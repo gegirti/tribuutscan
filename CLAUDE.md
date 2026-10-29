@@ -47,6 +47,10 @@ is simply getting colour, IR and depth out of the scanner on Linux.
   3000) and gain 1000-15000 (default 1000). The IR node's own exposure is read-only (EACCES). The colour
   node has the usual UVC controls (brightness, gain, white balance, auto exposure). There is no V4L2
   control for projector power. Helpers live in `v4l2.py` (`controls`, `get_control`, `set_control`).
+- One test with light boxes at about 25 cm in a dark room: depth stayed at about 72% valid from exposure
+  800 to 3000. Clipping cost depth: gain 8000 gave 33% clipped pixels and only 47% valid. The
+  projector lights the scene on its own. So the rule is to avoid IR clipping, not to make the image
+  brighter. Dark objects are not tested yet.
 - The vendor control interface is `/dev/hidraw*` (root only); its protocol is unknown.
 
 ## Commands
