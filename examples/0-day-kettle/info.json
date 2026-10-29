@@ -1,0 +1,9 @@
+{
+  "size": [
+    1280,
+    800
+  ],
+  "depth_valid_fraction": 0.0909,
+  "depth_median": 71.0,
+  "note": "ir is flipped horizontally to match colour/depth (sensor output is mirrored); depth is raw, units unknown"
+}

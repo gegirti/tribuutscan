@@ -1,6 +1,6 @@
 """Record raw depth statistics for a flat target at a known distance.
 
-    python3 -m ferret.measure 30        # target is 30 cm from the scanner
+    python3 -m tribuutscan.measure 30        # target is 30 cm from the scanner
 
 Appends a row to captures/scale.csv. Use several distances, then fit raw value vs distance.
 """

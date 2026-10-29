@@ -1,4 +1,4 @@
-"""Live viewer: colour, IR and depth side by side. Run with `python -m ferret.viewer`.
+"""Live viewer: colour, IR and depth side by side. Run with `python -m tribuutscan.viewer`.
 
 Press `s` or click Save to write the current frame set to captures/<timestamp>/.
 """
@@ -71,7 +71,7 @@ def main():
     color, ir, depth = streams.values()
 
     root = tk.Tk()
-    root.title("Ferret Pro")
+    root.title("triBUUTSCAN (Ferret Pro)")
     labels = {}
     for col, name in enumerate(streams):
         tk.Label(root, text=name).grid(row=0, column=col)

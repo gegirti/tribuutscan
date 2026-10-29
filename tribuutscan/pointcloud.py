@@ -1,7 +1,7 @@
 """Rough point-cloud export from a raw depth map plus colour. NOT metrically calibrated.
 
-    python3 -m ferret.pointcloud                    # grab a frame set now
-    python3 -m ferret.pointcloud captures/<stamp>   # use a saved set
+    python3 -m tribuutscan.pointcloud                    # grab a frame set now
+    python3 -m tribuutscan.pointcloud captures/<stamp>   # use a saved set
 
 Assumptions, all unverified:
   * raw depth -> distance uses the hand-measured fit  z_cm = A / (v + B)  (see README);

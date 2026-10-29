@@ -1,6 +1,6 @@
 import numpy as np
 
-from ferret.depth import decode_y10, encode_y10
+from tribuutscan.depth import decode_y10, encode_y10
 
 
 def test_roundtrip():

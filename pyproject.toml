@@ -1,7 +1,7 @@
 [project]
-name = "ferret-linux"
+name = "tribuutscan"
 version = "0.1.0"
-description = "Use a Creality CR-Scan Ferret Pro directly on Linux over V4L2"
+description = "3BUUTscan: use a Creality CR-Scan Ferret Pro directly on Linux over V4L2"
 requires-python = ">=3.10"
 license = { text = "MIT" }
 dependencies = ["numpy"]
