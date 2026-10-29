@@ -4,8 +4,9 @@ Using a Creality CR-Scan Ferret Pro directly on Linux, with no Creality software
 
 Made in 3BUUT. Free for everyone, see [License](#license).
 
-Status: **capture works** (colour, IR, depth). There is no scanning/fusion yet, and the depth scale
-and camera calibration are unknown.
+Status: **early days, and so far we are simply happy to have the data.** Capture works (colour, IR,
+depth) and a single frame exports to a coloured point cloud. There is no scanning/fusion yet, and
+the depth scale and camera calibration are unknown. This is only the beginning.
 
 ```
 python3 -m ferret.viewer        # live colour + IR + depth
@@ -79,6 +80,25 @@ scene: only the nearest surface was inside the window.
 - `ferret/measure.py` depth-vs-distance readings
 - `tests/` run with pytest, or call the test functions directly
 
+## TODO / roadmap
+
+Next up:
+
+- [ ] **USB capture**: record the traffic between Creality's app and the scanner (usbmon, under
+      Wine/Bottles or Android) to learn the init commands; they may widen the 17-32 cm depth window.
+- [ ] **Calibration**: depth law and units, camera intrinsics, proper colour-to-depth registration
+      (replace the eyeballed `REG`), using a fixed rig instead of hand-held readings.
+- [ ] Multi-view fusion: burst capture, ICP alignment (Open3D), merged cloud.
+- [ ] Why only ~10% of depth is valid in some scenes beyond the range cutoff (glass, dark surfaces).
+
+Later, once the above works:
+
+- [ ] **Geometry**: cleanup, meshing, scale-correct export.
+- [ ] **Markers**: for calibration and for scanning (marker-based tracking and alignment).
+- [ ] **Texturing** from the colour camera.
+- [ ] **A better interface**, to be built in VS Code (the current viewer is a plain tkinter window).
+- [ ] Proper tests (pytest), packaging, other devices (see Compatibility).
+
 ## Compatibility
 
 Tested on exactly one setup: **Creality CR-Scan Ferret Pro**, Ubuntu (GNOME, Wayland), kernel 7.0.
@@ -108,3 +128,6 @@ notice. Made in 3BUUT.
 
 This is an independent project, not affiliated with or endorsed by Creality or Orbbec. Product
 names belong to their owners.
+
+This project was made with the help of Claude (Claude Sonnet 5.5, through Claude Code), using a
+Claude account provided by 3BUUT.
