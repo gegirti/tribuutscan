@@ -2,6 +2,8 @@
 
 Using a Creality CR-Scan Ferret Pro directly on Linux, with no Creality software.
 
+Made in 3BUUT. Free for everyone, see [License](#license).
+
 Status: **capture works** (colour, IR, depth). There is no scanning/fusion yet, and the depth scale
 and camera calibration are unknown.
 
@@ -76,3 +78,33 @@ scene: only the nearest surface was inside the window.
   registration): `python3 -m ferret.pointcloud [captures/<stamp>]`
 - `ferret/measure.py` depth-vs-distance readings
 - `tests/` run with pytest, or call the test functions directly
+
+## Compatibility
+
+Tested on exactly one setup: **Creality CR-Scan Ferret Pro**, Ubuntu (GNOME, Wayland), kernel 7.0.
+
+Possibly related, **untested**:
+
+- The original **CR-Scan Ferret**. The Pro identifies itself over USB with the same product string
+  ("CR-Scan Ferret"), so the two may behave alike. Not verified.
+- Other Creality scanners, and other Orbbec-vendor (`2bc5`) devices. Nothing here suggests they work.
+
+Want to help? Plug your scanner in and send the output of `lsusb` and
+`for d in /sys/class/video4linux/video*; do echo "$d $(cat $d/name)"; done`, then try
+`python3 -m ferret.viewer` and tell us which streams you get.
+
+## Alternatives
+
+As of October 2026 we found no other Linux support for this scanner: Creality ships no Linux
+scanning software, and the Orbbec SDK we tried (`pyorbbecsdk2` 2.9.3) does not recognise it. If you
+know of one, please open an issue. Until then, the practical options are Creality's Android app or
+CrealityScan under Wine/Bottles for actual scanning; this project covers raw capture, depth and
+rough point clouds only.
+
+## License
+
+MIT, see [LICENSE](LICENSE). Use it for anything, no strings attached beyond keeping the copyright
+notice. Made in 3BUUT.
+
+This is an independent project, not affiliated with or endorsed by Creality or Orbbec. Product
+names belong to their owners.
