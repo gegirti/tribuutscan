@@ -38,9 +38,24 @@ The IR projector turns on by itself when the IR stream is opened.
 - Only ~10% of depth pixels are valid in a test scene (plastic handle yes; glass, box, floor no).
   Cause not yet known.
 
+## Depth versus distance (hand-measured, flat matte wall, `python3 -m ferret.measure <cm>`)
+
+| cm | centre median | centre valid |
+|---|---|---|
+| 20 | 590 | 88% |
+| 25 | 251 | 92% |
+| 30 | 66 | 90% |
+| 35 | (none) | 0.1% |
+
+Value falls steeply with distance and reaches zero near 31-33 cm: a disparity-like stream relative
+to a reference plane, in a default near-range window of roughly 17-32 cm (15 cm extrapolates past
+the 10-bit ceiling; not measured). Distances were held by hand (about +-1-2 cm), so the exact law
+is not settled: `a/z + b` and `a/z^2 + b` both fit three points. This explains the sparse kettle
+scene: only the nearest surface was inside the window.
+
 ## Open questions
 
-1. What unit is the depth in (disparity? mm/8?). Plan: capture a flat wall at known distances.
+1. Exact depth law and units. Needs a fixed rig, not a hand-held reading.
 2. Where do the camera intrinsics / depth-to-colour alignment come from? Plan: capture the USB
    traffic from Creality's app (usbmon, needs sudo).
 3. Why is depth sparse, and can a full-range mode be enabled?
