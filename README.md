@@ -35,6 +35,11 @@ The IR projector turns on by itself when the IR stream is opened.
 - Some depth frames arrive truncated; drop any frame shorter than `sizeimage`.
 - The Orbbec SDK (`pyorbbecsdk2` 2.9.3) does not enumerate the device ("No matched usb device
   found"), although its udev rules list `2bc5:069c`.
+- **Colour and depth are not registered 1:1.** Different cameras: depth looks magnified about
+  1.13x horizontally vs the 1280x800 colour image, offset ~-31 px, with ~5 px vertical shift, and
+  the leftmost ~17% of the depth frame is empty. `ferret/pointcloud.py` carries a rough affine
+  estimate (`REG`) read off box edges in a single frame; an overlay check looked right on a flat
+  shelf, but it is not a calibration (parallax varies with depth).
 - Only ~10% of depth pixels are valid in a test scene (plastic handle yes; glass, box, floor no).
   Cause not yet known.
 
@@ -65,5 +70,9 @@ scene: only the nearest surface was inside the window.
 
 - `ferret/v4l2.py` capture and node discovery
 - `ferret/depth.py` depth decode (and encode, for tests)
-- `ferret/viewer.py` live viewer
+- `ferret/viewer.py` live viewer; `s` / Save writes `captures/<stamp>/` (colour, IR, depth, npz)
+- `ferret/frames.py` grab and save a 1280x800 colour+IR+depth set
+- `ferret/pointcloud.py` rough .ply export (guessed intrinsics, fitted depth law, estimated
+  registration): `python3 -m ferret.pointcloud [captures/<stamp>]`
+- `ferret/measure.py` depth-vs-distance readings
 - `tests/` run with pytest, or call the test functions directly
