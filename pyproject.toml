@@ -1,0 +1,9 @@
+[project]
+name = "ferret-linux"
+version = "0.1.0"
+description = "Use a Creality CR-Scan Ferret Pro directly on Linux over V4L2"
+requires-python = ">=3.10"
+dependencies = ["numpy"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
