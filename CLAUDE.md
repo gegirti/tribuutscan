@@ -43,6 +43,10 @@ is simply getting colour, IR and depth out of the scanner on Linux.
   `python3 -m tribuutscan.pointcloud` (live grab) or `tribuutscan.measure`.
 - The scene must be lit and the lenses uncovered, or all streams are black.
 - `pyorbbecsdk2` 2.9.3 does not enumerate the device ("No matched usb device found").
+- IR brightness is set through the depth node's standard V4L2 controls: exposure 100-6800 (default
+  3000) and gain 1000-15000 (default 1000). The IR node's own exposure is read-only (EACCES). The colour
+  node has the usual UVC controls (brightness, gain, white balance, auto exposure). There is no V4L2
+  control for projector power. Helpers live in `v4l2.py` (`controls`, `get_control`, `set_control`).
 - The vendor control interface is `/dev/hidraw*` (root only); its protocol is unknown.
 
 ## Commands

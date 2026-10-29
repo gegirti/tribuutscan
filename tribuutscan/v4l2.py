@@ -17,6 +17,17 @@ VIDIOC_QBUF = 0xC058560F
 VIDIOC_DQBUF = 0xC0585611
 VIDIOC_STREAMON = 0x40045612
 VIDIOC_STREAMOFF = 0x40045613
+VIDIOC_G_CTRL = 0xC008561B
+VIDIOC_S_CTRL = 0xC008561C
+VIDIOC_QUERYCTRL = 0xC0445624
+CTRL_FLAG_NEXT = 0x80000000
+CTRL_TYPE_CLASS = 6
+
+# Standard control IDs seen on the Ferret Pro (all three nodes have gain + exposure).
+CID_BRIGHTNESS = 0x00980900
+CID_GAIN = 0x00980913
+CID_EXPOSURE_AUTO = 0x009A0901  # menu: 0 auto, 2 shutter priority (manual exposure time)
+CID_EXPOSURE = 0x009A0902  # exposure time, units of 100 us per the V4L2 spec
 
 BUF_TYPE_CAPTURE = 1
 MEMORY_MMAP = 1
@@ -42,6 +53,51 @@ def discover():
     if not all(k in found for k in order):
         raise RuntimeError(f"scanner not found or unexpected layout: {found}")
     return dict(zip(("depth", "ir", "color"), (found[k] for k in order)))
+
+
+def controls(dev):
+    """Return {name: dict(id, min, max, step, default, value)} for a node's integer/menu controls."""
+    out = {}
+    fd = os.open(dev, os.O_RDWR)
+    try:
+        cid = CTRL_FLAG_NEXT
+        while True:
+            q = bytearray(struct.pack("<II32siiiiI8x", cid, 0, b"", 0, 0, 0, 0, 0))
+            try:
+                fcntl.ioctl(fd, VIDIOC_QUERYCTRL, q)
+            except OSError:
+                break
+            i, typ, name, lo, hi, step, default, _ = struct.unpack("<II32siiiiI8x", q)
+            if typ != CTRL_TYPE_CLASS:
+                out[name.rstrip(b"\0").decode()] = dict(
+                    id=i, min=lo, max=hi, step=step, default=default, value=_get(fd, i))
+            cid = i | CTRL_FLAG_NEXT
+    finally:
+        os.close(fd)
+    return out
+
+
+def _get(fd, cid):
+    c = bytearray(struct.pack("<Ii", cid, 0))
+    fcntl.ioctl(fd, VIDIOC_G_CTRL, c)
+    return struct.unpack("<Ii", c)[1]
+
+
+def get_control(dev, cid):
+    fd = os.open(dev, os.O_RDWR)
+    try:
+        return _get(fd, cid)
+    finally:
+        os.close(fd)
+
+
+def set_control(dev, cid, value):
+    """Set one control; works while another handle is streaming from the same node."""
+    fd = os.open(dev, os.O_RDWR)
+    try:
+        fcntl.ioctl(fd, VIDIOC_S_CTRL, struct.pack("<Ii", cid, int(value)))
+    finally:
+        os.close(fd)
 
 
 class Capture:

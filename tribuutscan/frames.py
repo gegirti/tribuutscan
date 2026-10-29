@@ -41,8 +41,11 @@ def grab(warmup=10):
         return decode(last["color"], last["ir"], last["depth"], d.bytesperline)
 
 
-def save(frames, root=CAPTURES):
-    """Write a frame set to captures/<timestamp>/ and return the directory."""
+def save(frames, root=CAPTURES, extra=None):
+    """Write a frame set to captures/<timestamp>/ and return the directory.
+
+    `extra` (e.g. the camera control values in use) is merged into info.json.
+    """
     out = Path(root) / time.strftime("%Y%m%d-%H%M%S")
     out.mkdir(parents=True, exist_ok=True)
     write_png(out / "color.png", frames["color"])
@@ -55,5 +58,6 @@ def save(frames, root=CAPTURES):
         "depth_valid_fraction": round(float((frames["depth"] > 0).mean()), 4),
         "depth_median": float(np.median(valid)) if valid.size else None,
         "note": "ir is flipped horizontally to match colour/depth (sensor output is mirrored); depth is raw, units unknown",
+        **(extra or {}),
     }, indent=2))
     return out
