@@ -36,9 +36,18 @@ The first real frame we saved, kept as-is: a glass kettle on the floor, scanner 
 of it (distance not measured). It is the starting point everything else gets compared against. Files are in
 [`examples/0-day-kettle/`](examples/0-day-kettle/).
 
-| Colour | IR (projector dots) | Depth (raw, near = red) |
-|---|---|---|
-| ![colour](examples/0-day-kettle/color.png) | ![ir](examples/0-day-kettle/ir.png) | ![depth](examples/0-day-kettle/depth_preview.png) |
+<p align="center">
+  <img src="examples/0-day-kettle/color.png" width="420" alt="colour"><br>
+  <sub>Colour</sub>
+</p>
+<p align="center">
+  <img src="examples/0-day-kettle/ir.png" width="420" alt="IR with projector dots"><br>
+  <sub>IR (projector dots)</sub>
+</p>
+<p align="center">
+  <img src="examples/0-day-kettle/depth_preview.png" width="420" alt="raw depth, near = red"><br>
+  <sub>Depth (raw, near = red)</sub>
+</p>
 
 What it shows, honestly:
 
