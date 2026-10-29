@@ -20,7 +20,7 @@ CAPTURES = Path(__file__).resolve().parent.parent / "captures"
 def decode(color_buf, ir_buf, depth_buf, depth_bytesperline):
     return {
         "color": yuyv_to_rgb(color_buf, W, H),
-        "ir": np.frombuffer(ir_buf, np.uint8, W * H).reshape(H, W).copy(),  # sensor orientation (mirrored)
+        "ir": np.frombuffer(ir_buf, np.uint8, W * H).reshape(H, W)[:, ::-1].copy(),  # flipped to match colour/depth
         "depth": decode_y10(depth_buf, W, H, depth_bytesperline),
     }
 
@@ -54,6 +54,6 @@ def save(frames, root=CAPTURES):
         "size": [W, H],
         "depth_valid_fraction": round(float((frames["depth"] > 0).mean()), 4),
         "depth_median": float(np.median(valid)) if valid.size else None,
-        "note": "ir is in sensor orientation (mirrored vs colour/depth); depth is raw, units unknown",
+        "note": "ir is flipped horizontally to match colour/depth (sensor output is mirrored); depth is raw, units unknown",
     }, indent=2))
     return out
