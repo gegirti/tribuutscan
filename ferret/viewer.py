@@ -9,7 +9,7 @@ import tkinter as tk
 import numpy as np
 
 from . import frames as fr
-from . import v4l2
+from . import pointcloud, v4l2
 from .depth import decode_y10
 from .image import depth_to_rgb, ppm, yuyv_to_rgb
 
@@ -86,7 +86,10 @@ def main():
             message["text"] = "nothing to save yet"
             return
         frames = fr.decode(color.raw, ir.raw, depth.raw, depth.cap.bytesperline)
-        message["text"] = f"saved {fr.save(frames).name}"
+        out = fr.save(frames)
+        xyz, rgb = pointcloud.to_points(frames["depth"], pointcloud.register_color(frames["color"]))
+        pointcloud.write_ply(out / "cloud.ply", xyz, rgb)
+        message["text"] = f"saved {out.name} (with cloud.ply)"
 
     tk.Button(root, text="Save frame (s)", command=save).grid(row=2, column=2, sticky="e")
     root.bind("s", save)
