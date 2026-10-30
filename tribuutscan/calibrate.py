@@ -3,7 +3,8 @@ relative to each other, and the depth law. Writes captures/calibration.json, whi
 uses instead of the estimates. OpenCV (.venv).
 
     .venv/bin/python -m tribuutscan.calibrate board                      # captures/calib/board.svg
-    .venv/bin/python -m tribuutscan.calibrate capture [square_mm]        # live: keeps views by itself, q ends
+    .venv/bin/python -m tribuutscan.calibrate capture [square_mm] [captures/calib/<stamp>]
+                                                         # live: keeps views by itself, q ends; a folder continues
     .venv/bin/python -m tribuutscan.calibrate solve captures/calib/<stamp> [square_mm]
 
 Print board.svg at 100% (no "fit to page"), on matte paper, and tape it FLAT to something rigid
@@ -34,7 +35,9 @@ CALIB = fr.CAPTURES / "calib"
 IR_SIGMA = 2.0  # px: blurs the projector's dots into grey levels (white squares bright, black dark)
 MARGIN_MM = 8.0  # white paper around the board in the alignment template
 MIN_CORRELATION = 0.5  # image alignment accepted above this
-STILL_PX, STILL_S, NEW_PX = 1.5, 0.5, 40.0  # auto-keep: corners move < STILL_PX for STILL_S, NEW_PX from kept views
+# auto-keep: corners move < STILL_PX per update (~4 a second) for STILL_S, and lie NEW_PX from kept views.
+# Colour and IR are captured 0.4 ms apart, so a slowly moving hand-held scanner is fine.
+STILL_PX, STILL_S, NEW_PX = 3.0, 0.5, 40.0
 
 
 def board(square_mm=SQUARE_MM):
@@ -307,15 +310,15 @@ def corner_shift(a, b):
     return float(np.median(np.linalg.norm(a[1][ia] - b[1][ib], axis=1))) if len(common) >= 8 else np.inf
 
 
-def capture(square_mm=SQUARE_MM):
+def capture(square_mm=SQUARE_MM, out=None):
     """Live window (colour + IR with the board found). A view is kept by itself when the board has been
     still for STILL_S at a new place (hold the scanner still); space keeps one at once; q finishes and
-    solves."""
+    solves. With `out` an earlier session folder, its views count and new ones are added."""
     import tkinter as tk
     from . import v4l2
     from .image import ppm
     brd = board(square_mm)
-    out = CALIB / time.strftime("%Y%m%d-%H%M%S")
+    out = Path(out) if out else CALIB / time.strftime("%Y%m%d-%H%M%S")
     out.mkdir(parents=True, exist_ok=True)
     nodes = v4l2.discover()
     caps = {"color": v4l2.Capture(nodes["color"], "YUYV", fr.W, fr.H),
@@ -332,7 +335,15 @@ def capture(square_mm=SQUARE_MM):
     tally = tk.Label(root, font=("TkDefaultFont", 15, "bold"))
     tally.grid(row=2, column=0, columnspan=2)
     state = {"kept": [], "places": [], "prev": None, "still": None, "frame": None, "col": None, "flash": 0.0,
-             "note": "", "images": []}
+             "note": "", "images": [], "logged": 0.0}
+    for v in load_views(out):  # an earlier session's views: they count, and new views must differ from them
+        col = detect(cv2.cvtColor(v["color"], cv2.COLOR_RGB2GRAY), brd)
+        found = ir_board(v["ir"], col, brd) if col is not None else None
+        if found is not None:
+            state["kept"].append(col)
+            state["places"].append(board_place(v, col, found[0], k_rough))
+    if state["kept"]:
+        print(f"continuing {out.name}: {len(state['kept'])} views", flush=True)
 
     def keep(frame, col, place):
         i = ir_corners(frame["ir"], col, brd)
@@ -340,7 +351,7 @@ def capture(square_mm=SQUARE_MM):
         if i is None or len(i[2]) < 20:
             state["note"] = "IR could not place the board here: come a little closer or tilt less"
             return
-        n = len(state["kept"])
+        n = len(list(out.glob("view_*.npz")))
         np.savez_compressed(out / f"view_{n:03d}.npz", **frame)
         state["kept"].append(col)
         state["places"].append(place)
@@ -379,10 +390,13 @@ def capture(square_mm=SQUARE_MM):
             for p, im in zip(panes, state["images"]):
                 p.configure(image=im, bg=border)
             cm, tilt = place
-            status.configure(text=(
-                f"colour: {0 if col is None else len(col[2])} corners   IR: {'board found' if aligned else 'no board'}   "
-                f"{'' if cm is None else f'{cm:.1f} cm (estimate)   '}{'' if tilt is None else f'tilt {tilt:.0f} deg   '}"
-                f"{'still' if state['still'] else 'moving'}   {state['note']}"))
+            text = (f"colour: {0 if col is None else len(col[2])} corners   IR: {'board found' if aligned else 'no board'}   "
+                    f"{'' if cm is None else f'{cm:.1f} cm (estimate)   '}{'' if tilt is None else f'tilt {tilt:.0f} deg   '}"
+                    f"{'still' if state['still'] else 'moving'}{'' if new or col is None else ', seen already'}   {state['note']}")
+            status.configure(text=text)
+            if now - state["logged"] >= 2:  # a trace of what the window showed, for debugging
+                print(f"status: {text.strip()} (moved {moved:.1f} px)", flush=True)
+                state["logged"] = now
             places = [p for p in state["places"]]
             near = sum(1 for c, _ in places if c is not None and c < 22)
             far = sum(1 for c, _ in places if c is not None and c > 27)
@@ -407,7 +421,7 @@ def capture(square_mm=SQUARE_MM):
     tick()
     root.mainloop()
     if len(state["kept"]) >= 5:
-        solve(out, square_mm)
+        solve(out, square_mm, out=out / "calibration.json")  # checked before it replaces captures/calibration.json
     return out
 
 
@@ -417,7 +431,7 @@ def main():
         CALIB.mkdir(parents=True, exist_ok=True)
         print(write_board(CALIB / "board.svg"))
     elif cmd == "capture":
-        capture(float(sys.argv[2]) if len(sys.argv) > 2 else SQUARE_MM)
+        capture(float(sys.argv[2]) if len(sys.argv) > 2 else SQUARE_MM, sys.argv[3] if len(sys.argv) > 3 else None)
     elif cmd == "solve":
         solve(sys.argv[2], float(sys.argv[3]) if len(sys.argv) > 3 else SQUARE_MM)
     else:
