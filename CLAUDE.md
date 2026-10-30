@@ -148,7 +148,10 @@ P1 (tracker "current" in evaluate.py; "baseline" keeps the first version):
   unchanged
 - camera constants live in `calib.py` (`CAMERA`, estimates until captures/calibration.json exists)
 - `v4l2.Capture` exposes the kernel capture time (`last_time`, monotonic) and sequence number; the
-  viewer pairs streams by nearest capture time. This is not yet checked on the scanner.
+  viewer pairs streams by nearest capture time. Checked on the scanner: the stamps must be read
+  BEFORE re-queueing the buffer (QBUF clears them). All three streams run at 30 fps with no dropped
+  sequence numbers; the colour frame sits a constant 8.9 ms from its depth frame, and a frame
+  reaches the program 27-29 ms after its stamp.
 P2 (`scene.py`, scan modes still/turntable/free):
 - In "still", the table plane is found once (3 of the first 5 frames), kept in world coordinates,
   and re-fitted to each frame near its kept place. The object is what lies above it, inside a
@@ -201,6 +204,11 @@ P5 (live):
   luma (taken straight from YUYV), fewer solve iterations, `markers.detect_fast` (OpenCV blobs +
   the same checks, 8 ms against 47), and merging in a background thread. Live worker 5.6 -> about
   8 fps (simulated camera).
+- On the scanner the live scan first ran 5.4 fps with a 91 ms colour/depth skew: the viewer's
+  previews took the CPU from the worker (113 ms per frame alone, 161 ms beside the viewer), and the
+  stream threads fell behind. The viewer now renders only the newest frame, at most 15 previews a
+  second and only the shown pixels, and keeps 12 frames per stream for pairing. Live: 7.3 fps,
+  126 ms per frame, skew 10 ms median.
 - The object region must update on EVERY tracked frame: updating it only on merges let the region
   take in too much, the model filled with it, and tilt doubling went 1% -> 65%.
 - The model rebuild waits for pending merges, so a replay of the worker's raw copy reproduces the

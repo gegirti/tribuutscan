@@ -154,11 +154,15 @@ class Capture:
         index = struct.unpack_from("<I", b, 0)[0]
         used = struct.unpack_from("<I", b, 8)[0]
         data = bytes(self._bufs[index][:used])
+        self.last_time, self.last_sequence = buffer_time(b)  # before QBUF: re-queueing clears these fields
         fcntl.ioctl(self.fd, VIDIOC_QBUF, b)
-        self.last_time, self.last_sequence = buffer_time(b)
         if not self.last_time:
             self.last_time = time.monotonic()
         return data
+
+    def ready(self):
+        """True if another frame is already waiting (reading it now would not block)."""
+        return bool(select.select([self.fd], [], [], 0)[0])
 
     def frames(self):
         while self._streaming:

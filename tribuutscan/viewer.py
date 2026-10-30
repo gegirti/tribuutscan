@@ -29,9 +29,10 @@ import numpy as np
 from . import frames as fr
 from . import cloud, livescan, markers, pointcloud, v4l2
 from .depth import decode_y10
-from .image import depth_to_rgb, ppm, yuyv_to_rgb
+from .image import depth_to_rgb, ppm, yuyv_pixels, yuyv_to_rgb
 
 PANE_W = 480
+PREVIEW_FPS = 15  # previews redraw at most this often; every frame is still captured and paired
 
 # (label, node, control id, column): what the sliders drive and which image they sit under.
 SLIDERS = [
@@ -78,23 +79,28 @@ class Stream(threading.Thread):
         self.cap = v4l2.Capture(dev, fourcc, w, h)
         self.render = render
         self.latest = None
+        self.version = 0  # bumped with each new preview (the window redraws only on change)
         self.stats = {}
         self.raw = None
         self.stamp = 0.0
-        self.recent = collections.deque(maxlen=4)  # (stamp, raw)
+        self.recent = collections.deque(maxlen=12)  # (stamp, raw): ~0.4 s, so pairing works under load
         self.fps = 0.0
 
     def run(self):
-        n, t0 = 0, time.time()
+        n, t0, rendered = 0, time.time(), 0.0
         for buf in self.cap.frames():
             if len(buf) < self.cap.sizeimage:  # truncated USB transfer
                 continue
             self.raw, self.stamp = buf, self.cap.last_time
             self.recent.append((self.stamp, buf))
-            self.latest, self.stats = self.render(self.cap, buf)
-            n += 1
+            n += 1  # the fps shown is the camera's rate, not the preview's
             if time.time() - t0 >= 1:
                 self.fps, n, t0 = n / (time.time() - t0), 0, time.time()
+            if self.cap.ready() or time.time() - rendered < 1 / PREVIEW_FPS:
+                continue  # behind, or a preview is fresh enough: every frame still goes to `recent`
+            rendered = time.time()
+            self.latest, self.stats = self.render(self.cap, buf)
+            self.version += 1
 
     def nearest(self, t):
         """(raw, stamp) of the kept frame captured closest to time t."""
@@ -119,17 +125,17 @@ def find_markers_loop(color):
         t = time.time()
         if found_markers["on"] and color.raw and color.stamp != found_markers["stamp"]:
             found_markers["stamp"] = color.stamp
-            rgb = yuyv_to_rgb(color.raw, color.cap.width, color.cap.height)[::2, ::2]
-            hits = markers.detect(markers.luma(rgb), MARKER_RADII, rgb=rgb)
-            found_markers["list"] = [(2 * x, 2 * y, 2 * r, c) for x, y, r, c in hits]
+            luma = np.frombuffer(color.raw, np.uint8, color.cap.width * color.cap.height * 2)[0::2]
+            found_markers["list"] = markers.detect_fast(luma.reshape(color.cap.height, color.cap.width))
         elif not found_markers["on"]:
             found_markers["list"] = []
         time.sleep(max(0.0, 1 / MARKER_HZ - (time.time() - t)))
 
 
 def render_color(cap, buf):
-    rgb = fit(yuyv_to_rgb(buf, cap.width, cap.height))
-    step = cap.width / rgb.shape[1]
+    step = max(1, cap.width // PANE_W)  # convert only the preview's pixels (4x less work than all)
+    v, u = np.mgrid[0:cap.height:step, 0:cap.width:step]
+    rgb = yuyv_pixels(buf, cap.width, u.ravel(), v.ravel()).reshape(v.shape + (3,))
     hits = found_markers["list"]
     if hits:
         rgb = markers.draw(rgb, [(x / step, y / step, r / step, c) for x, y, r, c in hits])
@@ -154,7 +160,7 @@ def render_depth(cap, buf):
         "centre_valid": valid.size / centre.size,
         "centre_cm": float(pointcloud.depth_to_mm(np.median(valid))) / 10 if valid.size else None,
     }
-    return ppm(fit(depth_to_rgb(d))), stats
+    return ppm(depth_to_rgb(fit(d))), stats  # colour-map only the preview's pixels
 
 
 def distance_hint(stats):
@@ -466,9 +472,12 @@ def main():
         s.start()
     images = {}
 
+    shown = {}
+
     def tick():
         for name, s in streams.items():
-            if s.latest is not None:
+            if s.latest is not None and shown.get(name) != s.version:  # redraw only a changed preview
+                shown[name] = s.version
                 images[name] = tk.PhotoImage(data=s.latest, format="PPM")
                 labels[name].configure(image=images[name])
         if depth.stats:

@@ -97,7 +97,9 @@ def run(commands, replies, port=view3d.PORT):
     replies.put(("ready", f"http://localhost:{port}/" if server else None))
     out_dir, keep_raw, recorder = None, False, None
     parent = multiprocessing.parent_process()
+    timing = {"wait": 0.0, "raw": 0.0, "decode": 0.0, "feed": 0.0, "frames": 0}  # per scan, logged at Stop
     while True:
+        t_wait = time.perf_counter()
         try:
             cmd = commands.get(timeout=1.0)
         except queue.Empty:
@@ -110,7 +112,9 @@ def run(commands, replies, port=view3d.PORT):
             else:
                 continue
         kind = cmd[0]
+        timing["wait"] += time.perf_counter() - t_wait
         if kind == "start":
+            timing = {k: 0 for k in timing}
             _, preset, out_dir, keep_raw, continue_from = cmd
             recorder = None
             log = lambda m: replies.put(("log", m))
@@ -125,17 +129,24 @@ def run(commands, replies, port=view3d.PORT):
                 source.phase, source.out_dir = "scanning", out_dir
         elif kind == "frame" and source.scanner is not None:
             _, yuyv, grey, y10, bytesperline, (t_c, t_i, t_d) = cmd
+            t0 = time.perf_counter()
             if keep_raw:
                 if recorder is None:
                     recorder = fr.Recorder(bytesperline, root=out_dir, extra={"note": "frames a live scan processed"})
                 recorder.write({"color": yuyv, "ir": grey, "depth": y10}, {"color": t_c, "ir": t_i, "depth": t_d})
+            t1 = time.perf_counter()
             frame = {"yuyv": yuyv, "depth": decode_y10(y10, fr.W, fr.H, bytesperline),  # colour decoded per point
                      "t": t_d, "skew_ms": (t_c - t_d) * 1000}
+            t2 = time.perf_counter()
             with source.lock:
                 s = source.scanner
                 s.feed(frame)
                 with s.cloud_lock:
                     points = int((s.cloud.seen >= cl.MIN_SEEN).sum())
+            timing["raw"] += t1 - t0
+            timing["decode"] += t2 - t1
+            timing["feed"] += time.perf_counter() - t2
+            timing["frames"] += 1
             replies.put(("frame_done", s.stats["merged"], s.stats["frames"], points, s.stats["tracking"], dict(s.cue)))
         elif kind == "frame":
             replies.put(("frame_done", 0, 0, 0))
@@ -148,6 +159,10 @@ def run(commands, replies, port=view3d.PORT):
                 source.name = out_dir.name
                 source.phase = "optimising"
             replies.put(("saved", str(path), kept))
+            n = max(timing["frames"], 1)
+            replies.put(("log", f"worker: {timing['frames']} frames; per frame: tracking {1000 * timing['feed'] / n:.0f} ms, "
+                                f"raw copy {1000 * timing['raw'] / n:.0f} ms, decode {1000 * timing['decode'] / n:.0f} ms, "
+                                f"waiting for frames {1000 * timing['wait'] / n:.0f} ms"))
             try:  # Optimise right away (user decision): loop closures, pose graph, merge again
                 from . import optimise
                 with source.busy:
