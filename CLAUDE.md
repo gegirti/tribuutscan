@@ -25,7 +25,8 @@ is simply getting colour, IR and depth out of the scanner on Linux.
 - Keep captures out of git: `captures/` is ignored (it holds photos of the workspace). Only
   `examples/` is meant to be public; check an image before adding it.
 - Match the existing style: small numpy-only modules, short docstrings, no heavy dependencies.
-  Python 3.10+, numpy and tkinter only. No pytest installed on the dev machine; the tests are plain
+  Python 3.10+, numpy and tkinter only. The browser view (`tribuutscan/web/`) uses a vendored copy of
+  three.js r160 (MIT, `THREE-LICENSE`) so it works offline; the server is Python stdlib. No pytest installed on the dev machine; the tests are plain
   functions and can be called directly.
 
 ## Device facts (verified on one Ferret Pro, Ubuntu GNOME/Wayland)
@@ -82,6 +83,7 @@ python3 -m tribuutscan.measure <cm>         # depth stats for a flat target at a
 python3 -m tribuutscan.markers captures/<stamp>   # find markers in a saved frame -> markers.png
 .venv/bin/python -m tribuutscan.cloud captures/<stamp>-rec [small|medium|large]
                                             # merged point cloud -> captures/<stamp>-scan/
+python3 -m tribuutscan.view3d captures/<stamp>-scan    # browser 3D view at http://localhost:8765
 .venv/bin/python -m tribuutscan.fuse captures/<stamp>-rec   # ROUGH mesh.ply from a recording (Open3D)
 ```
 

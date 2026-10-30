@@ -1,0 +1,209 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>triBUUTSCAN 3D</title>
+<style>
+  :root {
+    --bg: #15171a; --panel: #1f2226; --line: #33373d; --text: #e6e8eb; --muted: #9aa1aa;
+    --accent: #e0457b; --good: #4caf50;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
+    font: 14px/1.4 system-ui, -apple-system, "Segoe UI", Ubuntu, sans-serif; overflow: hidden; }
+  #view { position: fixed; inset: 0; display: block; }
+  header { position: fixed; top: 0; left: 0; right: 0; height: 40px; display: flex; align-items: center;
+    gap: 4px; padding: 0 12px; background: var(--panel); border-bottom: 1px solid var(--line); z-index: 2; }
+  header .brand { font-weight: 700; margin-right: 16px; letter-spacing: .02em; }
+  header .brand span { color: var(--accent); }
+  .menu { position: relative; }
+  .menu > button { background: none; border: 0; color: var(--text); padding: 8px 12px; border-radius: 6px;
+    font: inherit; cursor: pointer; }
+  .menu > button:hover, .menu.open > button { background: var(--line); }
+  .menu ul { display: none; position: absolute; top: 36px; left: 0; min-width: 220px; margin: 0; padding: 6px;
+    list-style: none; background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+    box-shadow: 0 8px 24px rgba(0,0,0,.4); }
+  .menu.open ul { display: block; }
+  .menu li { padding: 7px 10px; border-radius: 5px; cursor: pointer; white-space: nowrap; }
+  .menu li:hover { background: var(--line); }
+  .menu li.later { color: var(--muted); cursor: default; }
+  .menu li.later:hover { background: none; }
+  .menu li small { color: var(--muted); margin-left: 6px; }
+  #status { margin-left: auto; color: var(--muted); font-size: 13px; }
+  #status b { color: var(--good); font-weight: 600; }
+  aside { position: fixed; top: 52px; right: 12px; width: 250px; padding: 12px 14px; z-index: 2;
+    background: rgba(31,34,38,.92); border: 1px solid var(--line); border-radius: 10px; }
+  aside h2 { margin: 0 0 8px; font-size: 13px; color: var(--muted); font-weight: 600;
+    text-transform: uppercase; letter-spacing: .05em; }
+  dl { display: grid; grid-template-columns: auto 1fr; gap: 4px 10px; margin: 0 0 12px; font-size: 13px; }
+  dt { color: var(--muted); }
+  dd { margin: 0; text-align: right; font-variant-numeric: tabular-nums; }
+  label { display: block; margin: 10px 0 4px; color: var(--muted); font-size: 13px; }
+  input[type=range], select { width: 100%; accent-color: var(--accent); }
+  select { background: var(--bg); color: var(--text); border: 1px solid var(--line); border-radius: 6px;
+    padding: 5px; font: inherit; }
+  .hint { margin-top: 12px; color: var(--muted); font-size: 12px; }
+  @media (max-width: 600px) { aside { left: 12px; right: 12px; width: auto; top: auto; bottom: 12px; } }
+</style>
+<script type="importmap">{ "imports": { "three": "./three.module.min.js" } }</script>
+</head>
+<body>
+<canvas id="view"></canvas>
+<header>
+  <div class="brand">tri<span>BUUT</span>SCAN</div>
+  <div class="menu"><button>Scan</button><ul>
+    <li class="later">Start / stop scan<small>next: live</small></li>
+  </ul></div>
+  <div class="menu"><button>Process</button><ul>
+    <li class="later">Merge again (other preset)<small>later</small></li>
+    <li class="later">Mesh<small>later</small></li>
+  </ul></div>
+  <div class="menu"><button>Export</button><ul>
+    <li id="dl-ply">Download cloud.ply</li>
+    <li id="dl-png">Save view as PNG</li>
+  </ul></div>
+  <div class="menu"><button>View</button><ul>
+    <li id="reset">Reset view <small>R</small></li>
+  </ul></div>
+  <div id="status">connecting…</div>
+</header>
+<aside>
+  <h2 id="name">Cloud</h2>
+  <dl>
+    <dt>Points</dt><dd id="points">–</dd>
+    <dt>Point distance</dt><dd id="pd">–</dd>
+    <dt>Raw points</dt><dd id="raw">–</dd>
+    <dt>Frames merged</dt><dd id="frames">–</dd>
+  </dl>
+  <label for="size">Point size</label>
+  <input id="size" type="range" min="0.3" max="4" step="0.1" value="1.5">
+  <label for="mode">Colour</label>
+  <select id="mode">
+    <option value="rgb">Camera colour</option>
+    <option value="seen">Times seen (blue few, red many)</option>
+    <option value="height">Height</option>
+  </select>
+  <div class="hint">Drag to orbit, right-drag to pan, scroll to zoom. Sizes are estimates until calibration.</div>
+</aside>
+<script type="module">
+import * as THREE from "three";
+import { OrbitControls } from "./OrbitControls.js";
+
+const canvas = document.getElementById("view");
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, preserveDrawingBuffer: true });
+renderer.setPixelRatio(window.devicePixelRatio);
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x15171a);
+const camera = new THREE.PerspectiveCamera(45, 1, 0.001, 50);
+const controls = new OrbitControls(camera, canvas);
+controls.enableDamping = true;
+
+const material = new THREE.PointsMaterial({ size: 0.0015, vertexColors: true, sizeAttenuation: true });
+let points = null, data = null, version = null, pointMm = 1, framed = false;
+const $ = (id) => document.getElementById(id);
+
+function resize() {
+  renderer.setSize(window.innerWidth, window.innerHeight, false);
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+}
+window.addEventListener("resize", resize);
+resize();
+
+function ramp(t) {  // blue -> cyan -> green -> yellow -> red
+  const r = Math.min(Math.max(1.5 - Math.abs(4 * t - 3), 0), 1);
+  const g = Math.min(Math.max(1.5 - Math.abs(4 * t - 2), 0), 1);
+  const b = Math.min(Math.max(1.5 - Math.abs(4 * t - 1), 0), 1);
+  return [r, g, b];
+}
+
+function colours() {
+  const n = data.n, out = new Float32Array(n * 3), mode = $("mode").value;
+  if (mode === "rgb") {
+    for (let i = 0; i < n * 3; i++) out[i] = data.rgb[i] / 255;
+  } else if (mode === "seen" && data.seen) {
+    let max = 1;
+    for (let i = 0; i < n; i++) max = Math.max(max, data.seen[i]);
+    for (let i = 0; i < n; i++) out.set(ramp(Math.log(data.seen[i]) / Math.log(max)), i * 3);
+  } else {
+    let lo = Infinity, hi = -Infinity;
+    for (let i = 0; i < n; i++) { lo = Math.min(lo, data.xyz[i * 3 + 1]); hi = Math.max(hi, data.xyz[i * 3 + 1]); }
+    for (let i = 0; i < n; i++) out.set(ramp((data.xyz[i * 3 + 1] - lo) / (hi - lo || 1)), i * 3);
+  }
+  return out;
+}
+
+function frame() {
+  if (!points) return;
+  points.geometry.computeBoundingSphere();
+  const s = points.geometry.boundingSphere;
+  controls.target.copy(s.center);
+  camera.position.copy(s.center).add(new THREE.Vector3(0, 0, s.radius * 2.6));
+  camera.near = s.radius / 100; camera.far = s.radius * 100;
+  camera.updateProjectionMatrix();
+  controls.update();
+}
+
+async function load() {
+  const buf = await (await fetch("cloud.bin")).arrayBuffer();
+  const [n, hasSeen] = new Uint32Array(buf, 0, 2);
+  const xyz = new Float32Array(buf, 8, n * 3);
+  const rgbAt = 8 + n * 12, rgbLen = n * 3 + ((4 - (n * 3) % 4) % 4);
+  data = { n, xyz, rgb: new Uint8Array(buf, rgbAt, n * 3),
+           seen: hasSeen ? new Uint16Array(buf.slice(rgbAt + rgbLen, rgbAt + rgbLen + n * 2)) : null };
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute("position", new THREE.BufferAttribute(xyz, 3));
+  geometry.setAttribute("color", new THREE.BufferAttribute(colours(), 3));
+  if (points) { scene.remove(points); points.geometry.dispose(); }
+  points = new THREE.Points(geometry, material);
+  scene.add(points);
+  if (!framed) { frame(); framed = true; }
+}
+
+async function poll() {
+  try {
+    const info = await (await fetch("info.json")).json();
+    if (info.version !== version) {
+      version = info.version;
+      await load();
+      const s = info.session || {};
+      pointMm = s.point_distance_mm || pointMm;
+      material.size = pointMm / 1000 * $("size").value;
+      $("name").textContent = info.name;
+      $("points").textContent = info.points.toLocaleString();
+      $("pd").textContent = s.point_distance_mm ? `${s.point_distance_mm} mm (${s.preset})` : "–";
+      $("raw").textContent = s.raw_points ? s.raw_points.toLocaleString() : "–";
+      $("frames").textContent = s.merged != null ? `${s.merged} of ${s.frames}` : "–";
+    }
+    $("status").innerHTML = "<b>●</b> connected";
+  } catch (e) {
+    $("status").textContent = "server stopped";
+  }
+  setTimeout(poll, 500);
+}
+
+$("size").addEventListener("input", () => { material.size = pointMm / 1000 * $("size").value; });
+$("mode").addEventListener("change", () => {
+  if (points) points.geometry.setAttribute("color", new THREE.BufferAttribute(colours(), 3));
+});
+$("reset").addEventListener("click", frame);
+window.addEventListener("keydown", (e) => { if (e.key === "r" || e.key === "R") frame(); });
+$("dl-ply").addEventListener("click", () => { location.href = "cloud.ply"; });
+$("dl-png").addEventListener("click", () => {
+  const a = document.createElement("a");
+  a.href = canvas.toDataURL("image/png"); a.download = "triBUUTSCAN-view.png"; a.click();
+});
+document.querySelectorAll(".menu > button").forEach((b) => b.addEventListener("click", (e) => {
+  const menu = b.parentElement, open = menu.classList.contains("open");
+  document.querySelectorAll(".menu").forEach((m) => m.classList.remove("open"));
+  if (!open) menu.classList.add("open");
+  e.stopPropagation();
+}));
+document.addEventListener("click", () => document.querySelectorAll(".menu").forEach((m) => m.classList.remove("open")));
+
+(function animate() { requestAnimationFrame(animate); controls.update(); renderer.render(scene, camera); })();
+poll();
+</script>
+</body>
+</html>
