@@ -61,11 +61,15 @@
     <li class="later">Start / stop scan<small>next: live</small></li>
   </ul></div>
   <div class="menu"><button>Process</button><ul>
-    <li class="later">Merge again (other preset)<small>later</small></li>
-    <li class="later">Mesh<small>later</small></li>
+    <li data-action="optimise">Optimise again<small>loops + pose graph</small></li>
+    <li data-action="small">Merge again: small<small>0.5 mm</small></li>
+    <li data-action="medium">Merge again: medium<small>1 mm</small></li>
+    <li data-action="large">Merge again: large<small>2 mm</small></li>
+    <li data-action="mesh">Make mesh<small>Poisson</small></li>
   </ul></div>
   <div class="menu"><button>Export</button><ul>
     <li id="dl-ply">Download cloud.ply</li>
+    <li id="dl-mesh" class="later">Download mesh.ply<small>make a mesh first</small></li>
     <li id="dl-png">Save view as PNG</li>
   </ul></div>
   <div class="menu"><button>View</button><ul>
@@ -106,7 +110,7 @@ const controls = new OrbitControls(camera, canvas);
 controls.enableDamping = true;
 
 const material = new THREE.PointsMaterial({ size: 0.0015, vertexColors: true, sizeAttenuation: true });
-let points = null, data = null, version = null, pointMm = 1, framed = false;
+let points = null, data = null, version = null, pointMm = 1, framed = false, messageAt = 0;
 const $ = (id) => document.getElementById(id);
 
 function resize() {
@@ -189,7 +193,9 @@ async function poll() {
         : `ok, held by ${held}${s.relocked ? ` (re-found ${s.relocked}×)` : ""}`;
       $("empty").classList.toggle("show", info.points === 0);
     }
-    $("status").innerHTML = "<b>●</b> connected";
+    if (Date.now() - messageAt > 8000)  // a Process result stays readable for a while
+      $("status").innerHTML = info.phase === "optimising" ? "<b>●</b> optimising…" : "<b>●</b> connected";
+    $("dl-mesh").classList.toggle("later", !info.mesh);
   } catch (e) {
     $("status").textContent = "server stopped";
   }
@@ -203,6 +209,18 @@ $("mode").addEventListener("change", () => {
 $("reset").addEventListener("click", frame);
 window.addEventListener("keydown", (e) => { if (e.key === "r" || e.key === "R") frame(); });
 $("dl-ply").addEventListener("click", () => { location.href = "cloud.ply"; });
+$("dl-mesh").addEventListener("click", () => { if (!$("dl-mesh").classList.contains("later")) location.href = "mesh.ply"; });
+document.querySelectorAll("[data-action]").forEach((li) => li.addEventListener("click", async () => {
+  $("status").textContent = `working: ${li.textContent.trim()}…`;
+  messageAt = Date.now() + 600000;  // until the answer comes
+  try {
+    const r = await (await fetch(`process/${li.dataset.action}`, { method: "POST" })).json();
+    $("status").textContent = r.message;
+    messageAt = Date.now();
+  } catch (e) {
+    $("status").textContent = "failed: server stopped";
+  }
+}));
 $("dl-png").addEventListener("click", () => {
   const a = document.createElement("a");
   a.href = canvas.toDataURL("image/png"); a.download = "triBUUTSCAN-view.png"; a.click();

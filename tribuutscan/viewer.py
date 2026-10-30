@@ -428,7 +428,10 @@ def main():
                     message["text"] = f"SCAN {merged} of {frames} frames merged, {points:,} points | held by {held}{hint}"
             elif kind == "saved":
                 path, points = rest
-                log(f"scan saved: {points:,} points -> {Path(path).parent.name}/cloud.ply")
+                log(f"scan saved: {points:,} points -> {Path(path).parent.name}/cloud.ply; optimising ...")
+                scan_button.configure(text="Optimising...", state="disabled")
+            elif kind == "optimised":
+                log(rest[0])
                 scan_button.configure(text="Start scan (c)", state="normal")
 
     scan_box = tk.Frame(columns[2])

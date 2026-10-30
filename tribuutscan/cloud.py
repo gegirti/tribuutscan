@@ -385,6 +385,7 @@ class Scanner:
         self.clean_depth, self.gate_refind, self.motion_dt = clean_depth, gate_refind, motion_dt
         from .scene import Scene
         self.scene = Scene(mode, self.rng)
+        self.stats["mode"] = mode
         from .markermap import MarkerMap
         # "joint" (track.solve: shape + markers + motion prior, flat-face check; default), "jointnm"
         # (joint without markers), "icp" (frame-to-frame point-to-plane, Open3D: P2), "markers" (only)
@@ -410,6 +411,7 @@ class Scanner:
         self.prev_feat, self.feature_starts = None, 0  # last tracked frame's ORB; frames started from ORB
         self.cue = {}  # what held the last frame: markers used, ORB start, flat (shape alone slides)
         self.keyframes = []  # merged frames: (index, pose, points mm (camera, 2 mm grid), ORB, markers mm)
+        self.merged_data = {}  # index -> (camera points mm float32, rgb, camera normals float32): re-merging
         import concurrent.futures
         import threading
         self.cloud_lock = threading.Lock()
@@ -466,7 +468,7 @@ class Scanner:
                                              None if scene.mode == "still" else pix)
                 if self.prev is not None and self.prev_feat is not None:
                     found, _ = self.features.relative_pose(feat, self.prev_feat, self.rng)
-                    self.cue = {"features": found is not None and plausible_step(found, xyz)}
+                    self.cue = {"features": bool(found is not None and plausible_step(found, xyz))}
                     if self.cue["features"]:
                         guess = found
                         self.feature_starts += 1
@@ -530,6 +532,7 @@ class Scanner:
         cxyz, crgb, cpix, cnrm = frame_points(merge_frame, self.stride, normals=True)
         sel = kept[cpix[:, 1], cpix[:, 0]]
         mxyz, mrgb, mnrm = cxyz[sel], crgb[sel], cnrm[sel]
+        self.merged_data[index] = (mxyz.astype(np.float32), mrgb, mnrm.astype(np.float32))
         world = mxyz @ pose[:3, :3].T + pose[:3, 3] * 1000
         world_nrm = mnrm @ pose[:3, :3].T
         with self.cloud_lock:
@@ -539,6 +542,59 @@ class Scanner:
         if not self.stats["markers"]:
             color = frame["color"] if "color" in frame else yuyv_to_rgb(frame["yuyv"], *shape[::-1])
             self.stats["markers"] = [[round(x, 1), round(y, 1)] for x, y, *_ in markers.detect_half(color)]
+
+    def remerge(self, new_poses, point_mm=None):
+        """Merge every merged frame again with corrected poses (dict index -> pose), e.g. after
+        optimise.optimise, optionally at another point distance; also moves the current pose and
+        the marker map along."""
+        self.flush()
+        old = dict(self.poses)
+        if not old:
+            return
+        last = self.poses[-1][0]
+        fix = new_poses.get(last, old[last]) @ np.linalg.inv(old[last])
+        self.pose, self.last_merged = fix @ self.pose, fix @ self.last_merged
+        cloud = VoxelCloud(point_mm or self.cloud.point_mm)
+        for index, _ in self.poses:
+            pose = new_poses.get(index, old[index])
+            pts, rgb, nrm = self.merged_data[index]
+            cloud.add(pts.astype(np.float64) @ pose[:3, :3].T + pose[:3, 3] * 1000, rgb,
+                      nrm.astype(np.float64) @ pose[:3, :3].T)
+        with self.cloud_lock:
+            self.cloud = cloud
+        self.poses = [(i, new_poses.get(i, p)) for i, p in self.poses]
+        self.keyframes = [(i, new_poses.get(i, p), *rest) for i, p, *rest in self.keyframes]
+        from .markermap import MarkerMap
+        self.marker_map = MarkerMap(add_mm=self.marker_map.add_mm)
+        for _, pose, _, _, mk in self.keyframes:
+            if len(mk):
+                self.marker_map.add(mk, pose)
+        self.model_levels = None  # rebuilt from the corrected cloud
+
+    @classmethod
+    def restore(cls, directory, log=print):
+        """A Scanner rebuilt from a saved session (keyframes, merged frames, scene), for Optimise."""
+        directory = Path(directory)
+        session = json.loads((directory / "session.json").read_text())
+        sc = cls(session.get("preset", "small"), log=log, mode=session.get("mode", "still"))
+        kf = np.load(directory / "keyframes.npz")
+        at = lambda name: kf[name + "_at"]
+        for k, index in enumerate(kf["index"]):
+            pts = kf["points"][at("points")[k]:at("points")[k + 1]]
+            fp = kf["feat_points"][at("feat")[k]:at("feat")[k + 1]]
+            fd = kf["feat_desc"][at("feat")[k]:at("feat")[k + 1]]
+            mk = kf["markers"][at("markers")[k]:at("markers")[k + 1]]
+            sc.keyframes.append((int(index), kf["pose"][k], pts, (fp, fd) if len(fd) else None, mk))
+            sc.poses.append((int(index), kf["pose"][k]))
+        m = np.load(directory / "merged.npz")
+        for k, index in enumerate(m["index"]):
+            a, b = m["at"][k], m["at"][k + 1]
+            sc.merged_data[int(index)] = (m["points"][a:b], m["rgb"][a:b], m["normals"][a:b])
+        sc.pose = sc.last_merged = sc.poses[-1][1]
+        sc.stats.update({k: session[k] for k in ("frames", "merged", "lost", "relocked") if k in session})
+        sc.scene.load(json.loads((directory / "scene.json").read_text()))
+        sc.remerge({})
+        return sc
 
     def flush(self):
         """Wait for merges still running in the background (before reading or saving the cloud)."""
@@ -566,9 +622,10 @@ class Scanner:
                                   marker_pairs=pairs, radius_mm=radius, marker_sigma_mm=self.marker_sigma)
         step = np.linalg.inv(self.pose) @ found if use_model else found
         self.track_info.append((index, info))
-        flat = info["degeneracy"] is not None and info["degeneracy"] < track.DEGENERATE and not info["markers_used"]
+        flat = bool(info["degeneracy"] is not None and info["degeneracy"] < track.DEGENERATE and not info["markers_used"])
         self.stats["flat"] = self.stats.get("flat", 0) + flat
-        self.cue = {"markers": info["markers_used"], "features": self.cue.get("features", False), "flat": flat}
+        self.cue = {"markers": int(info["markers_used"]), "features": bool(self.cue.get("features", False)),
+                    "flat": flat}  # plain Python values: the page receives them as JSON
         ok = (info["fitness"] >= JOINT_MIN_FITNESS and info["rmse_mm"] is not None
               and info["rmse_mm"] <= JOINT_MAX_RMSE_MM and plausible_step(step, xyz)
               and (info["marker_rmse_mm"] is None or info["marker_rmse_mm"] <= self.marker_accept))
@@ -699,6 +756,14 @@ class Scanner:
         c = self.cloud
         np.savez_compressed(directory / "cloud_state.npz", point_mm=c.point_mm, keys=c.keys, xyz=c.xyz, rgb=c.rgb,
                             n=c.n, nrm=c.nrm, seen=c.seen, frames=c.frames, raw_points=c.raw_points)
+        if self.merged_data:
+            order = [i for i, _ in self.poses if i in self.merged_data]
+            parts = [self.merged_data[i] for i in order]
+            np.savez_compressed(directory / "merged.npz", index=np.array(order),
+                                at=np.cumsum([0] + [len(p[0]) for p in parts]),
+                                points=np.concatenate([p[0] for p in parts]), rgb=np.concatenate([p[1] for p in parts]),
+                                normals=np.concatenate([p[2] for p in parts]))
+        (directory / "scene.json").write_text(json.dumps(self.scene.state()))
 
     def trim_table(self):
         """Drop cubes merged before the table plane was settled: on/below it or outside the region."""
@@ -742,7 +807,7 @@ def save(directory, cloud, poses, stats, preset, min_seen=MIN_SEEN):
         for i, p in poses:
             f.write(f"{i} " + " ".join(f"{v:.6f}" for v in p.ravel()) + "\n")
     (directory / "session.json").write_text(json.dumps({
-        "preset": preset, "point_distance_mm": cloud.point_mm, "min_seen": min_seen,
+        "preset": preset, "point_distance_mm": cloud.point_mm, "min_seen": min_seen, "mode": stats.get("mode"),
         "raw_points": cloud.raw_points, "cubes": len(cloud), "points_kept": len(xyz), **stats,
         "note": "distances rest on the estimated depth law and field of view",
     }, indent=2))

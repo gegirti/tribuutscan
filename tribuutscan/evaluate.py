@@ -81,7 +81,7 @@ def make_scanner(tracker, preset, mode):
     return cl.Scanner(preset, log=lambda m: None, **options)
 
 
-def run(name, tracker="baseline", preset="small", live_markers=False):
+def run(name, tracker="baseline", preset="small", live_markers=False, optimise_after=False):
     """live_markers: let the tracker detect markers itself (markers.detect_fast, as live) instead of
     being handed the cached reference detections."""
     directory = dataset_path(name)
@@ -101,6 +101,10 @@ def run(name, tracker="baseline", preset="small", live_markers=False):
                 if loc is not None:
                     sightings.append(loc[0] @ pose[:3, :3].T + pose[:3, 3] * 1000)
     scanner.flush()
+    opt_report = None
+    if optimise_after:
+        from . import optimise
+        opt_report = optimise.optimise(scanner, log=lambda m: None)
     scanner.trim_table()
     xyz, rgb, seen, normals = scanner.cloud.points(cl.MIN_SEEN, with_normals=True)
     tracked = [(i, p) for i, s, p in scanner.track_log if p is not None]
@@ -119,11 +123,16 @@ def run(name, tracker="baseline", preset="small", live_markers=False):
         "double_surface_ratio": round(metrics.double_surface_ratio(xyz, normals), 4),
         "marker_scatter": metrics.marker_scatter(sightings),
         "loop_gap": {"mm": round(gap[0], 1), "deg": round(gap[1], 1)},
+        "keyframe_marker_scatter": metrics.marker_scatter(
+            [m @ p[:3, :3].T + p[:3, 3] * 1000 for _, p, _, _, mk in scanner.keyframes for m in mk]),
+        "optimise": opt_report,
     }
     if name in SYNTH:
         truth = synth.read_truth(directory)
         result["ground_truth"] = {k: (round(v, 3) if isinstance(v, float) else v)
                                   for k, v in metrics.ate_rpe(dict(tracked), truth).items()}
+        result["keyframe_ground_truth"] = {k: (round(v, 3) if isinstance(v, float) else v)
+                                           for k, v in metrics.ate_rpe(dict(scanner.poses), truth).items()}
     return result, (xyz, rgb, normals)
 
 
@@ -166,10 +175,11 @@ def show(results, against=None):
             v = len(v)
         return "-" if v is None else (f"{v:.3g}" if isinstance(v, float) else str(v))
 
-    cols = [("tracked", "tracked"), ("lost", "lost"), ("relocked", "re-found"), ("pose_jumps", "jumps"),
+    cols = [("tracked", "tracked"), ("relocked", "re-found"), ("pose_jumps", "jumps"),
             ("double_surface_ratio", "double"), ("marker_scatter.scatter_mm", "mk mm"),
-            ("marker_scatter.markers", "mk n"), ("loop_gap.mm", "gap mm"),
-            ("ground_truth.ate_mm", "ATE mm"), ("ground_truth.rpe_mm", "RPE mm"), ("ms_per_frame", "ms")]
+            ("keyframe_marker_scatter.scatter_mm", "kf mk mm"), ("loop_gap.mm", "gap mm"),
+            ("ground_truth.ate_mm", "ATE mm"), ("keyframe_ground_truth.ate_mm", "kf ATE"),
+            ("optimise.loops_kept", "loops"), ("ms_per_frame", "ms")]
     print(f"{'dataset':9s} " + " ".join(f"{h:>14s}" for _, h in cols))
     for r in results:
         o = old.get(r["dataset"])
@@ -189,7 +199,7 @@ def main():
     results = []
     for name in names:
         t0 = time.time()
-        result, (xyz, rgb, normals) = run(name, tracker, preset, "--live-markers" in args)
+        result, (xyz, rgb, normals) = run(name, tracker, preset, "--live-markers" in args, "--optimise" in args)
         results.append(result)
         if name not in PRIVATE:
             render_views(xyz, normals, out / f"{name}.png")

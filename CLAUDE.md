@@ -105,6 +105,7 @@ python3 -m tribuutscan.markers captures/<stamp>   # find markers in a saved fram
 .venv/bin/python -m tribuutscan.cloud captures/<stamp>-rec [small|medium|large]
                                             # merged point cloud -> captures/<stamp>-scan/
 python3 -m tribuutscan.view3d captures/<stamp>-scan    # browser 3D view at http://localhost:8765
+.venv/bin/python -m tribuutscan.optimise captures/<stamp>-scan   # loop closures + pose graph + merge again
 .venv/bin/python -m tribuutscan.evaluate [datasets] [--label x] [--against report.json]
                                             # tracking metrics on saved + synthetic recordings
 .venv/bin/python -m tribuutscan.synth [out] [frames] [every] [hard]   # synthetic box scan, ground truth
@@ -206,6 +207,16 @@ P5 (live):
   continuing a scan).
 - Final against the first version: tilt 60% -> 1.1% doubled; face 13 -> 0 jumps; synthetic ATE
   1.2 / 1.3 / 0.94 mm (was 4.0 / 1.7 / 6.0).
+P6 (`optimise.py`, runs automatically after Stop; Process menu: Optimise again, Merge again at
+0.5/1/2 mm, Make mesh):
+- Loop candidates come from shared markers, ORB matches or nearby poses, at most 3 per keyframe and
+  at least 10 keyframes apart. Each is checked with `track.solve`. Then an Open3D pose graph
+  (preference_loop_closure 2.0 kept a true loop and pruned a 30 mm false one; 1.0 pruned both),
+  and the cloud is merged again from each merged frame's kept camera points (merged.npz).
+- Keyframe ATE on the synthetic sets 1.2/1.3/1.0 -> 0.19/0.28/0.34 mm; 5-15 s for 70-110
+  keyframes (every pair took 60 s for the same gain).
+- The mesh is Poisson from the oriented cloud (a TSDF mesh needs depth images, which are not kept).
+- Our real paths do not close a loop; a closed-loop recording is planned for the scanner session.
 Markers: the retroreflective dot usually has depth on this scanner (about 90% of its pixels), and a
 plane fitted to the ring around the dot is flat to about 0.3 mm.
 

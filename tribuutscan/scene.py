@@ -121,6 +121,18 @@ class Scene:
         mask[idx[piece]] = True
         return mask
 
+    def state(self):
+        """The kept plane and region, as plain JSON values."""
+        listed = lambda v: None if v is None else np.asarray(v).tolist()
+        return {"mode": self.mode, "plane": None if self.plane is None else [listed(self.plane[0]), self.plane[1]],
+                "axis": listed(self.axis), "radius": self.radius, "top": self.top}
+
+    def load(self, state):
+        if state.get("plane"):
+            self.plane = (np.array(state["plane"][0]), float(state["plane"][1]))
+        if state.get("axis") is not None:
+            self.axis, self.radius, self.top = np.array(state["axis"]), state["radius"], state["top"]
+
     def height(self, xyz_region):
         n, c = self.plane
         return xyz_region @ n + c

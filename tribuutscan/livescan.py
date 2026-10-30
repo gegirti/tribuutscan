@@ -36,26 +36,46 @@ class LiveSource:
     def __init__(self):
         self.lock = threading.Lock()
         self.scanner, self.name, self.scan_id = None, "no scan yet", 0
+        self.phase, self.out_dir, self.busy = "idle", None, threading.Lock()  # scanning / optimising / done
         self.cached, self.built_key, self.built_at = ("0", view3d.pack_arrays(np.empty((0, 3))), {}), None, 0.0
 
     def current(self):
         with self.lock:
             s = self.scanner
             if s is None:
-                return "empty", self.cached[1], {"name": self.name, "points": 0, "session": {}}
-            key = (self.scan_id, s.stats["merged"], s.stats["tracking"], s.cue.get("flat"))
+                return "empty", self.cached[1], {"name": self.name, "points": 0, "session": {}, "phase": self.phase}
+            key = (self.scan_id, s.stats["merged"], s.stats["tracking"], s.cue.get("flat"), self.phase,
+                   id(s.cloud), s.cloud.point_mm)
             if key != self.built_key and time.time() - self.built_at >= PAYLOAD_EVERY_S:
                 with s.cloud_lock:
                     xyz, rgb, seen = s.cloud.points(LIVE_MIN_SEEN)
                 payload = view3d.pack_arrays(xyz @ cl.FLIP.T / 1000, rgb, seen)
-                info = {"name": self.name, "points": len(xyz), "session": {
+                info = {"name": self.name, "points": len(xyz), "phase": self.phase,
+                        "mesh": bool(self.out_dir and (self.out_dir / "mesh.ply").exists()), "session": {
                     "preset": s.preset, "point_distance_mm": s.cloud.point_mm,
                     "raw_points": s.cloud.raw_points,
                     **{k: s.stats[k] for k in ("frames", "merged", "lost", "relocked", "tracking")},
                     "cue": dict(s.cue)}}
-                self.cached = (f"{key[0]}-{key[1]}", payload, info)
+                self.cached = ("-".join(map(str, key)), payload, info)
                 self.built_key, self.built_at = key, time.time()
             return self.cached
+
+
+    def process(self, action):
+        """A Process-menu action from the page, on the last finished scan."""
+        from . import optimise
+        if self.scanner is None or self.phase in ("scanning", "optimising"):
+            return "not now: no finished scan (or it is still being scanned or optimised)"
+        with self.busy:
+            self.phase = "optimising"
+            try:
+                return optimise.process(self.scanner, self.out_dir, action, log=lambda m: None)
+            finally:
+                self.phase = "done"
+                self.built_key = None
+
+    def mesh_path(self):
+        return self.out_dir / "mesh.ply" if self.out_dir else None
 
 
 def run(commands, replies, port=view3d.PORT):
@@ -95,6 +115,7 @@ def run(commands, replies, port=view3d.PORT):
                 source.scanner = cl.Scanner(preset, log=lambda m: replies.put(("log", m)))
                 source.scan_id += 1
                 source.name = f"live: {out_dir.name}"
+                source.phase, source.out_dir = "scanning", out_dir
         elif kind == "frame" and source.scanner is not None:
             _, yuyv, grey, y10, bytesperline, (t_c, t_i, t_d) = cmd
             if keep_raw:
@@ -118,7 +139,17 @@ def run(commands, replies, port=view3d.PORT):
             with source.lock:
                 path, kept = source.scanner.save(out_dir)
                 source.name = out_dir.name
+                source.phase = "optimising"
             replies.put(("saved", str(path), kept))
+            try:  # Optimise right away (user decision): loop closures, pose graph, merge again
+                from . import optimise
+                with source.busy:
+                    message = optimise.process(source.scanner, out_dir, "optimise", log=lambda m: None)
+                replies.put(("optimised", message))
+            except ImportError:
+                replies.put(("optimised", "not optimised: needs Open3D (.venv)"))
+            finally:
+                source.phase, source.built_key = "done", None
         elif kind == "quit":
             if server:
                 server.shutdown()

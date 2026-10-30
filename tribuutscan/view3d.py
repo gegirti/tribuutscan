@@ -70,6 +70,18 @@ class FileSource:
         self.version, self.payload, self.info = None, b"", {}
         self.lock = threading.Lock()
 
+    def process(self, action):
+        """A Process-menu action on the saved session (needs keyframes.npz and merged.npz)."""
+        from . import cloud as cl
+        from . import optimise
+        if not (self.ply.parent / "merged.npz").exists():
+            return "this session has no saved frames to process (scanned before sessions kept them)"
+        scanner = cl.Scanner.restore(self.ply.parent, log=lambda m: None)
+        return optimise.process(scanner, self.ply.parent, action, log=lambda m: None)
+
+    def mesh_path(self):
+        return self.ply.parent / "mesh.ply"
+
     def current(self):
         version = self.ply.stat().st_mtime_ns
         with self.lock:
@@ -77,7 +89,8 @@ class FileSource:
                 rec = read_ply(self.ply)
                 self.payload = pack_cloud(rec)
                 session = json.loads(self.session.read_text()) if self.session.exists() else {}
-                self.info = {"name": self.ply.parent.name, "points": len(rec), "session": session}
+                self.info = {"name": self.ply.parent.name, "points": len(rec), "session": session,
+                             "mesh": self.mesh_path().exists(), "phase": "done"}
                 self.version = version
             return self.version, self.payload, self.info
 
@@ -99,7 +112,22 @@ class Handler(BaseHTTPRequestHandler):
             return self.reply(payload, "application/octet-stream")
         if path == "/cloud.ply" and isinstance(self.source, FileSource):
             return self.reply(self.source.ply.read_bytes(), "application/octet-stream")
+        if path == "/mesh.ply":
+            mesh = self.source.mesh_path() if hasattr(self.source, "mesh_path") else None
+            if mesh is not None and mesh.exists():
+                return self.reply(mesh.read_bytes(), "application/octet-stream")
         self.send_error(404)
+
+    def do_POST(self):
+        """/process/<action>: optimise, small/medium/large (merge again) or mesh, on a finished scan."""
+        parts = self.path.split("?")[0].strip("/").split("/")
+        if len(parts) != 2 or parts[0] != "process" or not hasattr(self.source, "process"):
+            return self.send_error(404)
+        try:
+            message = self.source.process(parts[1])
+        except Exception as e:  # report to the page instead of dropping the connection
+            message = f"failed: {e}"
+        self.reply(json.dumps({"message": message}).encode(), "application/json")
 
     def reply(self, body, kind):
         self.send_response(200)
