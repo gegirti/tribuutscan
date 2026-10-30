@@ -18,10 +18,11 @@ is simply getting colour, IR and depth out of the scanner on Linux.
   `Co-Authored-By: Claude ...` trailer on commits.
 - **Ask before anything outward-facing**: pushing, publishing, changing repo visibility, creating
   releases or issues. The repo is public at https://github.com/gegirti/tribuutscan.
-- **Be honest about what is estimated.** Do not present these as calibrated or verified:
-  depth units and depth law, camera field of view (60 degrees is a guess), the colour-to-depth
-  registration (`REG`, eyeballed from one frame), the 17-32 cm depth window (a hypothesis from
-  hand-held wall readings). Say "estimate" in docs and output.
+- **Be honest about what is estimated.** Calibrated on 2026-10-30 (captures/calibration.json, on
+  this one scanner): depth intrinsics and lens distortion, the depth law, the colour camera, and
+  colour <-> depth registration. Still estimates: the near end of the depth window (17 cm, never
+  reached during calibration), depth noise, and anything computed WITHOUT calibration.json (the
+  ESTIMATES block in calib.py: 60 degree FOV, eyeballed REG). Say "estimate" for those.
 - Keep captures out of git: `captures/` is ignored (it holds photos of the workspace). Only
   `examples/` is meant to be public; check an image before adding it.
 - Match the existing style: small numpy-only modules, short docstrings, no heavy dependencies.
@@ -258,6 +259,23 @@ Scanner session preparation:
   (`frames.paired`: reading them in turn left them a frame or more apart).
 - A board page on a spiral pad was bowed by 6 mm: the depth map showed both ends 3-4.5 mm nearer
   than the middle. Tape the page flat on a desk.
+Calibration result (captures/calib/20261030-184110, 28 views, 19-33 cm, tilts to 47 degrees):
+- Reprojection colour 0.35 px, IR 0.32 px, stereo 0.34 px; even/odd halves agree within 0.2%.
+- Depth camera: fx 963.5, fy 962.5, cx 631.7, cy 390.8: 67.2 degree FOV (the 60 degree guess made
+  every cloud ~13% too narrow sideways). Small lens distortion.
+- Depth law z = 289570 / (v + 873.4) mm, the a/z form (median 0.30 mm; a/z^2 3.5 mm). The estimate
+  read 1.4% short at 25 cm and 3.6% short at 31 cm.
+- Colour camera: fx 851, fy 946: non-square pixels, which fits a 16:9 sensor squeezed into the
+  16:10 mode (1.11). It sits 19.6 mm sideways from the depth camera, turned 0.23 degrees.
+- On frames not used for calibration: a board square measured from depth is 24.03 mm (true 24.00;
+  the estimates gave 20.12), and colour lands on depth within 0.3 px (estimates 2.8 px).
+- Synthetic data always uses the estimated (pinhole) camera: `calib.use()` switches the shared model,
+  `synth.generate` and `evaluate.run` do it for synthetic sets.
+- Tracking with the calibration: synthetic unchanged, standing and kettle as good or better. The old
+  tilt recording doubled (1% -> 40%) after ONE wrong re-find (45 mm / 10.7 degrees after 2 lost
+  frames, inside the 2x gate of 60 mm / 30 degrees). That recording predates the timing fix (colour
+  up to ~90 ms from depth) and the tracker was tuned on it with the wrong geometry; a fresh
+  recording is needed before tuning the gate.
 - The solver finds colour/IR intrinsics, stereo extrinsics (`CALIB_FIX_INTRINSIC`), and the depth
   law per pixel against the board plane. It compares v = A/z + B with A/z^2 + B, which hand
   readings could not tell apart.
