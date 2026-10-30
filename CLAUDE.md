@@ -62,12 +62,18 @@ python3 -m tribuutscan.viewer               # live colour + IR + depth; `s` save
                                             # Auto IR button, distance guide (estimate)
 python3 -m tribuutscan.pointcloud [dir]     # .ply from a saved set, or grab a live one
 python3 -m tribuutscan.measure <cm>         # depth stats for a flat target at a known distance
+.venv/bin/python -m tribuutscan.fuse captures/<stamp>-rec   # ROUGH mesh.ply from a recording (Open3D)
 ```
 
 Beware `pkill -f ...tribuutscan.viewer` inside a shell command: the pattern matches the shell
 itself. Use `pgrep -f "^python3 -m tribuutscan.viewer"` and kill by PID.
 
 ## Pitfalls already hit
+
+- Open3D (0.20, in the gitignored `.venv`): the legacy `ScalableTSDFVolume` gives empty meshes on
+  this data. The tensor `VoxelBlockGrid` works, and its mesh extraction skips voxels seen in
+  fewer than 3 frames. Plain frame-to-frame ICP lost track when the object was moved, so
+  `fuse.py` uses coarse-to-fine ICP plus a check that rejects implausible jumps.
 
 - The v4l2_format union starts at byte 8 on 64-bit; getting this wrong silently ignores the
   requested format.
