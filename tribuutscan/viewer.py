@@ -6,10 +6,13 @@ Sliders set IR exposure/gain and colour brightness live. IR exposure and gain ar
 depth node: they change the IR sensor that depth is computed from. Auto IR steps them until the IR
 image has little clipping (clipping costs depth; see CLAUDE.md).
 The distance line reads the centre of the depth image; distances and the window are estimates.
+Press `m` or click Mesh to fuse the latest recording into mesh.ply (runs fuse.py in the Open3D .venv).
 """
+import subprocess
 import threading
 import time
 import tkinter as tk
+from pathlib import Path
 
 import numpy as np
 
@@ -35,6 +38,14 @@ AUTO_STEP_MS, AUTO_MAX_STEPS = 600, 16
 RECORD_FPS = 10  # about 43 MB/s of raw data
 
 GOOD, EDGE, BAD = "#2e7d32", "#ef6c00", "#c62828"
+
+REPO = Path(__file__).resolve().parent.parent
+VENV_PYTHON = REPO / ".venv" / "bin" / "python"  # has Open3D; see fuse.py
+
+
+def latest_recording():
+    recordings = sorted(fr.CAPTURES.glob("*-rec"))
+    return recordings[-1] if recordings else None
 
 
 def fit(rgb):
@@ -219,6 +230,7 @@ def main():
         recorder.close()
 
     def toggle_record(_event=None):
+        check_mesh()
         recorder = rec["recorder"]
         if recorder:
             rec["recorder"] = None
@@ -234,13 +246,51 @@ def main():
         rec["thread"].start()
         record_button.configure(text="Stop recording (r)")
 
+    job = {"process": None, "dir": None}
+
+    def mesh(_event=None):
+        """Fuse the latest recording in a separate process so the live view keeps running."""
+        if job["process"]:
+            message["text"] = f"still meshing {job['dir'].name}"
+            return
+        if rec["recorder"]:
+            message["text"] = "stop recording first"
+            return
+        directory = latest_recording()
+        if directory is None:
+            message["text"] = "no recording yet: press r to record"
+            return
+        if not VENV_PYTHON.exists():
+            message["text"] = "meshing needs Open3D in .venv (see fuse.py)"
+            return
+        job["process"] = subprocess.Popen(
+            [str(VENV_PYTHON), "-m", "tribuutscan.fuse", str(directory)], cwd=REPO,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        job["dir"] = directory
+        message["text"] = f"meshing {directory.name} ..."
+
+    def check_mesh():
+        process = job["process"]
+        if process is None or process.poll() is None:
+            return
+        lines = [ln for ln in process.stdout.read().splitlines() if ln.startswith(("mesh:", "Traceback"))]
+        if process.returncode == 0:
+            summary = lines[-1].split(" -> ")[0] if lines else "done"
+            message["text"] = f"meshed {job['dir'].name} ({summary}) -> mesh.ply"
+        else:
+            message["text"] = f"meshing {job['dir'].name} failed (exit {process.returncode})"
+        job["process"] = None
+
+    # Actions: buttons for now, a menu later.
     actions = tk.Frame(root)
     actions.grid(row=3, column=2, sticky="e")
     tk.Button(actions, text="Save frame (s)", command=save).pack(side="left")
     record_button = tk.Button(actions, text="Record (r)", command=toggle_record)
     record_button.pack(side="left")
+    tk.Button(actions, text="Mesh last recording (m)", command=mesh).pack(side="left")
     root.bind("s", save)
     root.bind("r", toggle_record)
+    root.bind("m", mesh)
 
     for s in streams.values():
         s.start()
@@ -255,6 +305,7 @@ def main():
             text, colour = distance_hint(depth.stats)
             guide.configure(text=text, fg=colour)
         fps = "  ".join(f"{n.split()[0]}: {s.fps:4.1f} fps {s.stats.get('text', '')}" for n, s in streams.items())
+        check_mesh()
         recorder = rec["recorder"]
         if recorder:
             message["text"] = f"REC {recorder.count} sets, {recorder.megabytes:.0f} MB"
