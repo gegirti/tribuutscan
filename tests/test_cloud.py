@@ -75,3 +75,23 @@ def test_normals_point_out_of_a_sphere():
     d /= np.linalg.norm(d, axis=1)[:, None]
     normals = cl.VoxelCloud(0.5).normals(d * 50)
     assert np.median(np.abs(np.sum(normals * d, 1))) > 0.99
+
+
+def test_scale_motion_halves_and_doubles():
+    t = np.eye(4)
+    a = np.radians(10)
+    t[:3, :3] = [[np.cos(a), -np.sin(a), 0], [np.sin(a), np.cos(a), 0], [0, 0, 1]]
+    t[:3, 3] = [0.01, 0, 0]
+    half = cl.scale_motion(t, 0.5)
+    assert np.allclose(half @ half, cl.scale_motion(t, 1.0), atol=1e-3)
+    assert abs(cl.turned(cl.scale_motion(t, 2.0))[1] - 20) < 1e-6
+
+
+def test_refind_gate_rejects_a_jump():
+    xyz = np.array([[0, 0, 250.0], [10, 0, 250], [0, 10, 260]])
+    jump = np.eye(4)
+    jump[0, 3] = 0.12  # 120 mm: what the first version accepted
+    assert not cl.plausible_step(jump, xyz, scale=cl.RELOCK_MAX_SCALE)
+    small = np.eye(4)
+    small[0, 3] = 0.02
+    assert cl.plausible_step(small, xyz)

@@ -13,6 +13,7 @@ process; Open 3D view shows it growing in the browser. Stop saves captures/<time
 Markers (white dot in a black ring) are found in the colour image a few times a second and ringed
 in the colour view; saved frames list them in info.json.
 """
+import collections
 import multiprocessing
 import os
 import queue
@@ -66,7 +67,11 @@ def fit(rgb):
 
 
 class Stream(threading.Thread):
-    """Reads one node in the background; keeps the latest raw frame, its preview and stats."""
+    """Reads one node in the background; keeps the latest raw frame, its preview and stats.
+
+    `stamp` is the camera's capture time (kernel timestamp, time.monotonic() scale); the last few
+    frames are kept so `nearest(t)` can pair streams by time instead of taking whatever is latest.
+    """
 
     def __init__(self, dev, fourcc, w, h, render):
         super().__init__(daemon=True)
@@ -76,6 +81,7 @@ class Stream(threading.Thread):
         self.stats = {}
         self.raw = None
         self.stamp = 0.0
+        self.recent = collections.deque(maxlen=4)  # (stamp, raw)
         self.fps = 0.0
 
     def run(self):
@@ -83,11 +89,20 @@ class Stream(threading.Thread):
         for buf in self.cap.frames():
             if len(buf) < self.cap.sizeimage:  # truncated USB transfer
                 continue
-            self.raw, self.stamp = buf, time.time()
+            self.raw, self.stamp = buf, self.cap.last_time
+            self.recent.append((self.stamp, buf))
             self.latest, self.stats = self.render(self.cap, buf)
             n += 1
             if time.time() - t0 >= 1:
                 self.fps, n, t0 = n / (time.time() - t0), 0, time.time()
+
+    def nearest(self, t):
+        """(raw, stamp) of the kept frame captured closest to time t."""
+        recent = list(self.recent)
+        if not recent:
+            return self.raw, self.stamp
+        stamp, raw = min(recent, key=lambda sr: abs(sr[0] - t))
+        return raw, stamp
 
     def stop(self):
         self.cap.close()
@@ -275,9 +290,9 @@ def main():
         while rec["recorder"] is recorder:
             t = time.time()
             if depth.stamp != last and color.raw and ir.raw:
-                last = depth.stamp
-                recorder.write({"color": color.raw, "ir": ir.raw, "depth": depth.raw},
-                               {"color": color.stamp, "ir": ir.stamp, "depth": depth.stamp})
+                d_raw, last = depth.raw, depth.stamp
+                (c_raw, c_t), (i_raw, i_t) = color.nearest(last), ir.nearest(last)
+                recorder.write({"color": c_raw, "ir": i_raw, "depth": d_raw}, {"color": c_t, "ir": i_t, "depth": last})
             time.sleep(max(0.0, 1 / RECORD_FPS - (time.time() - t)))
         recorder.close()
 
@@ -386,9 +401,11 @@ def main():
         """Hand the worker a new frame when it is free; handle its replies."""
         if live["scanning"] and live["inflight"] < 2 and color.raw and ir.raw and depth.raw \
                 and depth.stamp != live["sent"]:  # one frame in work, one waiting: the worker never idles
-            live["sent"] = depth.stamp
+            d_raw, d_t = depth.raw, depth.stamp
+            live["sent"] = d_t
             live["inflight"] += 1
-            live["commands"].put(("frame", color.raw, ir.raw, depth.raw, depth.cap.bytesperline))
+            (c_raw, c_t), (i_raw, i_t) = color.nearest(d_t), ir.nearest(d_t)
+            live["commands"].put(("frame", c_raw, i_raw, d_raw, depth.cap.bytesperline, (c_t, i_t, d_t)))
         while live["replies"] is not None:
             try:
                 kind, *rest = live["replies"].get_nowait()

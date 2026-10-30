@@ -4,7 +4,8 @@ The viewer starts it with the .venv Python when there is one (so ICP tracking wo
 to it over two queues. The worker also serves the browser 3D view of the growing cloud
 (view3d page), so cloud data never passes back through the viewer.
 
-Commands:  ("start", preset, out_dir, keep_raw) | ("frame", yuyv, grey, y10, bytesperline) | ("stop",) | ("quit",)
+Commands:  ("start", preset, out_dir, keep_raw) | ("frame", yuyv, grey, y10, bytesperline, (t_colour, t_ir, t_depth))
+           | ("stop",) | ("quit",)   (times: camera capture times, seconds)
 Replies:   ("ready", url) | ("log", text) | ("frame_done", merged, frames, points, tracking) | ("saved", path, points)
 
 With keep_raw, the frames the worker processed are also written to out_dir/<stamp>-rec/ (the
@@ -92,13 +93,13 @@ def run(commands, replies, port=view3d.PORT):
                 source.scan_id += 1
                 source.name = f"live: {out_dir.name}"
         elif kind == "frame" and source.scanner is not None:
-            _, yuyv, grey, y10, bytesperline = cmd
+            _, yuyv, grey, y10, bytesperline, (t_c, t_i, t_d) = cmd
             if keep_raw:
                 if recorder is None:
                     recorder = fr.Recorder(bytesperline, root=out_dir, extra={"note": "frames a live scan processed"})
-                now = time.time()
-                recorder.write({"color": yuyv, "ir": grey, "depth": y10}, {"color": now, "ir": now, "depth": now})
-            frame = {"yuyv": yuyv, "depth": decode_y10(y10, fr.W, fr.H, bytesperline)}  # colour decoded per point
+                recorder.write({"color": yuyv, "ir": grey, "depth": y10}, {"color": t_c, "ir": t_i, "depth": t_d})
+            frame = {"yuyv": yuyv, "depth": decode_y10(y10, fr.W, fr.H, bytesperline),  # colour decoded per point
+                     "t": t_d, "skew_ms": (t_c - t_d) * 1000}
             with source.lock:
                 s = source.scanner
                 s.feed(frame)

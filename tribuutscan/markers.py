@@ -146,16 +146,14 @@ def locate(depth, found):
 
     The retroreflective dot itself has no depth, so a plane is fitted to the valid depth in a ring
     around it and the camera ray through the dot's centre is intersected with that plane. Colour
-    pixels map to depth pixels by the rough registration estimate (pointcloud.REG).
+    pixels map to depth pixels through calib.CAMERA (an estimate until calibrated).
     """
-    from . import pointcloud as pc
+    from .calib import CAMERA
     h, w = depth.shape
-    f = (w / 2) / np.tan(np.radians(pc.HFOV_DEG) / 2)
-    reg = pc.REG
     out = []
     for x, y, r, _ in found:
-        u0, v0 = reg["ax"] * x + reg["bx"], reg["ay"] * y + reg["by"]
-        rd = max(r * reg["ax"], 2.0)
+        u0, v0 = CAMERA.depth_px(x, y)
+        rd = max(r * CAMERA.reg["ax"], 2.0)
         k = int(RING[1] * rd) + 1
         u_lo, u_hi, v_lo, v_hi = int(u0) - k, int(u0) + k + 1, int(v0) - k, int(v0) + k + 1
         if u_lo < 0 or v_lo < 0 or u_hi > w or v_hi > h:
@@ -168,15 +166,14 @@ def locate(depth, found):
         if ring.sum() < RING_MIN_PX:
             out.append(None)
             continue
-        z = pc.depth_to_mm(win[ring])
-        pts = np.stack([(uu[ring] - w / 2) * z / f, (vv[ring] - h / 2) * z / f, z], 1)
+        pts = CAMERA.backproject(uu[ring], vv[ring], CAMERA.depth_mm(win[ring]))
         centre = pts.mean(0)
         _, sv, vt = np.linalg.svd(pts - centre, full_matrices=False)
         normal = vt[2]
         if sv[2] / np.sqrt(len(pts)) > RING_MAX_RMS_MM:
             out.append(None)  # not flat: the marker sits on an edge or the depth is noisy
             continue
-        ray = np.array([(u0 - w / 2) / f, (v0 - h / 2) / f, 1.0])
+        ray = CAMERA.backproject(u0, v0, 1.0)
         point = ray * (normal @ centre) / (normal @ ray)
         out.append((point, normal if normal @ point < 0 else -normal))
     return out

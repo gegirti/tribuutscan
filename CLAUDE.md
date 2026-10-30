@@ -134,6 +134,17 @@ doubled and the good scan. Baseline (frame-to-frame ICP + relock):
 | synthhard | 0 | 0.38 | 1.1 mm | 6.0 mm |
 
 The doubled black part came from `relock()` accepting impossible jumps (117-193 mm / 42-64 degrees).
+P1 (tracker "current" in evaluate.py; "baseline" keeps the first version):
+- re-finds are gated (a believable step from the last good pose, at most 2x the normal limit)
+- the next-frame guess follows real time
+- `prep.clean` drops window/jump/grazing/edge/speckle pixels, but only for MERGING. Tracking on
+  cleaned depth doubled the frame-to-frame error on the synthetic box: depth edges and steep
+  faces are what hold flat objects in place.
+- results: tilt 0 jumps (was 4) and 39% doubled (was 60%); face 2 jumps (was 13); synthetic ATE
+  unchanged
+- camera constants live in `calib.py` (`CAMERA`, estimates until captures/calibration.json exists)
+- `v4l2.Capture` exposes the kernel capture time (`last_time`, monotonic) and sequence number; the
+  viewer pairs streams by nearest capture time. This is not yet checked on the scanner.
 Markers: the retroreflective dot usually has depth on this scanner (about 90% of its pixels), and a
 plane fitted to the ring around the dot is flat to about 0.3 mm.
 

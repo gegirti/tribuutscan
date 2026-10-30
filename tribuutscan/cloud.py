@@ -23,6 +23,8 @@ import numpy as np
 from . import frames as fr
 from . import markers
 from . import pointcloud as pc
+from . import prep
+from .calib import CAMERA
 from .image import yuyv_pixels, yuyv_to_rgb
 
 PRESETS_MM = {"small": 0.5, "medium": 1.0, "large": 2.0}  # point distance; depth noise ~1 mm (estimate)
@@ -41,6 +43,7 @@ CLUSTER_CELL_MM = 6.0  # cell size for finding the connected piece at the centre
 KEY_MOVE_MM, KEY_TURN_DEG = 3.0, 2.0  # merge a frame only after this much motion since the last one
 MAX_STEP_MM, MAX_STEP_DEG = 30.0, 15.0  # larger jumps between tracked frames are tracking failures
 RELOCK_FITNESS = 0.6  # after a loss, a frame must match this share of its points to the cloud so far
+RELOCK_MAX_SCALE = 2.0  # a re-found pose may be at most this many normal steps from the last good one
 BIAS = 1 << 20  # voxel coordinates are packed into one int64 key, 21 bits each
 FLIP = np.diag([1.0, -1.0, -1.0])  # camera (y down, z forward) -> y up, z toward scanner
 
@@ -152,25 +155,22 @@ def frame_points(frame, stride=1, normals=False):
     valid = ds > 0
     v, u = np.nonzero(valid)
     v, u = v * stride, u * stride
-    z = pc.depth_to_mm(d[v, u])
-    f = (w / 2) / np.tan(np.radians(pc.HFOV_DEG) / 2)
-    xyz = np.stack([(u - w / 2) * z / f, (v - h / 2) * z / f, z], 1)
+    xyz = CAMERA.backproject(u, v, pc.depth_to_mm(d[v, u]))
     if "color" in frame:
         rgb = pc.register_color(frame["color"])[v, u]
     else:
         rgb = yuyv_pixels(frame["yuyv"], w, *pc.color_source(u, v, w, h))
     if not normals:
         return xyz, rgb, np.stack([u, v], 1)
-    return xyz, rgb, np.stack([u, v], 1), grid_normals(ds, stride, f)[valid]
+    return xyz, rgb, np.stack([u, v], 1), grid_normals(ds, stride)[valid]
 
 
-def grid_normals(ds, stride, f):
+def grid_normals(ds, stride):
     """Unit normals of an organised depth grid (raw values, every `stride`-th pixel), facing the camera."""
     hs, ws = ds.shape
-    h, w = hs * stride, ws * stride
     vv, uu = np.mgrid[0:hs, 0:ws] * stride
     z = np.where(ds > 0, pc.depth_to_mm(ds), np.nan)
-    grid = np.stack([(uu - w / 2) * z / f, (vv - h / 2) * z / f, z], -1)
+    grid = CAMERA.backproject(uu, vv, z)
     dx, dy = np.full_like(grid, np.nan), np.full_like(grid, np.nan)
     dx[:, 1:-1] = grid[:, 2:] - grid[:, :-2]
     dy[1:-1] = grid[2:] - grid[:-2]
@@ -291,16 +291,31 @@ def isolate(xyz, rgb, pix, shape, rng):
     return xyz[keep], rgb[keep], had_plane
 
 
-def plausible_step(t, xyz):
+def plausible_step(t, xyz, scale=1.0):
     """Is a frame-to-frame motion believable? Judged at the object's centre, not the camera.
 
     Turning the object a few degrees in place swings the camera-equivalent pose by centimetres
     (it is ~25 cm away), so a limit on camera movement wrongly rejects it. The object's own centre
-    barely moves in that case; a tracking failure moves it a lot.
+    barely moves in that case; a tracking failure moves it a lot. `scale` widens the limits (for
+    re-finding after a few lost frames).
     """
     c = xyz.mean(0) / 1000
     moved_mm = np.linalg.norm(t[:3, :3] @ c + t[:3, 3] - c) * 1000
-    return moved_mm <= MAX_STEP_MM and turned(t)[1] <= MAX_STEP_DEG
+    return moved_mm <= MAX_STEP_MM * scale and turned(t)[1] <= MAX_STEP_DEG * scale
+
+
+def scale_motion(t, s):
+    """The rigid motion `t` (4x4) stretched to `s` times as long (constant velocity), via axis-angle."""
+    angle = np.arccos(np.clip((np.trace(t[:3, :3]) - 1) / 2, -1, 1))
+    out = np.eye(4)
+    out[:3, 3] = t[:3, 3] * s
+    if angle > 1e-9:
+        r = t[:3, :3]
+        axis = np.array([r[2, 1] - r[1, 2], r[0, 2] - r[2, 0], r[1, 0] - r[0, 1]]) / (2 * np.sin(angle))
+        k = np.array([[0, -axis[2], axis[1]], [axis[2], 0, -axis[0]], [-axis[1], axis[0], 0]])
+        a = angle * s
+        out[:3, :3] = np.eye(3) + np.sin(a) * k + (1 - np.cos(a)) * k @ k
+    return out
 
 
 def turned(t):
@@ -309,9 +324,16 @@ def turned(t):
 
 
 class Scanner:
-    """Feeds frames one at a time: isolate the object, track it (ICP, if Open3D is present), merge."""
+    """Feeds frames one at a time: isolate the object, track it (ICP, if Open3D is present), merge.
 
-    def __init__(self, preset="small", log=print):
+    Options (all on by default; off reproduces the first version, for evaluate.py's baseline):
+    clean_depth (prep.clean: "merge" cleans only what is merged and tracks on the uncleaned depth,
+    whose edges and steep faces hold flat objects in place; True cleans both), gate_refind
+    (re-found poses must be plausible), motion_dt (the next-frame guess follows the real time
+    between frames).
+    """
+
+    def __init__(self, preset="small", log=print, clean_depth="merge", gate_refind=True, motion_dt=True):
         try:
             from . import fuse  # Open3D: frame-to-frame ICP
         except ImportError:
@@ -326,6 +348,8 @@ class Scanner:
         self.model, self.model_merged = None, -1  # cloud-so-far, prepared for relocking
         self.stats = {"frames": 0, "merged": 0, "lost": 0, "relocked": 0, "plane_frames": 0, "markers": [],
                       "tracking": True}
+        self.clean_depth, self.gate_refind, self.motion_dt = clean_depth, gate_refind, motion_dt
+        self.last_t, self.motion_s, self.lost_run = None, None, 0  # time of the last tracked frame, of `motion`
         self.track_log = []  # per frame: (index, status, pose or None); for evaluation
         self.on_merge = None  # optional callback(index, world_xyz_mm, rgb, world_normals, pose)
 
@@ -334,31 +358,41 @@ class Scanner:
         stats, fuse = self.stats, self.fuse
         index = stats["frames"] if index is None else index
         stats["frames"] += 1
+        if self.clean_depth is True:  # track on cleaned depth as well
+            frame = self.cleaned(frame)
         xyz, rgb, pix, nrm = frame_points(frame, self.stride, normals=True)
         keep, had_plane = isolate_mask(xyz, pix, frame["depth"].shape, self.rng)
-        xyz, rgb, nrm = xyz[keep], rgb[keep], nrm[keep]
+        xyz, rgb, nrm, pix = xyz[keep], rgb[keep], nrm[keep], pix[keep]
         stats["plane_frames"] += had_plane
         if len(xyz) < 500 // self.stride ** 2:
             stats["lost"] += 1
             stats["tracking"] = False
+            self.lost_run += 1
             self.track_log.append((index, "too few points", None))
             return False
+        t = frame.get("t")
+        guess = self.motion
+        if self.motion_dt and t is not None and self.last_t is not None and self.motion_s:
+            guess = scale_motion(self.motion, (t - self.last_t) / self.motion_s)
         status = "first" if self.prev is None else "tracked"
         if fuse is not None:
             levels = fuse.levels(xyz / 1000)
             if self.prev is not None:
-                result = fuse.icp(levels, self.prev, self.motion)
+                result = fuse.icp(levels, self.prev, guess)
                 if result.fitness >= fuse.MIN_FITNESS and plausible_step(result.transformation, xyz):
                     self.motion = result.transformation
+                    self.motion_s = (t - self.last_t) if (t is not None and self.last_t is not None) else None
                     self.pose = self.pose @ self.motion
-                elif self.relock(levels):
+                elif self.relock(levels, xyz):
                     stats["relocked"] += 1
                     status = "relocked"
                 else:
                     stats["lost"] += 1
                     stats["tracking"] = False
+                    self.lost_run += 1
                     self.track_log.append((index, "lost", None))
                     return False
+            self.last_t, self.lost_run = t, 0
             self.prev = levels
             stats["tracking"] = True
         self.track_log.append((index, status, self.pose.copy()))
@@ -366,11 +400,18 @@ class Scanner:
             move, turn = turned(np.linalg.inv(self.last_merged) @ self.pose)
             if fuse is not None and move < KEY_MOVE_MM and turn < KEY_TURN_DEG:
                 return False
-        world = xyz @ self.pose[:3, :3].T + self.pose[:3, 3] * 1000
-        world_nrm = nrm @ self.pose[:3, :3].T
-        self.cloud.add(world, rgb, world_nrm)
+        mxyz, mrgb, mnrm = xyz, rgb, nrm
+        if self.clean_depth == "merge":  # merge the cleaned pixels of the same isolated object
+            kept = np.zeros(frame["depth"].shape, bool)
+            kept[pix[:, 1], pix[:, 0]] = True
+            cxyz, crgb, cpix, cnrm = frame_points(self.cleaned(frame), self.stride, normals=True)
+            sel = kept[cpix[:, 1], cpix[:, 0]]
+            mxyz, mrgb, mnrm = cxyz[sel], crgb[sel], cnrm[sel]
+        world = mxyz @ self.pose[:3, :3].T + self.pose[:3, 3] * 1000
+        world_nrm = mnrm @ self.pose[:3, :3].T
+        self.cloud.add(world, mrgb, world_nrm)
         if self.on_merge is not None:
-            self.on_merge(index, world, rgb, world_nrm, self.pose.copy())
+            self.on_merge(index, world, mrgb, world_nrm, self.pose.copy())
         self.last_merged = self.pose.copy()
         self.poses.append((index, self.pose.copy()))
         stats["merged"] += 1
@@ -379,10 +420,20 @@ class Scanner:
             stats["markers"] = [[round(x, 1), round(y, 1)] for x, y, *_ in markers.detect(markers.luma(color), rgb=color)]
         return True
 
-    def relock(self, levels):
+    def cleaned(self, frame):
+        """The frame with prep.clean applied to the pixels tracking samples (every stride-th)."""
+        s, d = self.stride, frame["depth"]
+        out = np.zeros_like(d)
+        out[::s, ::s] = prep.clean(d[::s, ::s], s)
+        return dict(frame, depth=out)
+
+    def relock(self, levels, xyz):
         """Tracking failed: try to place the frame against the cloud so far, from the last known pose.
 
         Works when the scanner comes back near where tracking was lost (like the app's "move back").
+        With gate_refind, the re-found pose must be a believable step from the last good pose
+        (limits widen with the frames lost, up to RELOCK_MAX_SCALE): the first version accepted
+        jumps of 120-190 mm, which merged shifted copies of the object.
         """
         if not len(self.cloud):
             return False
@@ -392,7 +443,11 @@ class Scanner:
         result = self.fuse.icp(levels, self.model, self.pose)
         if result.fitness < RELOCK_FITNESS:
             return False
-        self.pose, self.motion = result.transformation, np.eye(4)
+        if self.gate_refind:
+            jump = np.linalg.inv(self.pose) @ result.transformation  # current camera -> last good camera
+            if not plausible_step(jump, xyz, min(self.lost_run + 1, RELOCK_MAX_SCALE)):
+                return False
+        self.pose, self.motion, self.motion_s = result.transformation, np.eye(4), None
         return True
 
     def save(self, directory, min_seen=MIN_SEEN):

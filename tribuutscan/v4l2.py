@@ -8,6 +8,7 @@ import mmap
 import os
 import select
 import struct
+import time
 from pathlib import Path
 
 VIDIOC_S_FMT = 0xC0D05605
@@ -100,6 +101,13 @@ def set_control(dev, cid, value):
         os.close(fd)
 
 
+def buffer_time(b):
+    """(kernel timestamp in seconds, sequence number) of a dequeued v4l2_buffer (64-bit layout:
+    struct timeval at byte 24, sequence at byte 56)."""
+    sec, usec = struct.unpack_from("<qq", b, 24)
+    return sec + usec / 1e6, struct.unpack_from("<I", b, 56)[0]
+
+
 class Capture:
     """One streaming capture node. Iterate `frames()` for raw frame bytes."""
 
@@ -134,7 +142,11 @@ class Capture:
         return b
 
     def read(self, timeout=5.0):
-        """Block for the next frame and return it as bytes, or None on timeout."""
+        """Block for the next frame and return it as bytes, or None on timeout.
+
+        Also sets `last_time` (kernel capture time, seconds on the CLOCK_MONOTONIC scale of
+        time.monotonic(); time.monotonic() at dequeue if the driver gave none) and `last_sequence`.
+        """
         if not select.select([self.fd], [], [], timeout)[0]:
             return None
         b = self._buffer()
@@ -143,6 +155,9 @@ class Capture:
         used = struct.unpack_from("<I", b, 8)[0]
         data = bytes(self._bufs[index][:used])
         fcntl.ioctl(self.fd, VIDIOC_QBUF, b)
+        self.last_time, self.last_sequence = buffer_time(b)
+        if not self.last_time:
+            self.last_time = time.monotonic()
         return data
 
     def frames(self):

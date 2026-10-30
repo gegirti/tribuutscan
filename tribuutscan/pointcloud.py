@@ -3,11 +3,9 @@
     python3 -m tribuutscan.pointcloud                    # grab a frame set now
     python3 -m tribuutscan.pointcloud captures/<stamp>   # use a saved set
 
-Assumptions, all unverified:
-  * raw depth -> distance uses the hand-measured fit  z_cm = A / (v + B)  (see README);
-  * pinhole camera with a guessed horizontal field of view and centred principal point;
-  * colour -> depth registration is a rough affine ESTIMATE read off box edges in one frame
-    (REG below): depth_x = AX * colour_x + BX, depth_y = colour_y + BY. Not a calibration.
+The camera model (depth law, intrinsics, colour registration) comes from calib.CAMERA: a real
+calibration when captures/calibration.json exists, otherwise ESTIMATES (hand-measured depth fit,
+guessed field of view, colour registration eyeballed from one frame). Not a calibration until then.
 Output units are millimetres, x right, y up, z away from the scanner.
 """
 import sys
@@ -16,40 +14,34 @@ from pathlib import Path
 import numpy as np
 
 from . import frames as fr
+from .calib import CAMERA
 
-A, B = 31634.0, 998.0  # z_cm = A / (v + B), fitted on 20/25/30 cm readings
-HFOV_DEG = 60.0  # guess
-WINDOW_CM = (17.0, 32.0)  # depth window ESTIMATE from hand-held readings; beyond it depth is 0
-REG = {"ax": 1.134, "bx": -30.6, "ay": 1.0, "by": 5.0}  # eyeballed from one frame, see docstring
+WINDOW_CM = tuple(z / 10 for z in CAMERA.window_mm)  # beyond it depth is 0 (estimate until calibrated)
 
 
-def color_source(u, v, w, h, reg=REG):
-    """Colour-image pixel (x, y) for depth pixel (u, v), by the rough affine estimate."""
-    src_x = np.clip(np.round((u - reg["bx"]) / reg["ax"]).astype(int), 0, w - 1)
-    src_y = np.clip(np.round((v - reg["by"]) / reg["ay"]).astype(int), 0, h - 1)
-    return src_x, src_y
+def color_source(u, v, w, h):
+    """Colour-image pixel (x, y) (rounded, clipped) for depth pixel (u, v)."""
+    x, y = CAMERA.colour_px(u, v)
+    return np.clip(np.round(x).astype(int), 0, w - 1), np.clip(np.round(y).astype(int), 0, h - 1)
 
 
-def register_color(color, reg=REG):
-    """Resample colour onto the depth pixel grid using the rough affine estimate."""
+def register_color(color):
+    """Resample colour onto the depth pixel grid."""
     h, w = color.shape[:2]
-    src_x, src_y = color_source(np.arange(w), np.arange(h), w, h, reg)
+    src_x, src_y = color_source(np.arange(w), np.arange(h), w, h)
     return color[src_y][:, src_x]
 
 
 def depth_to_mm(v):
-    return 10.0 * A / (v.astype(np.float64) + B)
+    return CAMERA.depth_mm(v)
 
 
-def to_points(depth, rgb, hfov_deg=HFOV_DEG):
-    h, w = depth.shape
+def to_points(depth, rgb):
     mask = depth > 0
-    f = (w / 2) / np.tan(np.radians(hfov_deg) / 2)
     v, u = np.nonzero(mask)
-    z = depth_to_mm(depth[v, u])
-    x = (u - w / 2) * z / f
-    y = -(v - h / 2) * z / f
-    return np.stack([x, y, z], 1).astype(np.float32), rgb[v, u]
+    xyz = CAMERA.backproject(u, v, depth_to_mm(depth[v, u]))
+    xyz[:, 1] *= -1  # y up for this export
+    return xyz.astype(np.float32), rgb[v, u]
 
 
 def write_ply(path, xyz, rgb, normals=None, seen=None):

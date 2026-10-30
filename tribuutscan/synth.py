@@ -20,10 +20,10 @@ import open3d.core as o3c
 
 from . import frames as fr
 from . import pointcloud as pc
+from .calib import CAMERA
 from .depth import encode_y10
 
 W, H = fr.W, fr.H
-F = (W / 2) / np.tan(np.radians(pc.HFOV_DEG) / 2)
 BOX = np.array([0.12, 0.08, 0.06])  # flat-faced object, metres, standing on the table at z = 0
 NOISE_MM = 0.5  # depth noise (estimate of the scanner's)
 TOP_MARKERS = [(-0.042, 0.021), (0.031, -0.026), (0.047, 0.029), (-0.013, -0.031), (0.004, 0.012)]
@@ -110,7 +110,7 @@ def texture(material_name, hit):
 def render(scene, material, cam_to_world, rng):
     """(raw depth (H, W) uint16, colour RGB (H, W, 3) uint8 in colour-camera pixels) for one view."""
     world_to_cam = np.linalg.inv(cam_to_world)
-    K = o3c.Tensor([[F, 0, W / 2], [0, F, H / 2], [0, 0, 1]], o3c.float64)
+    K = o3c.Tensor(CAMERA.intrinsic_matrix(), o3c.float64)
     rays = o3d.t.geometry.RaycastingScene.create_rays_pinhole(K, o3c.Tensor(world_to_cam), W, H)
     ans = scene.cast_rays(rays)
     t = ans["t_hit"].numpy()
@@ -135,12 +135,13 @@ def render(scene, material, cam_to_world, rng):
     jump[1:-1] |= np.abs(zz[2:] - zz[:-2]) > 8
     ok &= ~(jump & (rng.random(z.shape) < 0.6))
     raw = np.zeros((H, W), np.uint16)
-    v = np.round(pc.A / (zn[ok] / 10) - pc.B)
+    v = np.round(CAMERA.raw_from_mm(zn[ok]))
     raw[ok] = np.clip(v, 1, 1023).astype(np.uint16)
     # colour camera image: sample the depth-grid render through the registration estimate
     ys, xs = np.mgrid[0:H, 0:W]
-    u = np.clip(np.round(pc.REG["ax"] * xs + pc.REG["bx"]).astype(int), 0, W - 1)
-    vv = np.clip(np.round(pc.REG["ay"] * ys + pc.REG["by"]).astype(int), 0, H - 1)
+    u, vv = CAMERA.depth_px(xs, ys)
+    u = np.clip(np.round(u).astype(int), 0, W - 1)
+    vv = np.clip(np.round(vv).astype(int), 0, H - 1)
     colour = np.clip(grey[vv, u] + rng.normal(0, 2, (H, W)), 0, 255)
     return raw, np.repeat(colour[..., None], 3, axis=2).astype(np.uint8)
 

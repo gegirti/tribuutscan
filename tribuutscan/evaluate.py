@@ -62,8 +62,13 @@ def cached_markers(name, directory):
 
 
 def make_scanner(tracker, preset):
-    if tracker == "baseline":
-        return cl.Scanner(preset, log=lambda m: None)
+    quiet = lambda m: None
+    if tracker == "baseline":  # the first version: no depth cleanup, ungated re-finds, fixed-step guess
+        return cl.Scanner(preset, log=quiet, clean_depth=False, gate_refind=False, motion_dt=False)
+    if tracker == "current":
+        return cl.Scanner(preset, log=quiet)
+    if tracker == "cleanboth":  # P1 with tracking on cleaned depth too (worse on ground truth)
+        return cl.Scanner(preset, log=quiet, clean_depth=True)
     raise ValueError(f"unknown tracker {tracker}")
 
 
@@ -157,7 +162,7 @@ def show(results, against=None):
 def main():
     args = sys.argv[1:]
     opt = lambda flag, default=None: args[args.index(flag) + 1] if flag in args else default
-    tracker, preset, label = opt("--tracker", "baseline"), opt("--preset", "small"), opt("--label", "run")
+    tracker, preset, label = opt("--tracker", "current"), opt("--preset", "small"), opt("--label", "run")
     against = json.loads(Path(opt("--against")).read_text()) if "--against" in args else None
     skip = {opt(f) for f in ("--tracker", "--preset", "--label", "--against")}
     names = [a for a in args if not a.startswith("--") and a not in skip] or list(DATASETS)

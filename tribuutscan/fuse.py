@@ -22,6 +22,7 @@ import open3d.core as o3c
 
 from . import frames as fr
 from . import pointcloud as pc
+from .calib import CAMERA
 
 VOXEL_M = 0.0015  # TSDF voxel
 TRUNC_M = 0.006  # TSDF truncation
@@ -34,8 +35,8 @@ FLIP = np.diag([1.0, -1.0, -1.0, 1.0])  # camera (y down, z forward) -> y up, z 
 
 
 def intrinsic(w=fr.W, h=fr.H):
-    f = (w / 2) / np.tan(np.radians(pc.HFOV_DEG) / 2)
-    return o3d.camera.PinholeCameraIntrinsic(w, h, f, f, w / 2, h / 2)
+    c = CAMERA
+    return o3d.camera.PinholeCameraIntrinsic(w, h, c.fx, c.fy, c.cx, c.cy)
 
 
 def images(frame):

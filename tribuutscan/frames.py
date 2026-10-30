@@ -104,10 +104,20 @@ class Recorder:
 
 
 def read_recording(directory):
-    """Yield decoded frame sets (as from `decode`) from a Recorder directory."""
+    """Yield decoded frame sets (as from `decode`) from a Recorder directory.
+
+    Each set also carries "t" (depth timestamp, s) and "skew_ms" (colour minus depth time) when the
+    recording has stamps.csv.
+    """
     directory = Path(directory)
     info = json.loads((directory / "info.json").read_text())
     data = {k: np.memmap(directory / f"{k}.raw", np.uint8, "r") for k in STREAMS}
+    stamps_file = directory / "stamps.csv"
+    stamps = np.loadtxt(stamps_file, delimiter=",", skiprows=1, ndmin=2) if stamps_file.exists() else None
     for i in range(len(data["depth"]) // FRAME_BYTES["depth"]):
         bufs = [data[k][i * FRAME_BYTES[k]:(i + 1) * FRAME_BYTES[k]].tobytes() for k in STREAMS]
-        yield decode(*bufs, info["depth_bytesperline"])
+        frame = decode(*bufs, info["depth_bytesperline"])
+        if stamps is not None and i < len(stamps):
+            frame["t"] = float(stamps[i, 3])
+            frame["skew_ms"] = float((stamps[i, 1] - stamps[i, 3]) * 1000)
+        yield frame
