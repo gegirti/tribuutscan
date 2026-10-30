@@ -61,3 +61,53 @@ def save(frames, root=CAPTURES, extra=None):
         **(extra or {}),
     }, indent=2))
     return out
+
+
+STREAMS = ("color", "ir", "depth")
+FRAME_BYTES = {"color": W * H * 2, "ir": W * H, "depth": W * H * 10 // 8}  # YUYV, GREY, packed Y10
+
+
+class Recorder:
+    """Append raw frame sets to captures/<timestamp>-rec/: one file per stream plus stamps.csv.
+
+    Frames are stored undecoded (about 4.3 MB per set) so recording keeps up with the camera;
+    `read_recording` decodes them later.
+    """
+
+    def __init__(self, depth_bytesperline, root=CAPTURES, extra=None):
+        self.dir = Path(root) / (time.strftime("%Y%m%d-%H%M%S") + "-rec")
+        self.dir.mkdir(parents=True, exist_ok=True)
+        (self.dir / "info.json").write_text(json.dumps({
+            "size": [W, H], "depth_bytesperline": depth_bytesperline, "frame_bytes": FRAME_BYTES,
+            "note": "raw sensor buffers; ir is NOT flipped here (read_recording flips it)",
+            **(extra or {}),
+        }, indent=2))
+        self.files = {k: open(self.dir / f"{k}.raw", "wb") for k in STREAMS}
+        self.stamps = open(self.dir / "stamps.csv", "w")
+        self.stamps.write("index,color_t,ir_t,depth_t\n")
+        self.count = 0
+
+    def write(self, bufs, stamps):
+        """bufs/stamps: dicts keyed by stream name; buffers are cut to their fixed frame size."""
+        for k in STREAMS:
+            self.files[k].write(bufs[k][: FRAME_BYTES[k]])
+        self.stamps.write(f"{self.count}," + ",".join(f"{stamps[k]:.4f}" for k in STREAMS) + "\n")
+        self.count += 1
+
+    @property
+    def megabytes(self):
+        return self.count * sum(FRAME_BYTES.values()) / 1e6
+
+    def close(self):
+        for f in (*self.files.values(), self.stamps):
+            f.close()
+
+
+def read_recording(directory):
+    """Yield decoded frame sets (as from `decode`) from a Recorder directory."""
+    directory = Path(directory)
+    info = json.loads((directory / "info.json").read_text())
+    data = {k: np.memmap(directory / f"{k}.raw", np.uint8, "r") for k in STREAMS}
+    for i in range(len(data["depth"]) // FRAME_BYTES["depth"]):
+        bufs = [data[k][i * FRAME_BYTES[k]:(i + 1) * FRAME_BYTES[k]].tobytes() for k in STREAMS]
+        yield decode(*bufs, info["depth_bytesperline"])

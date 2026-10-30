@@ -4,7 +4,7 @@ import zlib
 
 import numpy as np
 
-DEPTH_MAX = 200  # raw depth values are ~1..200 in the default window; display scale only
+DEPTH_MAX = 900  # raw depth: ~280 at 25 cm, ~860 at 17 cm (estimate); display scale only
 
 
 def yuyv_to_rgb(buf, w, h):

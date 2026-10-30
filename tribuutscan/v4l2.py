@@ -147,7 +147,12 @@ class Capture:
 
     def frames(self):
         while self._streaming:
-            data = self.read()
+            try:
+                data = self.read()
+            except OSError:
+                if self._streaming:
+                    raise
+                return  # closed from another thread mid-read
             if data is not None:
                 yield data
 

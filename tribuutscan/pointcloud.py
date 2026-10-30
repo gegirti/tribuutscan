@@ -19,6 +19,7 @@ from . import frames as fr
 
 A, B = 31634.0, 998.0  # z_cm = A / (v + B), fitted on 20/25/30 cm readings
 HFOV_DEG = 60.0  # guess
+WINDOW_CM = (17.0, 32.0)  # depth window ESTIMATE from hand-held readings; beyond it depth is 0
 REG = {"ax": 1.134, "bx": -30.6, "ay": 1.0, "by": 5.0}  # eyeballed from one frame, see docstring
 
 

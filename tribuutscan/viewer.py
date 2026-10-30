@@ -1,8 +1,11 @@
 """Live viewer: colour, IR and depth side by side. Run with `python -m tribuutscan.viewer`.
 
 Press `s` or click Save to write the current frame set to captures/<timestamp>/.
+Press `r` or click Record to start/stop recording raw frame sets to captures/<timestamp>-rec/.
 Sliders set IR exposure/gain and colour brightness live. IR exposure and gain are controls on the
-depth node: they change the IR sensor that depth is computed from.
+depth node: they change the IR sensor that depth is computed from. Auto IR steps them until the IR
+image has little clipping (clipping costs depth; see CLAUDE.md).
+The distance line reads the centre of the depth image; distances and the window are estimates.
 """
 import threading
 import time
@@ -24,6 +27,15 @@ SLIDERS = [
     ("Colour brightness", "color", v4l2.CID_BRIGHTNESS),
 ]
 
+# Auto IR: keep clipped pixels between CLIP_LO and CLIP_HI percent; brighten only if the mean is low.
+CLIP_LO, CLIP_HI, MEAN_LO = 0.3, 2.0, 35
+GAIN_CAP = 2000  # auto never raises gain past this (gain clipped badly in the 25 cm test)
+AUTO_STEP_MS, AUTO_MAX_STEPS = 600, 16
+
+RECORD_FPS = 10  # about 43 MB/s of raw data
+
+GOOD, EDGE, BAD = "#2e7d32", "#ef6c00", "#c62828"
+
 
 def fit(rgb):
     step = max(1, rgb.shape[1] // PANE_W)
@@ -31,15 +43,16 @@ def fit(rgb):
 
 
 class Stream(threading.Thread):
-    """Reads one node in the background; keeps the latest raw frame and its rendered preview."""
+    """Reads one node in the background; keeps the latest raw frame, its preview and stats."""
 
     def __init__(self, dev, fourcc, w, h, render):
         super().__init__(daemon=True)
         self.cap = v4l2.Capture(dev, fourcc, w, h)
         self.render = render
         self.latest = None
-        self.info = ""
+        self.stats = {}
         self.raw = None
+        self.stamp = 0.0
         self.fps = 0.0
 
     def run(self):
@@ -47,8 +60,8 @@ class Stream(threading.Thread):
         for buf in self.cap.frames():
             if len(buf) < self.cap.sizeimage:  # truncated USB transfer
                 continue
-            self.raw = buf
-            self.latest, self.info = self.render(self.cap, buf)
+            self.raw, self.stamp = buf, time.time()
+            self.latest, self.stats = self.render(self.cap, buf)
             n += 1
             if time.time() - t0 >= 1:
                 self.fps, n, t0 = n / (time.time() - t0), 0, time.time()
@@ -58,19 +71,42 @@ class Stream(threading.Thread):
 
 
 def render_color(cap, buf):
-    return ppm(fit(yuyv_to_rgb(buf, cap.width, cap.height))), ""
+    return ppm(fit(yuyv_to_rgb(buf, cap.width, cap.height))), {"text": ""}
 
 
 def render_ir(cap, buf):
     g = np.frombuffer(buf, np.uint8, cap.width * cap.height).reshape(cap.height, cap.width)
     g = fit(g[:, ::-1])  # IR is mirrored relative to colour/depth
-    info = f"mean {g.mean():.0f}  clipped {100 * (g >= 250).mean():.1f}%"
-    return ppm(np.repeat(g[..., None], 3, axis=2)), info
+    mean, clipped = float(g.mean()), 100 * float((g >= 250).mean())
+    stats = {"mean": mean, "clipped": clipped, "text": f"mean {mean:.0f}  clipped {clipped:.1f}%"}
+    return ppm(np.repeat(g[..., None], 3, axis=2)), stats
 
 
 def render_depth(cap, buf):
     d = decode_y10(buf, cap.width, cap.height, cap.bytesperline)
-    return ppm(fit(depth_to_rgb(d))), f"valid {100 * (d > 0).mean():.0f}%"
+    h, w = d.shape
+    centre = d[h * 3 // 8:h * 5 // 8, w * 3 // 8:w * 5 // 8]
+    valid = centre[centre > 0]
+    stats = {
+        "text": f"valid {100 * (d > 0).mean():.0f}%",
+        "centre_valid": valid.size / centre.size,
+        "centre_cm": float(pointcloud.depth_to_mm(np.median(valid))) / 10 if valid.size else None,
+    }
+    return ppm(fit(depth_to_rgb(d))), stats
+
+
+def distance_hint(stats):
+    """(text, colour) for the guide line, from the depth centre stats."""
+    near, far = pointcloud.WINDOW_CM
+    cm = stats.get("centre_cm")
+    if cm is None or stats["centre_valid"] < 0.2:
+        return f"Centre: no depth. Too close or too far; aim for {near + 3:.0f}-{far - 4:.0f} cm", BAD
+    text = f"Centre: ~{cm:.1f} cm (estimate)"
+    if cm < near + 2:
+        return text + " - near the close edge, move back", EDGE
+    if cm > far - 3:
+        return text + " - near the far edge, move closer", EDGE
+    return text + " - good", GOOD
 
 
 def main():
@@ -89,18 +125,19 @@ def main():
         tk.Label(root, text=name).grid(row=0, column=col)
         labels[name] = tk.Label(root)
         labels[name].grid(row=1, column=col)
+    guide = tk.Label(root, anchor="w", font=("TkDefaultFont", 14, "bold"))
+    guide.grid(row=2, column=0, columnspan=3, sticky="we", padx=6)
     status = tk.Label(root, anchor="w")
-    status.grid(row=2, column=0, columnspan=2, sticky="we")
+    status.grid(row=3, column=0, columnspan=2, sticky="we")
     message = {"text": ""}
 
     sliders = tk.Frame(root)
-    sliders.grid(row=3, column=0, columnspan=3, sticky="we")
-    controls = {}  # label -> (node path, control id, default)
+    sliders.grid(row=5, column=0, columnspan=3, sticky="we")
+    controls = {}  # label -> (node path, control id, info, scale)
     for col, (label, node, cid) in enumerate(SLIDERS):
         info = next((c for c in v4l2.controls(nodes[node]).values() if c["id"] == cid), None)
         if info is None:
             continue
-        controls[label] = (nodes[node], cid, info["default"])
 
         def set_value(value, dev=nodes[node], cid=cid, label=label):
             try:
@@ -112,16 +149,50 @@ def main():
                          to=info["max"], resolution=info["step"] or 1, command=set_value)
         scale.set(info["value"])
         scale.grid(row=0, column=col, padx=10)
-        controls[label] += (scale,)
+        controls[label] = (nodes[node], cid, info, scale)
 
     def reset():
-        for dev, cid, default, scale in controls.values():
-            scale.set(default)  # triggers set_value
+        for _, _, info, scale in controls.values():
+            scale.set(info["default"])  # triggers set_value
 
     def control_values():
         return {label: v4l2.get_control(dev, cid) for label, (dev, cid, _, _) in controls.items()}
 
-    tk.Button(sliders, text="Reset defaults", command=reset).grid(row=0, column=len(SLIDERS), padx=10)
+    buttons = tk.Frame(sliders)
+    buttons.grid(row=0, column=len(SLIDERS), padx=10)
+    tk.Button(buttons, text="Reset defaults", command=reset).pack(fill="x")
+
+    auto = {"steps": 0}
+
+    def auto_step():
+        """One Auto IR step: darken while clipping, brighten while dim, else stop."""
+        exposure, gain = controls["IR exposure"], controls["IR gain"]
+        e, g = exposure[3].get(), gain[3].get()
+        clipped, mean = ir.stats.get("clipped"), ir.stats.get("mean")
+        auto["steps"] += 1
+        if clipped is None or auto["steps"] > AUTO_MAX_STEPS:
+            message["text"] = "Auto IR: gave up"
+            return
+        if clipped > CLIP_HI and g > gain[2]["min"]:
+            gain[3].set(max(gain[2]["min"], g * 0.7))
+        elif clipped > CLIP_HI and e > exposure[2]["min"]:
+            exposure[3].set(max(exposure[2]["min"], e * 0.7))
+        elif clipped < CLIP_LO and mean < MEAN_LO and e < exposure[2]["max"]:
+            exposure[3].set(min(exposure[2]["max"], e * 1.4))
+        elif clipped < CLIP_LO and mean < MEAN_LO and g < GAIN_CAP:
+            gain[3].set(min(GAIN_CAP, g * 1.3))
+        else:
+            message["text"] = f"Auto IR: done (exposure {e}, gain {g})"
+            return
+        message["text"] = f"Auto IR: step {auto['steps']}"
+        root.after(AUTO_STEP_MS, auto_step)
+
+    def start_auto():
+        if "IR exposure" in controls and "IR gain" in controls:
+            auto["steps"] = 0
+            auto_step()
+
+    tk.Button(buttons, text="Auto IR", command=start_auto).pack(fill="x")
 
     def save(_event=None):
         if not (color.raw and ir.raw and depth.raw):
@@ -133,8 +204,42 @@ def main():
         pointcloud.write_ply(out / "cloud.ply", xyz, rgb)
         message["text"] = f"saved {out.name} (with cloud.ply)"
 
-    tk.Button(root, text="Save frame (s)", command=save).grid(row=2, column=2, sticky="e")
+    rec = {"recorder": None}
+
+    def record_loop(recorder):
+        last = 0.0
+        while rec["recorder"] is recorder:
+            t = time.time()
+            if depth.stamp != last and color.raw and ir.raw:
+                last = depth.stamp
+                recorder.write({"color": color.raw, "ir": ir.raw, "depth": depth.raw},
+                               {"color": color.stamp, "ir": ir.stamp, "depth": depth.stamp})
+            time.sleep(max(0.0, 1 / RECORD_FPS - (time.time() - t)))
+        recorder.close()
+
+    def toggle_record(_event=None):
+        recorder = rec["recorder"]
+        if recorder:
+            rec["recorder"] = None
+            record_button.configure(text="Record (r)")
+            message["text"] = f"recorded {recorder.count} sets to {recorder.dir.name}"
+            return
+        if not depth.raw:
+            message["text"] = "nothing to record yet"
+            return
+        recorder = fr.Recorder(depth.cap.bytesperline, extra={"controls": control_values(), "fps": RECORD_FPS})
+        rec["recorder"] = recorder
+        rec["thread"] = threading.Thread(target=record_loop, args=(recorder,), daemon=True)
+        rec["thread"].start()
+        record_button.configure(text="Stop recording (r)")
+
+    actions = tk.Frame(root)
+    actions.grid(row=3, column=2, sticky="e")
+    tk.Button(actions, text="Save frame (s)", command=save).pack(side="left")
+    record_button = tk.Button(actions, text="Record (r)", command=toggle_record)
+    record_button.pack(side="left")
     root.bind("s", save)
+    root.bind("r", toggle_record)
 
     for s in streams.values():
         s.start()
@@ -145,11 +250,20 @@ def main():
             if s.latest is not None:
                 images[name] = tk.PhotoImage(data=s.latest, format="PPM")
                 labels[name].configure(image=images[name])
-        fps = "  ".join(f"{n.split()[0]}: {s.fps:4.1f} fps {s.info}" for n, s in streams.items())
+        if depth.stats:
+            text, colour = distance_hint(depth.stats)
+            guide.configure(text=text, fg=colour)
+        fps = "  ".join(f"{n.split()[0]}: {s.fps:4.1f} fps {s.stats.get('text', '')}" for n, s in streams.items())
+        recorder = rec["recorder"]
+        if recorder:
+            message["text"] = f"REC {recorder.count} sets, {recorder.megabytes:.0f} MB"
         status.configure(text=f"{fps}   {message['text']}")
         root.after(33, tick)
 
     def close():
+        if rec["recorder"]:
+            rec["recorder"] = None
+            rec["thread"].join(timeout=2)  # let the last set and the files close cleanly
         for s in streams.values():
             s.stop()
         root.destroy()

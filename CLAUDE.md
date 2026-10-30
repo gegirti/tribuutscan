@@ -58,6 +58,8 @@ is simply getting colour, IR and depth out of the scanner on Linux.
 ```
 tribuutscan-viewer                          # launcher in ~/.local/bin, copy of tribuutscan-viewer.sh
 python3 -m tribuutscan.viewer               # live colour + IR + depth; `s` saves captures/<stamp>/
+                                            # `r` records raw sets to captures/<stamp>-rec/ (~43 MB/s),
+                                            # Auto IR button, distance guide (estimate)
 python3 -m tribuutscan.pointcloud [dir]     # .ply from a saved set, or grab a live one
 python3 -m tribuutscan.measure <cm>         # depth stats for a flat target at a known distance
 ```
