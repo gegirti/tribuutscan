@@ -254,18 +254,21 @@ def solve(directory, square_mm=SQUARE_MM, out=None, log=print):
         zs.append(plane_depth(k_i, d_i, r, t, uu[pick], vv[pick]))
     raw, z = np.concatenate(raws), np.concatenate(zs)
     law_name, laws = fit_law(raw, z)
+    seen = [float(np.percentile(z, 0.5)), float(np.percentile(z, 99.5))]
     a_law = laws["a/z"]
     report = {"views": len(views), "colour_views": len(col), "ir_views": len(irs), "stereo_views": len(both),
               "dropped_views": {"colour": dropped_c, "ir": dropped_i},
               "reprojection_px": {"colour": float(rms_c), "ir": float(rms_i), "stereo": float(rms_s)},
               "depth_law": {"better_form": law_name, **laws}, "square_mm": square_mm,
-              "baseline_mm": float(np.linalg.norm(trans))}
+              "baseline_mm": float(np.linalg.norm(trans)), "depth_seen_mm": seen}
     spec = {
         "estimate": False, "size": list(size),
         "depth": {"fx": float(k_i[0, 0]), "fy": float(k_i[1, 1]), "cx": float(k_i[0, 2]), "cy": float(k_i[1, 2]),
                   "dist": d_i.ravel().tolist()},
         "law": {"a_mm": float(a_law["A"]), "b": float(-a_law["B"])},  # z = A / (v - B)  ->  a / (v + b)
-        "window_mm": [float(np.percentile(z, 0.5)), float(np.percentile(z, 99.5))],
+        # the depth window: what the views saw, but never narrower than the estimate (the near end
+        # observed is only where the board was held, not the scanner's limit)
+        "window_mm": [min(calib.ESTIMATES["window_mm"][0], seen[0]), max(calib.ESTIMATES["window_mm"][1], seen[1])],
         "colour": {"K": k_c.tolist(), "dist": d_c.ravel().tolist(), "R": rot.tolist(), "T_mm": trans.ravel().tolist()},
         "colour_from_depth": affine_at(k_i, k_c, rot, trans, 250.0),
         "report": report,

@@ -3,7 +3,8 @@
     .venv/bin/python -m tribuutscan.synth [out_dir] [frames] [every] [hard]
 
 Rendered with Open3D's RaycastingScene into the viewer's raw recording format (YUYV colour, packed
-depth through the estimated depth law, blank IR) plus gt_poses.txt (camera -> first camera, metres,
+depth through the estimated depth law, blank IR), always with the estimated camera (a pinhole; it
+is the synthetic world's camera, whatever is calibrated: evaluate.py reads these with it too) plus gt_poses.txt (camera -> first camera, metres,
 x right / y down / z forward, as cloud.Scanner keeps poses). Depth gets noise, dropouts, flying
 pixels at edges and the estimated depth window, so tracking sees roughly what the scanner gives.
 `every` keeps every n-th frame (3 gives the ~7 fps of a slow live worker). `hard` adds what broke
@@ -18,8 +19,8 @@ import numpy as np
 import open3d as o3d
 import open3d.core as o3c
 
+from . import calib
 from . import frames as fr
-from . import pointcloud as pc
 from .calib import CAMERA
 from .depth import encode_y10
 
@@ -127,7 +128,7 @@ def render(scene, material, cam_to_world, rng):
         grey[sel] = texture(name, hit[sel]) * (0.35 + 0.65 * shade[sel])
     # depth: noise, the window, random dropouts, and flying pixels / gaps where depth jumps
     zn = z + rng.normal(0, NOISE_MM, z.shape)
-    near, far = pc.WINDOW_CM[0] * 10, pc.WINDOW_CM[1] * 10
+    near, far = CAMERA.window_mm
     ok = valid & (zn >= near) & (zn <= far) & (rng.random(z.shape) > 0.01)
     jump = np.zeros_like(ok)
     zz = np.where(valid, z, 1e4)
@@ -162,7 +163,15 @@ def rgb_to_yuyv(rgb):
 
 def generate(out_dir, n_frames=160, every=1, seed=0, hard=False):
     """Write a synthetic recording to out_dir (recording format + gt_poses.txt + markers_gt.json)."""
-    out_dir = Path(out_dir)
+    calibrated = CAMERA.spec
+    calib.use(calib.ESTIMATES)
+    try:
+        return _generate(Path(out_dir), n_frames, every, seed, hard)
+    finally:
+        calib.use(calibrated)
+
+
+def _generate(out_dir, n_frames, every, seed, hard):
     out_dir.mkdir(parents=True, exist_ok=True)
     rng = np.random.default_rng(seed)
     scene, material, marker_xyz = build_scene()

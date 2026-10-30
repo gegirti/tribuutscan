@@ -120,6 +120,12 @@ class Camera:
         return np.array([[self.fx, 0, self.cx], [0, self.fy, self.cy], [0, 0, 1.0]])
 
 
+def use(spec):
+    """Switch the shared camera model in place (every module holds this same CAMERA object). Synthetic
+    data is made and read with ESTIMATES, a pinhole camera, whatever is calibrated."""
+    CAMERA.__init__(spec)
+
+
 def load(path=CALIBRATION):
     path = Path(path)
     return Camera(json.loads(path.read_text()) if path.exists() else ESTIMATES)

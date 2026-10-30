@@ -18,11 +18,13 @@ from pathlib import Path
 
 import numpy as np
 
+from . import calib
 from . import cloud as cl
 from . import frames as fr
 from . import markers as mk
 from . import metrics
 from . import synth
+from .calib import CAMERA
 from .image import write_png
 
 EVAL = fr.CAPTURES / "eval"
@@ -83,7 +85,18 @@ def make_scanner(tracker, preset, mode):
 
 def run(name, tracker="baseline", preset="small", live_markers=False, optimise_after=False):
     """live_markers: let the tracker detect markers itself (markers.detect_fast, as live) instead of
-    being handed the cached reference detections."""
+    being handed the cached reference detections. Synthetic sets run with the estimated camera they
+    were rendered with."""
+    calibrated = CAMERA.spec
+    if name in SYNTH:
+        calib.use(calib.ESTIMATES)
+    try:
+        return _run(name, tracker, preset, live_markers, optimise_after)
+    finally:
+        calib.use(calibrated)
+
+
+def _run(name, tracker, preset, live_markers, optimise_after):
     directory = dataset_path(name)
     found = cached_markers(name, directory)
     scanner = make_scanner(tracker, preset, DATASETS[name][2])
