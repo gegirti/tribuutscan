@@ -9,7 +9,9 @@ Metrics: tracked/lost/re-found frames, pose jumps, double-surface ratio, marker 
 ms per frame; ATE/RPE against ground truth on synthetic data. (A keyframe residual and a split-half
 Chamfer were tried and dropped: they read the same on the doubled and the good scan, because each
 half / keyframe already contains the shifted frames.)
-Distances rest on the estimated depth law and field of view (except synthetic, which uses them too).
+Real recordings use the calibration (captures/calibration.json) when there is one; synthetic sets
+always use the estimated camera they were rendered with. The first datasets (tilt, standing, kettle,
+hand, face) were deleted on 2026-10-30; their numbers stay in CLAUDE.md.
 """
 import json
 import sys
@@ -29,18 +31,15 @@ from .image import write_png
 
 EVAL = fr.CAPTURES / "eval"
 DATASETS = {  # name: (path or glob under captures/, notes, scan mode)
-    "tilt": ("20261030-122746-scan/*-rec", "black part with markers, scanner tilted: the doubling case", "still"),
-    "standing": ("20261030-123412-scan/*-rec", "black part, scanner held still", "still"),
-    "kettle": ("20261030-094413-rec", "kettle, moved by hand", "turntable"),
-    "hand": ("20261030-102704-rec", "a hand: deforms, robustness only", "free"),
-    "face": ("20261030-101700-rec", "PRIVATE face scan: deforms, metrics only, never rendered", "free"),
+    "markers": ("20261030-194411-scan/*-rec", "the marker part, hand-held, 581 frames: the first recording with "
+                "the calibration and frames paired by capture time", "still"),
     "synth": ("synth/box-tilt-rec", "synthetic box with markers, tilting path, ground truth", "still"),
     "synth7": ("synth/box-tilt-7fps-rec", "the same at ~7 fps (every 3rd frame), like a slow live worker", "still"),
     "synthhard": ("synth/box-hard-rec", "synthetic at 10 fps with a jerk and a stretch beyond the depth window",
                   "still"),
 }
 SYNTH = {"synth": dict(every=1), "synth7": dict(every=3), "synthhard": dict(every=2, hard=True)}
-PRIVATE = {"face"}
+PRIVATE = set()  # datasets never rendered (none at the moment)
 
 
 def dataset_path(name):
