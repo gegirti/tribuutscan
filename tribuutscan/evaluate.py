@@ -68,6 +68,7 @@ TRACKERS = {  # name: Scanner options (the scan mode comes from the dataset)
     "p2": dict(track_with="icp"),  # frame-to-frame ICP with P1/P2 (gate, cleanup, scan modes)
     "frame": dict(target="frame"),  # joint solve against the previous frame
     "nomarkers": dict(track_with="jointnm"),  # joint solve against the model, without markers
+    "nofeatures": dict(use_features=False),  # joint solve without the ORB starting pose (P4 part 1)
     "markers": dict(track_with="markers"),  # markers alone (P3)
 }
 
@@ -109,6 +110,7 @@ def run(name, tracker="baseline", preset="small"):
         "points": int(len(xyz)),
         "pose_jumps": metrics.pose_jumps(tracked, centre),
         "flat_frames": scanner.stats.get("flat", 0),
+        "feature_starts": scanner.feature_starts,
         "double_surface_ratio": round(metrics.double_surface_ratio(xyz, normals), 4),
         "marker_scatter": metrics.marker_scatter(sightings),
         "loop_gap": {"mm": round(gap[0], 1), "deg": round(gap[1], 1)},

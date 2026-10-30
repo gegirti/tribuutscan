@@ -65,3 +65,18 @@ def test_outliers_do_not_drag_the_solve():
     junk = rng.uniform(-0.04, 0.04, (len(source) // 5, 3)) + [0, 0, 0.25]  # 20% clutter
     t, _ = track.solve(track.levels(np.r_[source, junk]), track.levels(target), np.eye(4))
     assert np.linalg.norm(t[:3, 3] - truth[:3, 3]) * 1000 < 0.5
+
+
+def test_features_recover_a_known_move():
+    try:
+        from tribuutscan import features
+    except ImportError:  # needs OpenCV (.venv)
+        return
+    rng = np.random.default_rng(5)
+    pts = rng.uniform(-50, 50, (300, 3)) + [0, 0, 250]
+    desc = rng.integers(0, 256, (300, 32), dtype=np.uint8)
+    truth = small_motion() if track is not None else np.eye(4)
+    moved = (pts - truth[:3, 3] * 1000) @ truth[:3, :3]  # the same points seen from the moved camera
+    t, inliers = features.relative_pose((moved, desc), (pts, desc), rng)
+    assert t is not None and inliers > 250
+    assert np.abs(t - truth).max() < 1e-6

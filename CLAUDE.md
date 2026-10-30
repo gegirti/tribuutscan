@@ -185,7 +185,14 @@ P4 (`track.py`, now the default tracker):
   is calibrated.
 - The flat-face flag fires on most frames of flat parts, so its threshold needs tuning before it
   can be a hint.
-- Cost: about 300 ms per frame offline (was about 110): live speed is P5's problem.
+- ORB features (`features.py`, OpenCV 4.10 in `.venv`) give the solve its starting pose: whole
+  image in "still" mode, object only otherwise. Tilt doubling 16% -> 6.7%, hard synthetic ATE
+  1.5 -> 1.0 mm.
+- The marker check also catches sliding: shape fits but markers disagree. Dropping it took tilt
+  doubling 7% -> 26%.
+- Against the first version: tilt 60% -> 6.7% doubled and 0 jumps; face 13 -> 0 jumps; synthetic
+  ATE 1.0-1.5 mm (was 1.7-6.0); standing drift 0.1 mm.
+- Cost: about 350 ms per frame offline (was about 110): live speed is P5's problem.
 Markers: the retroreflective dot usually has depth on this scanner (about 90% of its pixels), and a
 plane fitted to the ring around the dot is flat to about 0.3 mm.
 

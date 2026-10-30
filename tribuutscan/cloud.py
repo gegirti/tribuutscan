@@ -363,7 +363,7 @@ class Scanner:
     """
 
     def __init__(self, preset="small", log=print, clean_depth="merge", gate_refind=True, motion_dt=True,
-                 mode="still", track_with="joint", target="model"):
+                 mode="still", track_with="joint", target="model", use_features=True):
         try:
             from . import fuse  # Open3D: frame-to-frame ICP
         except ImportError:
@@ -387,6 +387,8 @@ class Scanner:
         # Markers are weighted strictly (1 mm) and noisy ones are dropped inside the solve (3 sigma):
         # measured better than loose weighting (3 mm) even with the estimated colour registration,
         # where loose let marker noise pull poses off and the map drift (tilt doubling 16% vs 78%).
+        # The marker check also catches sliding: on the tilt scan, poses whose shape fits well but
+        # whose markers disagree are the flat-face slides; dropping the check took doubling 7% -> 26%.
         self.marker_sigma, self.marker_accept = 1.0, 2.0
         self.track_with, self.marker_map = track_with, MarkerMap(add_mm=3.0)
         # joint solve against the "model" (cloud so far; default) or the previous "frame". Measured:
@@ -394,6 +396,14 @@ class Scanner:
         # WITHOUT markers drifts (synthetic 25 mm): markers keep the model honest.
         self.target = target
         self.model_levels, self.model_at = None, -1
+        self.features = None  # features module when OpenCV is available and use_features is on
+        if use_features and track_with in ("joint", "jointnm"):
+            try:
+                from . import features
+                self.features = features
+            except ImportError:
+                pass
+        self.prev_feat, self.feature_starts = None, 0  # last tracked frame's ORB; frames started from ORB
         self.track_info = []  # per tracked frame: (index, info from track.solve); for evaluation
         self.last_t, self.motion_s, self.lost_run = None, None, 0  # time of the last tracked frame, of `motion`
         self.track_log = []  # per frame: (index, status, pose or None); for evaluation
@@ -439,6 +449,15 @@ class Scanner:
                 marker_pts = self.frame_markers(frame) if self.track_with == "joint" else np.empty((0, 3))
             else:
                 levels = fuse.levels(xyz / 1000)
+            feat = None
+            if joint and self.features is not None:  # colour features: a starting pose for big movements
+                color = frame["color"] if "color" in frame else yuyv_to_rgb(frame["yuyv"], *shape[::-1])
+                feat = self.features.extract(color, frame["depth"], None if scene.mode == "still" else pix)
+                if self.prev is not None and self.prev_feat is not None:
+                    found, _ = self.features.relative_pose(feat, self.prev_feat, self.rng)
+                    if found is not None and plausible_step(found, xyz):
+                        guess = found
+                        self.feature_starts += 1
             if self.prev is not None:
                 if joint:
                     step, ok = self.joint_step(levels, xyz, marker_pts, guess, index)
@@ -464,6 +483,7 @@ class Scanner:
             stats["tracking"] = True
             if joint and len(marker_pts):
                 self.marker_map.add(marker_pts, self.pose)
+            self.prev_feat = feat
         self.track_log.append((index, status, self.pose.copy()))
         if scene.mode == "still":  # the object to merge: above the kept table plane, in its region
             to_world = scene_transform(self.pose)
