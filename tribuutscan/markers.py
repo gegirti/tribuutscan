@@ -132,6 +132,7 @@ def draw(rgb, found, color=(255, 0, 255)):
 RING = (1.8, 4.0)  # depth ring around a dot, in dot radii: beyond the 6/10 mm black ring (1.67)
 RING_MIN_PX = 30  # valid depth pixels needed in the ring
 RING_MAX_RMS_MM = 1.0  # ring must be flat to this (estimate; depth noise ~1 mm)
+DOT_MIN_PX = 10  # without a usable ring, the dot's own depth is used if this many of its pixels have it
 HALF_RADII = (3, 4, 5, 7)  # dot radii to search at half resolution (smaller ones were glints)
 
 
@@ -144,8 +145,9 @@ def detect_half(rgb):
 def locate(depth, found):
     """3D centre (mm, depth camera: x right, y down, z forward) and unit normal of each marker, or None.
 
-    The retroreflective dot itself has no depth, so a plane is fitted to the valid depth in a ring
-    around it and the camera ray through the dot's centre is intersected with that plane. Colour
+    A plane is fitted to the valid depth in a ring around the dot and the camera ray through the
+    dot's centre is intersected with it (normal from the plane). Without enough ring depth, the dot's
+    own median depth is used (normal None): on this scanner the dot usually has depth. Colour
     pixels map to depth pixels through calib.CAMERA (an estimate until calibrated).
     """
     from .calib import CAMERA
@@ -164,7 +166,12 @@ def locate(depth, found):
         dist = np.hypot(uu - u0, vv - v0)
         ring = (dist >= RING[0] * rd) & (dist <= RING[1] * rd) & (win > 0)
         if ring.sum() < RING_MIN_PX:
-            out.append(None)
+            dot = (dist <= 0.8 * rd) & (win > 0)  # fallback: the dot's own depth (usually present here)
+            if dot.sum() >= DOT_MIN_PX:
+                point = CAMERA.backproject(u0, v0, float(np.median(CAMERA.depth_mm(win[dot]))))
+                out.append((point, None))
+            else:
+                out.append(None)
             continue
         pts = CAMERA.backproject(uu[ring], vv[ring], CAMERA.depth_mm(win[ring]))
         centre = pts.mean(0)

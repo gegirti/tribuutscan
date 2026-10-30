@@ -70,6 +70,8 @@ def make_scanner(tracker, preset, mode):
         return cl.Scanner(preset, log=quiet, mode="free")
     if tracker == "current":
         return cl.Scanner(preset, log=quiet, mode=mode)
+    if tracker == "markers":  # P3: poses from markers alone
+        return cl.Scanner(preset, log=quiet, mode=mode, track_with="markers")
     raise ValueError(f"unknown tracker {tracker}")
 
 
@@ -79,6 +81,7 @@ def run(name, tracker="baseline", preset="small"):
     scanner = make_scanner(tracker, preset, DATASETS[name][2])
     sightings, elapsed, n = [], 0.0, 0
     for i, frame in enumerate(fr.read_recording(directory)):
+        frame["markers2d"] = found.get(i, [])
         t0 = time.perf_counter()
         scanner.feed(frame, i)
         elapsed += time.perf_counter() - t0

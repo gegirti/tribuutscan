@@ -155,6 +155,19 @@ P2 (`scene.py`, scan modes still/turntable/free):
   predicted pose leaks table points when the prediction is a few mm off. Tracking stays on each
   frame's own piece; only merging uses the kept plane.
 - Flat objects still slide under shape-only tracking (synthetic error 3-6 mm): P3/P4.
+P3 (`markermap.py`):
+- A world map of uncoded markers. Matching uses nearest neighbours plus pairwise-distance checks
+  with a predicted pose, and triangle side lengths without one. Symmetric and collinear layouts
+  are refused.
+- Marker 3D comes from a ring-plane fit, falling back to the dot's own depth.
+- Marker-only tracking: synthetic ATE 3.4 -> 1.0 mm (hard path 6.1 -> 2.1), doubling about 0.02.
+- On the real tilt scan it fails: a median of 3 markers have 3D per frame, and only 87 of 168
+  frames have 3 or more. More markers on the part are needed for marker mode; otherwise markers
+  only help inside a combined solve (P4).
+- With 3D markers nearly coplanar and 25 cm away, the camera position from markers alone swings
+  1.5-3.7 mm with 0.3 mm marker noise, while the markers themselves land within 0.5 mm.
+- A field-of-view sweep (54-66 degrees) by marker scatter was inconclusive (tracking error
+  dominates), so 60 degrees stays the estimate until calibration.
 Markers: the retroreflective dot usually has depth on this scanner (about 90% of its pixels), and a
 plane fitted to the ring around the dot is flat to about 0.3 mm.
 

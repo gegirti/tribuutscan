@@ -360,7 +360,7 @@ class Scanner:
     """
 
     def __init__(self, preset="small", log=print, clean_depth="merge", gate_refind=True, motion_dt=True,
-                 mode="still"):
+                 mode="still", track_with="icp"):
         try:
             from . import fuse  # Open3D: frame-to-frame ICP
         except ImportError:
@@ -378,6 +378,8 @@ class Scanner:
         self.clean_depth, self.gate_refind, self.motion_dt = clean_depth, gate_refind, motion_dt
         from .scene import Scene
         self.scene = Scene(mode, self.rng)
+        from .markermap import MarkerMap
+        self.track_with, self.marker_map = track_with, MarkerMap()  # "icp" or "markers" (markers only)
         self.last_t, self.motion_s, self.lost_run = None, None, 0  # time of the last tracked frame, of `motion`
         self.track_log = []  # per frame: (index, status, pose or None); for evaluation
         self.on_merge = None  # optional callback(index, world_xyz_mm, rgb, world_normals, pose)
@@ -409,7 +411,12 @@ class Scanner:
         if self.motion_dt and t is not None and self.last_t is not None and self.motion_s:
             guess = scale_motion(self.motion, (t - self.last_t) / self.motion_s)
         status = "first" if self.prev is None else "tracked"
-        if fuse is not None:
+        if self.track_with == "markers":
+            if not self.marker_step(frame, guess, index):
+                return False
+            status = "first" if self.prev is None else "tracked"
+            self.prev = True
+        elif fuse is not None:
             levels = fuse.levels(xyz / 1000)
             if self.prev is not None:
                 result = fuse.icp(levels, self.prev, guess)
@@ -458,6 +465,38 @@ class Scanner:
         if not stats["markers"]:
             color = frame["color"] if "color" in frame else yuyv_to_rgb(frame["yuyv"], *frame["depth"].shape[::-1])
             stats["markers"] = [[round(x, 1), round(y, 1)] for x, y, *_ in markers.detect(markers.luma(color), rgb=color)]
+        return True
+
+    def frame_markers(self, frame):
+        """Camera-frame centres (mm, (N, 3)) of the markers in a frame; uses frame["markers2d"]
+        (pre-detected colour pixels) when given."""
+        found = frame.get("markers2d")
+        if found is None:
+            color = frame["color"] if "color" in frame else yuyv_to_rgb(frame["yuyv"], *frame["depth"].shape[::-1])
+            found = markers.detect_half(color)
+        pts = [loc[0] for loc in markers.locate(frame["depth"], found) if loc is not None]
+        return np.array(pts).reshape(-1, 3)
+
+    def marker_step(self, frame, guess, index):
+        """Marker-only tracking (for measuring what markers alone can do): pose from the marker map."""
+        stats, mmap = self.stats, self.marker_map
+        pts = self.frame_markers(frame)
+        t = frame.get("t")
+        if self.prev is not None:
+            pairs = mmap.match_predicted(pts, self.pose @ guess) if len(pts) >= 3 else []
+            pose = mmap.pose_from(pts, pairs) if len(pairs) >= 3 else mmap.match_global(pts)
+            if pose is None:
+                stats["lost"] += 1
+                stats["tracking"] = False
+                self.lost_run += 1
+                self.track_log.append((index, "lost", None))
+                return False
+            self.motion = np.linalg.inv(self.pose) @ pose
+            self.motion_s = (t - self.last_t) if (t is not None and self.last_t is not None) else None
+            self.pose = pose
+        mmap.add(pts, self.pose)
+        self.last_t, self.lost_run = t, 0
+        stats["tracking"] = True
         return True
 
     def relock_source(self, levels, xyz, all_xyz, all_pix, shape):
