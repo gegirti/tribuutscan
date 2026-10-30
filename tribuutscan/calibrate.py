@@ -313,29 +313,22 @@ def corner_shift(a, b):
 def capture(square_mm=SQUARE_MM, out=None):
     """Live window (colour + IR with the board found). A view is kept by itself when the board has been
     still for STILL_S at a new place (hold the scanner still); space keeps one at once; q finishes and
-    solves. With `out` an earlier session folder, its views count and new ones are added."""
+    solves. With `out` an earlier session folder, its views count and new ones are added.
+
+    The camera and the board search run in a thread: in the window's own thread they froze it for
+    0.25 s per update and over a second per kept view, and a session's window was closed mid-way.
+    """
+    import threading
     import tkinter as tk
+    import traceback
     from . import v4l2
     from .image import ppm
     brd = board(square_mm)
     out = Path(out) if out else CALIB / time.strftime("%Y%m%d-%H%M%S")
     out.mkdir(parents=True, exist_ok=True)
-    nodes = v4l2.discover()
-    caps = {"color": v4l2.Capture(nodes["color"], "YUYV", fr.W, fr.H),
-            "ir": v4l2.Capture(nodes["ir"], "GREY", fr.W, fr.H),
-            "depth": v4l2.Capture(nodes["depth"], "Y10", fr.W, fr.H)}
     k_rough = np.array([[1000.0, 0, fr.W / 2], [0, 1000.0, fr.H / 2], [0, 0, 1]])  # tilt guidance only
-    root = tk.Tk()
-    root.title("triBUUTSCAN calibration: hold the scanner still to keep a view, q finishes")
-    panes = [tk.Label(root, bd=6), tk.Label(root, bd=6)]
-    for i, p in enumerate(panes):
-        p.grid(row=0, column=i)
-    status = tk.Label(root, font=("TkDefaultFont", 13))
-    status.grid(row=1, column=0, columnspan=2)
-    tally = tk.Label(root, font=("TkDefaultFont", 15, "bold"))
-    tally.grid(row=2, column=0, columnspan=2)
-    state = {"kept": [], "places": [], "prev": None, "still": None, "frame": None, "col": None, "flash": 0.0,
-             "note": "", "images": [], "logged": 0.0}
+    state = {"kept": [], "places": [], "prev": None, "still": None, "flash": 0.0, "note": "", "logged": 0.0,
+             "show": None, "keep_now": False, "stop": False}
     for v in load_views(out):  # an earlier session's views: they count, and new views must differ from them
         col = detect(cv2.cvtColor(v["color"], cv2.COLOR_RGB2GRAY), brd)
         found = ir_board(v["ir"], col, brd) if col is not None else None
@@ -344,6 +337,10 @@ def capture(square_mm=SQUARE_MM, out=None):
             state["places"].append(board_place(v, col, found[0], k_rough))
     if state["kept"]:
         print(f"continuing {out.name}: {len(state['kept'])} views", flush=True)
+    nodes = v4l2.discover()
+    caps = {"color": v4l2.Capture(nodes["color"], "YUYV", fr.W, fr.H),
+            "ir": v4l2.Capture(nodes["ir"], "GREY", fr.W, fr.H),
+            "depth": v4l2.Capture(nodes["depth"], "Y10", fr.W, fr.H)}
 
     def keep(frame, col, place):
         i = ir_corners(frame["ir"], col, brd)
@@ -360,65 +357,104 @@ def capture(square_mm=SQUARE_MM, out=None):
         print(f"kept view {n}: {len(col[2])} corners in colour, {len(i[2])} in IR, "
               f"{'?' if cm is None else f'{cm:.1f}'} cm, tilt {'?' if tilt is None else f'{tilt:.0f}'} deg", flush=True)
 
-    def tick():
+    def update():
+        """One frame set: find the board, maybe keep the view, leave a preview for the window."""
         got = fr.paired(caps, timeout=0.5)
-        if got is not None:
-            frame = fr.decode(got["color"][0], got["ir"][0], got["depth"][0], caps["depth"].bytesperline)
-            col = detect(cv2.cvtColor(frame["color"], cv2.COLOR_RGB2GRAY), brd)
-            found = ir_board(frame["ir"], col, brd) if col is not None else None
-            aligned = found is not None and found[1] >= MIN_CORRELATION
-            place = board_place(frame, col, found[0], k_rough) if aligned else (None, None)
-            now = time.monotonic()
-            moved = corner_shift(col, state["prev"]) if col is not None and state["prev"] is not None else np.inf
-            state["prev"], state["frame"], state["col"] = col, frame, (col, place) if aligned else None
-            state["still"] = (state["still"] or now) if moved < STILL_PX else None
-            new = col is not None and all(corner_shift(col, k) > NEW_PX for k in state["kept"])
-            if aligned and new and state["still"] and now - state["still"] >= STILL_S:
-                keep(frame, col, place)
-            grey = found[2] if found is not None else cv2.GaussianBlur(np.float32(frame["ir"]), (0, 0), IR_SIGMA)
-            ir_show = cv2.normalize(grey, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-            shows = [frame["color"].copy(), np.repeat(ir_show[..., None], 3, 2)]
-            if col is not None:
-                for x, y in col[1].astype(int):
-                    cv2.circle(shows[0], (int(x), int(y)), 6, (255, 0, 255), 2)
-            if aligned:
-                p = cv2.perspectiveTransform(np.float64(brd.getChessboardCorners()[:, :2]).reshape(-1, 1, 2), found[0])
-                for x, y in p.reshape(-1, 2).astype(int):
-                    cv2.circle(shows[1], (int(x), int(y)), 6, (0, 255, 0), 2)
-            state["images"] = [tk.PhotoImage(data=ppm(np.ascontiguousarray(s[::2, ::2])), format="PPM") for s in shows]
-            border = "#22cc44" if now < state["flash"] else root.cget("bg")
-            for p, im in zip(panes, state["images"]):
-                p.configure(image=im, bg=border)
-            cm, tilt = place
-            text = (f"colour: {0 if col is None else len(col[2])} corners   IR: {'board found' if aligned else 'no board'}   "
-                    f"{'' if cm is None else f'{cm:.1f} cm (estimate)   '}{'' if tilt is None else f'tilt {tilt:.0f} deg   '}"
-                    f"{'still' if state['still'] else 'moving'}{'' if new or col is None else ', seen already'}   {state['note']}")
+        if got is None:
+            return
+        frame = fr.decode(got["color"][0], got["ir"][0], got["depth"][0], caps["depth"].bytesperline)
+        col = detect(cv2.cvtColor(frame["color"], cv2.COLOR_RGB2GRAY), brd)
+        found = ir_board(frame["ir"], col, brd, scales=(0.125, 0.25)) if col is not None else None
+        aligned = found is not None and found[1] >= MIN_CORRELATION
+        place = board_place(frame, col, found[0], k_rough) if aligned else (None, None)
+        now = time.monotonic()
+        moved = corner_shift(col, state["prev"]) if col is not None and state["prev"] is not None else np.inf
+        state["prev"] = col
+        state["still"] = (state["still"] or now) if moved < STILL_PX else None
+        new = col is not None and all(corner_shift(col, k) > NEW_PX for k in state["kept"])
+        if aligned and (state["keep_now"] or (new and state["still"] and now - state["still"] >= STILL_S)):
+            state["keep_now"] = False
+            keep(frame, col, place)
+        grey = found[2] if found is not None else cv2.GaussianBlur(np.float32(frame["ir"]), (0, 0), IR_SIGMA)
+        shows = [frame["color"][::2, ::2].copy(),
+                 np.repeat(cv2.normalize(grey[::2, ::2], None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)[..., None], 3, 2)]
+        if col is not None:
+            for x, y in col[1] / 2:
+                cv2.circle(shows[0], (int(x), int(y)), 4, (255, 0, 255), 2)
+        if aligned:
+            p = cv2.perspectiveTransform(np.float64(brd.getChessboardCorners()[:, :2]).reshape(-1, 1, 2), found[0])
+            for x, y in p.reshape(-1, 2) / 2:
+                cv2.circle(shows[1], (int(x), int(y)), 4, (0, 255, 0), 2)
+        cm, tilt = place
+        text = (f"colour: {0 if col is None else len(col[2])} corners   IR: {'board found' if aligned else 'no board'}   "
+                f"{'' if cm is None else f'{cm:.1f} cm (estimate)   '}{'' if tilt is None else f'tilt {tilt:.0f} deg   '}"
+                f"{'still' if state['still'] else 'moving'}{'' if new or col is None else ', seen already'}   {state['note']}")
+        places = list(state["places"])
+        near = sum(1 for c, _ in places if c is not None and c < 22)
+        far = sum(1 for c, _ in places if c is not None and c > 27)
+        tilted = sum(1 for _, t in places if t is not None and t > 20)
+        tally = (f"kept {len(places)} views (aim for ~25): {near} near (< 22 cm), {len(places) - near - far} middle, "
+                 f"{far} far (> 27 cm); {tilted} tilted over 20 deg   |   space keeps now, q finishes")
+        state["show"] = ([ppm(np.ascontiguousarray(s)) for s in shows], text, tally, now < state["flash"])
+        if now - state["logged"] >= 2:  # a trace of what the window showed, for debugging
+            print(f"status: {text.strip()} (moved {moved:.1f} px)", flush=True)
+            state["logged"] = now
+
+    def work():
+        while not state["stop"]:
+            try:
+                update()
+            except Exception as e:
+                if state["stop"]:
+                    return  # cameras closed while reading
+                if isinstance(e, OSError) and e.errno == 19:
+                    print("scanner disconnected", flush=True)
+                    state["note"] = "SCANNER DISCONNECTED: close this window, reconnect, start again (views are kept)"
+                    return
+                traceback.print_exc()
+                time.sleep(0.5)
+
+    root = tk.Tk()
+    root.title("triBUUTSCAN calibration: hold the scanner still to keep a view, q finishes")
+    panes = [tk.Label(root, bd=6), tk.Label(root, bd=6)]
+    for i, p in enumerate(panes):
+        p.grid(row=0, column=i)
+    status = tk.Label(root, font=("TkDefaultFont", 13))
+    status.grid(row=1, column=0, columnspan=2)
+    tally_label = tk.Label(root, font=("TkDefaultFont", 15, "bold"))
+    tally_label.grid(row=2, column=0, columnspan=2)
+    images = []
+
+    def refresh():  # the window's thread only shows the newest preview
+        show, state["show"] = state["show"], None
+        if show is not None:
+            data, text, tally, flash = show
+            images[:] = [tk.PhotoImage(data=d, format="PPM") for d in data]
+            for p, im in zip(panes, images):
+                p.configure(image=im, bg="#22cc44" if flash else root.cget("bg"))
             status.configure(text=text)
-            if now - state["logged"] >= 2:  # a trace of what the window showed, for debugging
-                print(f"status: {text.strip()} (moved {moved:.1f} px)", flush=True)
-                state["logged"] = now
-            places = [p for p in state["places"]]
-            near = sum(1 for c, _ in places if c is not None and c < 22)
-            far = sum(1 for c, _ in places if c is not None and c > 27)
-            tilted = sum(1 for _, t in places if t is not None and t > 20)
-            tally.configure(text=f"kept {len(places)} views (aim for ~25): {near} near (< 22 cm), "
-                                 f"{len(places) - near - far} middle, {far} far (> 27 cm); {tilted} tilted over 20 deg"
-                                 f"   |   space keeps now, q finishes")
-        root.after(10, tick)
+            tally_label.configure(text=tally)
+        elif state["note"].startswith("SCANNER"):
+            status.configure(text=state["note"])
+        root.after(30, refresh)
 
     def keep_now(_e=None):
-        if state["col"] is not None:
-            keep(state["frame"], *state["col"])
+        state["keep_now"] = True
 
-    def finish(_e=None):
+    def finish(how):
+        print(f"window closed: {how}", flush=True)
+        state["stop"] = True
+        worker.join(timeout=5)
         for cap in caps.values():
             cap.close()
         root.destroy()
 
     root.bind("<space>", keep_now)
-    root.bind("q", finish)
-    root.protocol("WM_DELETE_WINDOW", finish)
-    tick()
+    root.bind("q", lambda _e: finish("q pressed"))
+    root.protocol("WM_DELETE_WINDOW", lambda: finish("window close button"))
+    worker = threading.Thread(target=work, daemon=True)
+    worker.start()
+    refresh()
     root.mainloop()
     if len(state["kept"]) >= 5:
         solve(out, square_mm, out=out / "calibration.json")  # checked before it replaces captures/calibration.json
