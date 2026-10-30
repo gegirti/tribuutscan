@@ -48,16 +48,26 @@ def to_points(depth, rgb, hfov_deg=HFOV_DEG):
     return np.stack([x, y, z], 1).astype(np.float32), rgb[v, u]
 
 
-def write_ply(path, xyz, rgb):
-    rec = np.empty(len(xyz), dtype=[("x", "<f4"), ("y", "<f4"), ("z", "<f4"), ("r", "u1"), ("g", "u1"), ("b", "u1")])
+def write_ply(path, xyz, rgb, normals=None, seen=None):
+    """Binary PLY with colour; optional per-point normals and `seen` count (frames that saw it)."""
+    fields = [("x", "<f4"), ("y", "<f4"), ("z", "<f4"), ("red", "u1"), ("green", "u1"), ("blue", "u1")]
+    if normals is not None:
+        fields += [("nx", "<f4"), ("ny", "<f4"), ("nz", "<f4")]
+    if seen is not None:
+        fields += [("seen", "<u2")]
+    rec = np.empty(len(xyz), dtype=fields)
     rec["x"], rec["y"], rec["z"] = xyz[:, 0], xyz[:, 1], xyz[:, 2]
-    rec["r"], rec["g"], rec["b"] = rgb[:, 0], rgb[:, 1], rgb[:, 2]
+    rec["red"], rec["green"], rec["blue"] = rgb[:, 0], rgb[:, 1], rgb[:, 2]
+    if normals is not None:
+        rec["nx"], rec["ny"], rec["nz"] = normals[:, 0], normals[:, 1], normals[:, 2]
+    if seen is not None:
+        rec["seen"] = np.minimum(seen, 65535)
+    types = {"<f4": "float", "u1": "uchar", "<u2": "ushort"}
     header = (
         "ply\nformat binary_little_endian 1.0\n"
         f"element vertex {len(rec)}\n"
-        "property float x\nproperty float y\nproperty float z\n"
-        "property uchar red\nproperty uchar green\nproperty uchar blue\n"
-        "end_header\n"
+        + "".join(f"property {types[t]} {name}\n" for name, t in fields)
+        + "end_header\n"
     )
     with open(path, "wb") as f:
         f.write(header.encode())

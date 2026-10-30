@@ -50,7 +50,13 @@ def icp_clouds(mm, color, intr):
     image = o3d.geometry.RGBDImage.create_from_color_and_depth(
         o3d.geometry.Image(color), o3d.geometry.Image(mm),
         depth_scale=1000.0, depth_trunc=FAR_M, convert_rgb_to_intensity=False)
-    full = o3d.geometry.PointCloud.create_from_rgbd_image(image, intr)
+    return levels(o3d.geometry.PointCloud.create_from_rgbd_image(image, intr))
+
+
+def levels(full):
+    """Downsample a cloud (Open3D, or an (N, 3) array in metres) once per ICP level, with normals."""
+    if isinstance(full, np.ndarray):
+        full = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(full))
     clouds = []
     for voxel, _ in ICP_LEVELS:
         cloud = full.voxel_down_sample(voxel)

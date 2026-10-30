@@ -58,6 +58,14 @@ is simply getting colour, IR and depth out of the scanner on Linux.
   key labels, logos and glossy glints look the same. In IR they drown in the projector dot
   pattern. The live search in the viewer runs at half resolution, 5 Hz, and costs depth about
   19 -> 15 fps; there is a checkbox to turn it off.
+- Merged clouds (`cloud.py`): each cube of side "point distance" (0.5/1/2 mm presets) keeps one
+  averaged point, and a cube must be seen in 3 frames. The kettle recording went from 7.2M raw
+  points to 149k kept (4.3 MB) at 0.5 mm, and 32k at 1 mm. With depth noise ~1 mm (estimate), the
+  count still creeps up at 0.5 mm and flattens at 1 mm. The table/turntable is removed only if a
+  plane holds 10% of the points, the object stands on the scanner's side of it, it is not seen
+  edge-on, it reaches the image edge, and it covers 80 cm2. Without those rules the kettle's lid and
+  a slice through its handle were taken for tables. Without Open3D there is no tracking, and
+  every frame is merged unmoved (smeared).
 - The vendor control interface is `/dev/hidraw*` (root only); its protocol is unknown.
 
 ## Commands
@@ -72,6 +80,8 @@ python3 -m tribuutscan.viewer               # live colour + IR + depth; `s` save
 python3 -m tribuutscan.pointcloud [dir]     # .ply from a saved set, or grab a live one
 python3 -m tribuutscan.measure <cm>         # depth stats for a flat target at a known distance
 python3 -m tribuutscan.markers captures/<stamp>   # find markers in a saved frame -> markers.png
+.venv/bin/python -m tribuutscan.cloud captures/<stamp>-rec [small|medium|large]
+                                            # merged point cloud -> captures/<stamp>-scan/
 .venv/bin/python -m tribuutscan.fuse captures/<stamp>-rec   # ROUGH mesh.ply from a recording (Open3D)
 ```
 
