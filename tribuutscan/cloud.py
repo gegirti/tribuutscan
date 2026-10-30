@@ -63,6 +63,7 @@ class VoxelCloud:
         self.xyz = np.empty((0, 3))  # sums
         self.rgb = np.empty((0, 3))  # sums
         self.n = np.empty(0, np.int64)  # points summed
+        self.nrm = np.empty((0, 3))  # sums of oriented unit normals (zero when a frame gave none)
         self.seen = np.empty(0, np.int32)  # frames that hit the cube
         self.frames = 0
         self.raw_points = 0
@@ -70,13 +71,14 @@ class VoxelCloud:
     def __len__(self):
         return len(self.keys)
 
-    def add(self, xyz, rgb):
-        """Merge one frame's points (mm, world frame) and colours (uint8)."""
+    def add(self, xyz, rgb, nrm=None):
+        """Merge one frame's points (mm, world frame), colours (uint8) and optional oriented normals."""
         if not len(xyz):
             return
         keys, inv = np.unique(pack(np.floor(xyz / self.point_mm)), return_inverse=True)
         sums = lambda v: np.stack([np.bincount(inv, v[:, i], len(keys)) for i in range(3)], 1)
         xyz_s, rgb_s, n = sums(xyz), sums(rgb.astype(np.float64)), np.bincount(inv, minlength=len(keys))
+        nrm_s = sums(nrm) if nrm is not None else np.zeros((len(keys), 3))
         pos = np.searchsorted(self.keys, keys)
         old = pos < len(self.keys)
         old[old] = self.keys[pos[old]] == keys[old]
@@ -84,6 +86,7 @@ class VoxelCloud:
         self.xyz[p] += xyz_s[old]
         self.rgb[p] += rgb_s[old]
         self.n[p] += n[old]
+        self.nrm[p] += nrm_s[old]
         self.seen[p] += 1
         new = ~old
         at = pos[new]  # insertion points keep the keys sorted (no re-sort of the whole cloud)
@@ -91,15 +94,25 @@ class VoxelCloud:
         self.xyz = np.insert(self.xyz, at, xyz_s[new], axis=0)
         self.rgb = np.insert(self.rgb, at, rgb_s[new], axis=0)
         self.n = np.insert(self.n, at, n[new])
+        self.nrm = np.insert(self.nrm, at, nrm_s[new], axis=0)
         self.seen = np.insert(self.seen, at, np.ones(new.sum(), np.int32))
         self.frames += 1
         self.raw_points += len(xyz)
 
-    def points(self, min_seen=MIN_SEEN):
-        """(xyz mm, rgb uint8, seen) of the cubes seen in at least `min_seen` frames."""
+    def points(self, min_seen=MIN_SEEN, with_normals=False):
+        """(xyz mm, rgb uint8, seen[, oriented unit normals]) of the cubes seen in >= `min_seen` frames.
+
+        Oriented normals (pointing toward the cameras that saw the cube) are zero where no frame
+        supplied one.
+        """
         keep = self.seen >= min_seen
         n = self.n[keep, None]
-        return (self.xyz[keep] / n, np.clip(self.rgb[keep] / n, 0, 255).astype(np.uint8), self.seen[keep])
+        out = (self.xyz[keep] / n, np.clip(self.rgb[keep] / n, 0, 255).astype(np.uint8), self.seen[keep])
+        if not with_normals:
+            return out
+        s = self.nrm[keep]
+        length = np.linalg.norm(s, axis=1, keepdims=True)
+        return out + (np.divide(s, length, out=np.zeros_like(s), where=length > 0),)
 
     def normals(self, xyz, block_mm=NORMAL_BLOCK_MM):
         """Unit normals (unoriented) for shading: PCA of the points in each 3x3x3 group of blocks.
@@ -125,16 +138,19 @@ class VoxelCloud:
         return np.linalg.eigh(cov)[1][:, :, 0][inv]  # eigenvector of the smallest eigenvalue
 
 
-def frame_points(frame, stride=1):
+def frame_points(frame, stride=1, normals=False):
     """Camera-frame points (mm; x right, y down, z forward), colours, and pixel coords of one frame.
 
     `stride` takes every n-th pixel in both directions (more points than cubes is wasted work).
     The frame holds either decoded "color" or the raw "yuyv" buffer (then only the needed
-    pixels are converted, which is much cheaper live).
+    pixels are converted, which is much cheaper live). With `normals`, also returns unit normals
+    from the neighbouring pixels, facing the camera (zero where a neighbour has no depth).
     """
     d = frame["depth"]
     h, w = d.shape
-    v, u = np.nonzero(d[::stride, ::stride] > 0)
+    ds = d[::stride, ::stride]
+    valid = ds > 0
+    v, u = np.nonzero(valid)
     v, u = v * stride, u * stride
     z = pc.depth_to_mm(d[v, u])
     f = (w / 2) / np.tan(np.radians(pc.HFOV_DEG) / 2)
@@ -143,7 +159,27 @@ def frame_points(frame, stride=1):
         rgb = pc.register_color(frame["color"])[v, u]
     else:
         rgb = yuyv_pixels(frame["yuyv"], w, *pc.color_source(u, v, w, h))
-    return xyz, rgb, np.stack([u, v], 1)
+    if not normals:
+        return xyz, rgb, np.stack([u, v], 1)
+    return xyz, rgb, np.stack([u, v], 1), grid_normals(ds, stride, f)[valid]
+
+
+def grid_normals(ds, stride, f):
+    """Unit normals of an organised depth grid (raw values, every `stride`-th pixel), facing the camera."""
+    hs, ws = ds.shape
+    h, w = hs * stride, ws * stride
+    vv, uu = np.mgrid[0:hs, 0:ws] * stride
+    z = np.where(ds > 0, pc.depth_to_mm(ds), np.nan)
+    grid = np.stack([(uu - w / 2) * z / f, (vv - h / 2) * z / f, z], -1)
+    dx, dy = np.full_like(grid, np.nan), np.full_like(grid, np.nan)
+    dx[:, 1:-1] = grid[:, 2:] - grid[:, :-2]
+    dy[1:-1] = grid[2:] - grid[:-2]
+    n = np.cross(dx, dy)
+    length = np.linalg.norm(n, axis=-1, keepdims=True)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        n = n / length
+        n *= np.where((n * grid).sum(-1, keepdims=True) > 0, -1.0, 1.0)  # face the camera (at the origin)
+    return np.nan_to_num(n)
 
 
 def support_plane(xyz, rng, pix=None, shape=None, iterations=100, sample=2000, tries=3):
@@ -237,16 +273,22 @@ def centre_piece(xyz, pix, shape):
     return piece[inv]
 
 
-def isolate(xyz, rgb, pix, shape, rng):
-    """Cut a frame down to the object: drop the support plane, keep the piece at the centre."""
+def isolate_mask(xyz, pix, shape, rng):
+    """Mask of the object's points (support plane dropped, piece at the centre kept), and had_plane."""
+    keep = np.ones(len(xyz), bool)
     plane = support_plane(xyz, rng, pix, shape)
     if plane is not None:
         keep = np.abs(xyz @ plane[0] + plane[1]) >= PLANE_TOL_MM
-        xyz, rgb, pix = xyz[keep], rgb[keep], pix[keep]
-    if len(xyz):
-        keep = centre_piece(xyz, pix, shape)
-        xyz, rgb = xyz[keep], rgb[keep]
-    return xyz, rgb, plane is not None
+    if keep.any():
+        idx = np.nonzero(keep)[0]
+        keep[idx[~centre_piece(xyz[idx], pix[idx], shape)]] = False
+    return keep, plane is not None
+
+
+def isolate(xyz, rgb, pix, shape, rng):
+    """Cut a frame down to the object: drop the support plane, keep the piece at the centre."""
+    keep, had_plane = isolate_mask(xyz, pix, shape, rng)
+    return xyz[keep], rgb[keep], had_plane
 
 
 def plausible_step(t, xyz):
@@ -284,19 +326,24 @@ class Scanner:
         self.model, self.model_merged = None, -1  # cloud-so-far, prepared for relocking
         self.stats = {"frames": 0, "merged": 0, "lost": 0, "relocked": 0, "plane_frames": 0, "markers": [],
                       "tracking": True}
+        self.track_log = []  # per frame: (index, status, pose or None); for evaluation
+        self.on_merge = None  # optional callback(index, world_xyz_mm, rgb, world_normals, pose)
 
     def feed(self, frame, index=None):
         """Process one frame set ({'color', 'depth'}); returns True if it was merged into the cloud."""
         stats, fuse = self.stats, self.fuse
         index = stats["frames"] if index is None else index
         stats["frames"] += 1
-        xyz, rgb, pix = frame_points(frame, self.stride)
-        xyz, rgb, had_plane = isolate(xyz, rgb, pix, frame["depth"].shape, self.rng)
+        xyz, rgb, pix, nrm = frame_points(frame, self.stride, normals=True)
+        keep, had_plane = isolate_mask(xyz, pix, frame["depth"].shape, self.rng)
+        xyz, rgb, nrm = xyz[keep], rgb[keep], nrm[keep]
         stats["plane_frames"] += had_plane
         if len(xyz) < 500 // self.stride ** 2:
             stats["lost"] += 1
             stats["tracking"] = False
+            self.track_log.append((index, "too few points", None))
             return False
+        status = "first" if self.prev is None else "tracked"
         if fuse is not None:
             levels = fuse.levels(xyz / 1000)
             if self.prev is not None:
@@ -306,18 +353,24 @@ class Scanner:
                     self.pose = self.pose @ self.motion
                 elif self.relock(levels):
                     stats["relocked"] += 1
+                    status = "relocked"
                 else:
                     stats["lost"] += 1
                     stats["tracking"] = False
+                    self.track_log.append((index, "lost", None))
                     return False
             self.prev = levels
             stats["tracking"] = True
+        self.track_log.append((index, status, self.pose.copy()))
         if self.last_merged is not None:
             move, turn = turned(np.linalg.inv(self.last_merged) @ self.pose)
             if fuse is not None and move < KEY_MOVE_MM and turn < KEY_TURN_DEG:
                 return False
         world = xyz @ self.pose[:3, :3].T + self.pose[:3, 3] * 1000
-        self.cloud.add(world, rgb)
+        world_nrm = nrm @ self.pose[:3, :3].T
+        self.cloud.add(world, rgb, world_nrm)
+        if self.on_merge is not None:
+            self.on_merge(index, world, rgb, world_nrm, self.pose.copy())
         self.last_merged = self.pose.copy()
         self.poses.append((index, self.pose.copy()))
         stats["merged"] += 1

@@ -129,6 +129,59 @@ def draw(rgb, found, color=(255, 0, 255)):
     return out
 
 
+RING = (1.8, 4.0)  # depth ring around a dot, in dot radii: beyond the 6/10 mm black ring (1.67)
+RING_MIN_PX = 30  # valid depth pixels needed in the ring
+RING_MAX_RMS_MM = 1.0  # ring must be flat to this (estimate; depth noise ~1 mm)
+HALF_RADII = (3, 4, 5, 7)  # dot radii to search at half resolution (smaller ones were glints)
+
+
+def detect_half(rgb):
+    """Markers in full-resolution pixels, searched at half resolution (~4x faster, same hits)."""
+    half = rgb[::2, ::2]
+    return [(2 * x, 2 * y, 2 * r, c) for x, y, r, c in detect(luma(half), HALF_RADII, rgb=half)]
+
+
+def locate(depth, found):
+    """3D centre (mm, depth camera: x right, y down, z forward) and unit normal of each marker, or None.
+
+    The retroreflective dot itself has no depth, so a plane is fitted to the valid depth in a ring
+    around it and the camera ray through the dot's centre is intersected with that plane. Colour
+    pixels map to depth pixels by the rough registration estimate (pointcloud.REG).
+    """
+    from . import pointcloud as pc
+    h, w = depth.shape
+    f = (w / 2) / np.tan(np.radians(pc.HFOV_DEG) / 2)
+    reg = pc.REG
+    out = []
+    for x, y, r, _ in found:
+        u0, v0 = reg["ax"] * x + reg["bx"], reg["ay"] * y + reg["by"]
+        rd = max(r * reg["ax"], 2.0)
+        k = int(RING[1] * rd) + 1
+        u_lo, u_hi, v_lo, v_hi = int(u0) - k, int(u0) + k + 1, int(v0) - k, int(v0) + k + 1
+        if u_lo < 0 or v_lo < 0 or u_hi > w or v_hi > h:
+            out.append(None)
+            continue
+        win = depth[v_lo:v_hi, u_lo:u_hi]
+        vv, uu = np.mgrid[v_lo:v_hi, u_lo:u_hi]
+        dist = np.hypot(uu - u0, vv - v0)
+        ring = (dist >= RING[0] * rd) & (dist <= RING[1] * rd) & (win > 0)
+        if ring.sum() < RING_MIN_PX:
+            out.append(None)
+            continue
+        z = pc.depth_to_mm(win[ring])
+        pts = np.stack([(uu[ring] - w / 2) * z / f, (vv[ring] - h / 2) * z / f, z], 1)
+        centre = pts.mean(0)
+        _, sv, vt = np.linalg.svd(pts - centre, full_matrices=False)
+        normal = vt[2]
+        if sv[2] / np.sqrt(len(pts)) > RING_MAX_RMS_MM:
+            out.append(None)  # not flat: the marker sits on an edge or the depth is noisy
+            continue
+        ray = np.array([(u0 - w / 2) / f, (v0 - h / 2) / f, 1.0])
+        point = ray * (normal @ centre) / (normal @ ray)
+        out.append((point, normal if normal @ point < 0 else -normal))
+    return out
+
+
 def main():
     from .image import write_png
     directory = Path(sys.argv[1])

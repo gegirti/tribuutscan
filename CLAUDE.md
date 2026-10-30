@@ -105,11 +105,37 @@ python3 -m tribuutscan.markers captures/<stamp>   # find markers in a saved fram
 .venv/bin/python -m tribuutscan.cloud captures/<stamp>-rec [small|medium|large]
                                             # merged point cloud -> captures/<stamp>-scan/
 python3 -m tribuutscan.view3d captures/<stamp>-scan    # browser 3D view at http://localhost:8765
+.venv/bin/python -m tribuutscan.evaluate [datasets] [--label x] [--against report.json]
+                                            # tracking metrics on saved + synthetic recordings
+.venv/bin/python -m tribuutscan.synth [out] [frames] [every] [hard]   # synthetic box scan, ground truth
 .venv/bin/python -m tribuutscan.fuse captures/<stamp>-rec   # ROUGH mesh.ply from a recording (Open3D)
 ```
 
 Beware `pkill -f ...tribuutscan.viewer` inside a shell command: the pattern matches the shell
 itself. Use `pgrep -f "^python3 -m tribuutscan.viewer"` and kill by PID.
+
+## Tracking evaluation (P0 of the tracking plan)
+
+`evaluate.py` runs a tracker over these datasets: tilt, standing, kettle, hand, face (private, never
+rendered), synth, synth7 and synthhard. Metrics:
+- pose jumps: steps over 30 mm / 15 degrees at the object centre
+- double-surface ratio: share of points with a same-facing sheet 2.5-8 mm along their normal
+- marker scatter: spread of each marker's world position; independent of shape tracking
+- ATE/RPE: against ground truth, synthetic only
+
+A keyframe residual and a split-half Chamfer were tried and dropped: they read the same on the
+doubled and the good scan. Baseline (frame-to-frame ICP + relock):
+
+| dataset | jumps | double | marker scatter | ATE |
+|---|---|---|---|---|
+| tilt | 4 | 0.60 | 3.5 mm, 32 groups | - |
+| standing | 0 | 0.00 | 0.6 mm | - |
+| synth | 0 | 0.23 | 1.5 mm | 4.0 mm |
+| synthhard | 0 | 0.38 | 1.1 mm | 6.0 mm |
+
+The doubled black part came from `relock()` accepting impossible jumps (117-193 mm / 42-64 degrees).
+Markers: the retroreflective dot usually has depth on this scanner (about 90% of its pixels), and a
+plane fitted to the ring around the dot is flat to about 0.3 mm.
 
 ## Pitfalls already hit
 
