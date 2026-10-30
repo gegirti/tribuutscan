@@ -21,11 +21,12 @@ def box_sum(a, k):
     return p[k:k + h, k:k + w] - p[:h, k:k + w] - p[k:k + h, :w] + p[:h, :w]
 
 
-def clean(raw, stride=1):
+def clean(raw, stride=1, origin=(0, 0)):
     """Return a copy of a raw depth frame with doubtful pixels set to 0 (invalid).
 
     With `stride`, `raw` is the every-`stride`-th-pixel grid of a frame (neighbours are `stride`
-    pixels apart); cleaning only what tracking uses is ~stride^2 times cheaper.
+    pixels apart); cleaning only what tracking uses is ~stride^2 times cheaper. `origin` is the
+    (column, row) of raw[0, 0] in the full frame, when `raw` is a cut-out.
     """
     z = np.where(raw > 0, CAMERA.depth_mm(raw), np.nan).astype(np.float32)
     near, far = CAMERA.window_mm
@@ -47,6 +48,8 @@ def clean(raw, stride=1):
     # grazing surfaces: normal from neighbours vs the viewing ray
     h, w = raw.shape
     vv, uu = np.mgrid[0:h, 0:w].astype(np.float32) * stride
+    uu += origin[0]
+    vv += origin[1]
     grid = CAMERA.backproject(uu, vv, z).astype(np.float32)
     dx, dy = np.full_like(grid, np.nan), np.full_like(grid, np.nan)
     dx[:, 1:-1] = grid[:, 2:] - grid[:, :-2]

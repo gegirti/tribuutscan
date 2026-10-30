@@ -20,28 +20,43 @@ from .markermap import kabsch
 MIN_INLIERS = 25
 INLIER_MM = 3.0
 RATIO = 0.8
-RANSAC_ROUNDS = 200
+RANSAC_ROUNDS = 100
+SCALE = 2  # ORB runs on a half-resolution image: about 4x faster, enough keypoints
 
 _orb = cv2.ORB_create(1500, fastThreshold=7)
 _clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
 _matcher = cv2.BFMatcher(cv2.NORM_HAMMING)
 
 
-def extract(rgb, depth, mask_pixels=None):
+def luma_of(frame):
+    """Brightness (H, W) uint8 of a frame set: straight from the YUYV bytes when it has them."""
+    depth = frame["depth"]
+    h, w = depth.shape
+    if "yuyv" in frame:
+        return np.frombuffer(frame["yuyv"], np.uint8, w * h * 2)[0::2].reshape(h, w)
+    rgb = frame["color"]
+    return (rgb[..., 0] * 0.299 + rgb[..., 1] * 0.587 + rgb[..., 2] * 0.114).astype(np.uint8)
+
+
+def extract(luma, depth, mask_pixels=None):
     """(points mm (N, 3) in the camera, descriptors (N, 32) uint8) of keypoints that have depth.
 
-    rgb: colour image (H, W, 3); mask_pixels: optional (N, 2) depth-grid pixels to search around.
+    luma: colour-camera brightness (H, W) uint8; mask_pixels: optional (N, 2) depth-grid pixels to
+    search around. Works at 1/SCALE resolution on the depth grid.
     """
-    grey = _clahe.apply(cv2.cvtColor(np.ascontiguousarray(pc.register_color(rgb)), cv2.COLOR_RGB2GRAY))
+    h, w = depth.shape
+    v, u = np.mgrid[0:h:SCALE, 0:w:SCALE]
+    src_x, src_y = pc.color_source(u, v, w, h)  # depth-grid pixel -> colour pixel (registration)
+    grey = _clahe.apply(np.ascontiguousarray(luma[src_y, src_x]))
     mask = None
     if mask_pixels is not None:
         mask = np.zeros(grey.shape, np.uint8)
-        mask[mask_pixels[:, 1], mask_pixels[:, 0]] = 255
-        mask = cv2.dilate(mask, np.ones((9, 9), np.uint8))
+        mask[mask_pixels[:, 1] // SCALE, mask_pixels[:, 0] // SCALE] = 255
+        mask = cv2.dilate(mask, np.ones((5, 5), np.uint8))
     keypoints, desc = _orb.detectAndCompute(grey, mask)
     if desc is None:
         return np.empty((0, 3)), None
-    uv = np.round([k.pt for k in keypoints]).astype(int)
+    uv = np.round(np.array([k.pt for k in keypoints]) * SCALE).astype(int)
     h, w = depth.shape
     inside = (uv[:, 0] >= 0) & (uv[:, 0] < w) & (uv[:, 1] >= 0) & (uv[:, 1] < h)
     raw = np.zeros(len(uv), depth.dtype)

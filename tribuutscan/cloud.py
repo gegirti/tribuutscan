@@ -166,32 +166,36 @@ def frame_points(frame, stride=1, normals=False):
     v, u = v * stride, u * stride
     xyz = CAMERA.backproject(u, v, pc.depth_to_mm(d[v, u]))
     if "color" in frame:
-        rgb = pc.register_color(frame["color"])[v, u]
+        src_x, src_y = pc.color_source(u, v, w, h)  # only the needed pixels, not the whole image
+        rgb = frame["color"][src_y, src_x]
     else:
         rgb = yuyv_pixels(frame["yuyv"], w, *pc.color_source(u, v, w, h))
     if not normals:
         return xyz, rgb, np.stack([u, v], 1)
-    return xyz, rgb, np.stack([u, v], 1), grid_normals(ds, stride)[valid]
+    return xyz, rgb, np.stack([u, v], 1), pixel_normals(ds, stride, v // stride, u // stride, xyz)
 
 
-def grid_normals(ds, stride):
-    """Unit normals of an organised depth grid (raw values, every `stride`-th pixel), facing the camera."""
+def pixel_normals(ds, stride, rows, cols, xyz):
+    """Unit normals at the given cells of an organised depth grid (raw values, every `stride`-th
+    pixel), from the neighbouring cells, facing the camera; zero where a neighbour has no depth."""
     hs, ws = ds.shape
-    vv, uu = np.mgrid[0:hs, 0:ws] * stride
-    z = np.where(ds > 0, pc.depth_to_mm(ds), np.nan)
-    grid = CAMERA.backproject(uu, vv, z)
-    dx, dy = np.full_like(grid, np.nan), np.full_like(grid, np.nan)
-    dx[:, 1:-1] = grid[:, 2:] - grid[:, :-2]
-    dy[1:-1] = grid[2:] - grid[:-2]
-    n = np.cross(dx, dy)
-    length = np.linalg.norm(n, axis=-1, keepdims=True)
+    def point(r, c):
+        r, c = np.clip(r, 0, hs - 1), np.clip(c, 0, ws - 1)
+        raw = ds[r, c]
+        p = CAMERA.backproject(c * stride, r * stride, np.where(raw > 0, CAMERA.depth_mm(np.maximum(raw, 1)), np.nan))
+        p[(r <= 0) | (r >= hs - 1) | (c <= 0) | (c >= ws - 1)] = np.nan  # no neighbour beyond the edge
+        return p
+    dx = point(rows, cols + 1) - point(rows, cols - 1)
+    dy = point(rows + 1, cols) - point(rows - 1, cols)
+    n = np.stack([dx[:, 1] * dy[:, 2] - dx[:, 2] * dy[:, 1], dx[:, 2] * dy[:, 0] - dx[:, 0] * dy[:, 2],
+                  dx[:, 0] * dy[:, 1] - dx[:, 1] * dy[:, 0]], 1)
     with np.errstate(invalid="ignore", divide="ignore"):
-        n = n / length
-        n *= np.where((n * grid).sum(-1, keepdims=True) > 0, -1.0, 1.0)  # face the camera (at the origin)
+        n /= np.linalg.norm(n, axis=1, keepdims=True)
+        n *= np.where((n * xyz).sum(1, keepdims=True) > 0, -1.0, 1.0)  # face the camera (at the origin)
     return np.nan_to_num(n)
 
 
-def support_plane(xyz, rng, pix=None, shape=None, iterations=100, sample=2000, tries=3):
+def support_plane(xyz, rng, pix=None, shape=None, iterations=60, sample=1500, tries=3):
     """The table/turntable plane (normal n, offset c with n.p + c = 0, n toward the scanner), or None.
 
     A plane counts only if it holds PLANE_MIN_SHARE of the points AND most other points lie on the
@@ -363,7 +367,7 @@ class Scanner:
     """
 
     def __init__(self, preset="small", log=print, clean_depth="merge", gate_refind=True, motion_dt=True,
-                 mode="still", track_with="joint", target="model", use_features=True):
+                 mode="still", track_with="joint", target="model", use_features=True, threaded_merge=True):
         try:
             from . import fuse  # Open3D: frame-to-frame ICP
         except ImportError:
@@ -404,6 +408,13 @@ class Scanner:
             except ImportError:
                 pass
         self.prev_feat, self.feature_starts = None, 0  # last tracked frame's ORB; frames started from ORB
+        self.cue = {}  # what held the last frame: markers used, ORB start, flat (shape alone slides)
+        self.keyframes = []  # merged frames: (index, pose, points mm (camera, 2 mm grid), ORB, markers mm)
+        import concurrent.futures
+        import threading
+        self.cloud_lock = threading.Lock()
+        self.merger = concurrent.futures.ThreadPoolExecutor(1) if threaded_merge else None
+        self.pending = []
         self.track_info = []  # per tracked frame: (index, info from track.solve); for evaluation
         self.last_t, self.motion_s, self.lost_run = None, None, 0  # time of the last tracked frame, of `motion`
         self.track_log = []  # per frame: (index, status, pose or None); for evaluation
@@ -417,14 +428,14 @@ class Scanner:
         if self.clean_depth is True:  # track on cleaned depth as well
             frame = self.cleaned(frame)
         shape = frame["depth"].shape
-        all_xyz, all_rgb, all_pix, all_nrm = frame_points(frame, self.stride, normals=True)
+        all_xyz, all_rgb, all_pix = frame_points(frame, self.stride)  # normals only for merging (below)
         scene = self.scene
         if scene.mode == "turntable":
             scene.observe(all_xyz, all_pix, shape, np.eye(4))
             keep = scene.object_mask(all_xyz, all_pix, shape, np.eye(4))
         else:
             keep = isolate_mask(all_xyz, all_pix, shape, self.rng)[0]
-        xyz, rgb, nrm, pix = all_xyz[keep], all_rgb[keep], all_nrm[keep], all_pix[keep]
+        xyz, rgb, pix = all_xyz[keep], all_rgb[keep], all_pix[keep]
         if len(xyz) < 500 // self.stride ** 2:
             stats["lost"] += 1
             stats["tracking"] = False
@@ -451,11 +462,12 @@ class Scanner:
                 levels = fuse.levels(xyz / 1000)
             feat = None
             if joint and self.features is not None:  # colour features: a starting pose for big movements
-                color = frame["color"] if "color" in frame else yuyv_to_rgb(frame["yuyv"], *shape[::-1])
-                feat = self.features.extract(color, frame["depth"], None if scene.mode == "still" else pix)
+                feat = self.features.extract(self.features.luma_of(frame), frame["depth"],
+                                             None if scene.mode == "still" else pix)
                 if self.prev is not None and self.prev_feat is not None:
                     found, _ = self.features.relative_pose(feat, self.prev_feat, self.rng)
-                    if found is not None and plausible_step(found, xyz):
+                    self.cue = {"features": found is not None and plausible_step(found, xyz)}
+                    if self.cue["features"]:
                         guess = found
                         self.feature_starts += 1
             if self.prev is not None:
@@ -486,10 +498,9 @@ class Scanner:
             self.prev_feat = feat
         self.track_log.append((index, status, self.pose.copy()))
         if scene.mode == "still":  # the object to merge: above the kept table plane, in its region
-            to_world = scene_transform(self.pose)
+            to_world = scene_transform(self.pose)  # (every tracked frame: the region grows per frame)
             scene.observe(all_xyz, all_pix, shape, to_world)
-            obj = scene.object_mask(all_xyz, all_pix, shape, to_world)
-            xyz, rgb, nrm, pix = all_xyz[obj], all_rgb[obj], all_nrm[obj], all_pix[obj]
+            pix = all_pix[scene.object_mask(all_xyz, all_pix, shape, to_world)]
         stats["plane_frames"] += scene.plane is not None
         self.since_merge = getattr(self, "since_merge", 0) + 1
         if self.last_merged is not None:
@@ -497,25 +508,43 @@ class Scanner:
             if fuse is not None and move < KEY_MOVE_MM and turn < KEY_TURN_DEG and self.since_merge < KEY_EVERY:
                 return False
         self.since_merge = 0
-        mxyz, mrgb, mnrm = xyz, rgb, nrm
-        if self.clean_depth == "merge":  # merge the cleaned pixels of the same isolated object
-            kept = np.zeros(frame["depth"].shape, bool)
-            kept[pix[:, 1], pix[:, 0]] = True
-            cxyz, crgb, cpix, cnrm = frame_points(self.cleaned(frame), self.stride, normals=True)
-            sel = kept[cpix[:, 1], cpix[:, 0]]
-            mxyz, mrgb, mnrm = cxyz[sel], crgb[sel], cnrm[sel]
-        world = mxyz @ self.pose[:3, :3].T + self.pose[:3, 3] * 1000
-        world_nrm = mnrm @ self.pose[:3, :3].T
-        self.cloud.add(world, mrgb, world_nrm)
-        if self.on_merge is not None:
-            self.on_merge(index, world, mrgb, world_nrm, self.pose.copy())
+        if self.prev is not None and self.prev is not True:  # keyframe for Optimise / continuing a scan
+            self.keyframes.append((index, self.pose.copy(), np.asarray(self.prev[-1].points) * 1000,
+                                   self.prev_feat, marker_pts if joint else np.empty((0, 3))))
         self.last_merged = self.pose.copy()
         self.poses.append((index, self.pose.copy()))
         stats["merged"] += 1
-        if not stats["markers"]:
-            color = frame["color"] if "color" in frame else yuyv_to_rgb(frame["yuyv"], *frame["depth"].shape[::-1])
-            stats["markers"] = [[round(x, 1), round(y, 1)] for x, y, *_ in markers.detect(markers.luma(color), rgb=color)]
+        job = (frame, index, self.pose.copy(), pix)
+        if self.merger is None:
+            self.merge(*job)
+        else:  # merging runs beside tracking the next frame (numpy and Open3D release the GIL)
+            self.pending.append(self.merger.submit(self.merge, *job))
         return True
+
+    def merge(self, frame, index, pose, pix):
+        """Merge one tracked frame's object pixels (cleaned, with normals) into the cloud."""
+        shape = frame["depth"].shape
+        kept = np.zeros(shape, bool)  # merge these pixels (cleaned, if cleaning)
+        kept[pix[:, 1], pix[:, 0]] = True
+        merge_frame = self.cleaned(frame, pix) if self.clean_depth == "merge" else frame
+        cxyz, crgb, cpix, cnrm = frame_points(merge_frame, self.stride, normals=True)
+        sel = kept[cpix[:, 1], cpix[:, 0]]
+        mxyz, mrgb, mnrm = cxyz[sel], crgb[sel], cnrm[sel]
+        world = mxyz @ pose[:3, :3].T + pose[:3, 3] * 1000
+        world_nrm = mnrm @ pose[:3, :3].T
+        with self.cloud_lock:
+            self.cloud.add(world, mrgb, world_nrm)
+        if self.on_merge is not None:
+            self.on_merge(index, world, mrgb, world_nrm, pose)
+        if not self.stats["markers"]:
+            color = frame["color"] if "color" in frame else yuyv_to_rgb(frame["yuyv"], *shape[::-1])
+            self.stats["markers"] = [[round(x, 1), round(y, 1)] for x, y, *_ in markers.detect_half(color)]
+
+    def flush(self):
+        """Wait for merges still running in the background (before reading or saving the cloud)."""
+        for job in self.pending:
+            job.result()
+        self.pending = []
 
     def joint_step(self, levels, xyz, marker_pts, guess, index):
         """One frame with track.solve (shape + markers + prior), against the previous frame or the
@@ -537,8 +566,9 @@ class Scanner:
                                   marker_pairs=pairs, radius_mm=radius, marker_sigma_mm=self.marker_sigma)
         step = np.linalg.inv(self.pose) @ found if use_model else found
         self.track_info.append((index, info))
-        if info["degeneracy"] is not None and info["degeneracy"] < track.DEGENERATE:
-            self.stats["flat"] = self.stats.get("flat", 0) + 1
+        flat = info["degeneracy"] is not None and info["degeneracy"] < track.DEGENERATE and not info["markers_used"]
+        self.stats["flat"] = self.stats.get("flat", 0) + flat
+        self.cue = {"markers": info["markers_used"], "features": self.cue.get("features", False), "flat": flat}
         ok = (info["fitness"] >= JOINT_MIN_FITNESS and info["rmse_mm"] is not None
               and info["rmse_mm"] <= JOINT_MAX_RMSE_MM and plausible_step(step, xyz)
               and (info["marker_rmse_mm"] is None or info["marker_rmse_mm"] <= self.marker_accept))
@@ -550,7 +580,9 @@ class Scanner:
         if self.stats["merged"] < 2:
             return False
         if self.model_levels is None or self.stats["merged"] - self.model_at >= MODEL_EVERY:
-            xyz, _, _ = self.cloud.points(min_seen=1)
+            self.flush()  # the model must not depend on how far background merges have got (replays match)
+            with self.cloud_lock:
+                xyz, _, _ = self.cloud.points(min_seen=1)
             if len(xyz) < 500:
                 return self.model_levels is not None
             self.model_levels, self.model_at = fuse.levels(xyz / 1000), self.stats["merged"]
@@ -561,8 +593,8 @@ class Scanner:
         (pre-detected colour pixels) when given."""
         found = frame.get("markers2d")
         if found is None:
-            color = frame["color"] if "color" in frame else yuyv_to_rgb(frame["yuyv"], *frame["depth"].shape[::-1])
-            found = markers.detect_half(color)
+            from .features import luma_of
+            found = markers.detect_fast(luma_of(frame), frame.get("color"))
         pts = [loc[0] for loc in markers.locate(frame["depth"], found) if loc is not None]
         return np.array(pts).reshape(-1, 3)
 
@@ -598,11 +630,17 @@ class Scanner:
             return levels, xyz
         return self.fuse.levels(all_xyz[obj] / 1000), all_xyz[obj]
 
-    def cleaned(self, frame):
-        """The frame with prep.clean applied to the pixels tracking samples (every stride-th)."""
+    def cleaned(self, frame, pix=None):
+        """The frame with prep.clean applied to the pixels tracking samples (every stride-th); with
+        `pix`, only inside their bounding box (plus a margin): the merge needs nothing else."""
         s, d = self.stride, frame["depth"]
         out = np.zeros_like(d)
-        out[::s, ::s] = prep.clean(d[::s, ::s], s)
+        r0, r1, c0, c1 = 0, d.shape[0], 0, d.shape[1]
+        if pix is not None and len(pix):
+            m = 8 * s
+            c0, c1 = max(0, pix[:, 0].min() - m) // s * s, min(d.shape[1], pix[:, 0].max() + m + 1)
+            r0, r1 = max(0, pix[:, 1].min() - m) // s * s, min(d.shape[0], pix[:, 1].max() + m + 1)
+        out[r0:r1:s, c0:c1:s] = prep.clean(d[r0:r1:s, c0:c1:s], s, origin=(c0, r0))
         return dict(frame, depth=out)
 
     def relock(self, levels, xyz):
@@ -629,11 +667,42 @@ class Scanner:
         return True
 
     def save(self, directory, min_seen=MIN_SEEN):
+        self.flush()
         self.trim_table()
-        return save(directory, self.cloud, self.poses, self.stats, self.preset, min_seen)
+        out = save(directory, self.cloud, self.poses, self.stats, self.preset, min_seen)
+        self.save_state(directory)
+        return out
+
+    def save_state(self, directory):
+        """What Optimise and continuing a scan need: per-frame tracking log, keyframes, marker map and
+        the cloud's sums (track.csv, keyframes.npz, markers.json, cloud_state.npz)."""
+        info = dict(self.track_info)
+        with open(directory / "track.csv", "w") as f:
+            f.write("index,status,fitness,rmse_mm,degeneracy,markers_used\n")
+            for i, status, _ in self.track_log:
+                d = info.get(i, {})
+                f.write(f"{i},{status},{d.get('fitness', '')},{d.get('rmse_mm', '')},{d.get('degeneracy', '')},"
+                        f"{d.get('markers_used', '')}\n")
+        kf = self.keyframes
+        if kf:
+            pts = [k[2] for k in kf]
+            feat_pts = [k[3][0] if k[3] is not None else np.empty((0, 3)) for k in kf]
+            feat_desc = [k[3][1] if k[3] is not None and k[3][1] is not None else np.empty((0, 32), np.uint8) for k in kf]
+            mks = [k[4] for k in kf]
+            count = lambda arrays: np.cumsum([0] + [len(a) for a in arrays])
+            np.savez_compressed(directory / "keyframes.npz", index=np.array([k[0] for k in kf]),
+                                pose=np.array([k[1] for k in kf]), points=np.concatenate(pts), points_at=count(pts),
+                                feat_points=np.concatenate(feat_pts), feat_desc=np.concatenate(feat_desc),
+                                feat_at=count(feat_pts), markers=np.concatenate(mks), markers_at=count(mks))
+        (directory / "markers.json").write_text(json.dumps(
+            {"positions_mm": self.marker_map.pos.round(3).tolist(), "sightings": self.marker_map.count.tolist()}))
+        c = self.cloud
+        np.savez_compressed(directory / "cloud_state.npz", point_mm=c.point_mm, keys=c.keys, xyz=c.xyz, rgb=c.rgb,
+                            n=c.n, nrm=c.nrm, seen=c.seen, frames=c.frames, raw_points=c.raw_points)
 
     def trim_table(self):
         """Drop cubes merged before the table plane was settled: on/below it or outside the region."""
+        self.flush()
         scene = self.scene
         if scene.mode != "still" or scene.plane is None or scene.axis is None or not len(self.cloud):
             return

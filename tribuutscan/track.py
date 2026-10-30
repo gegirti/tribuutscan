@@ -21,8 +21,9 @@ MARKER_SIGMA_MM = 1.0
 MARKER_GATE_SIGMAS = (10.0, 3.0)  # a marker beyond this many sigmas is ignored: loose on the coarse
                                   # levels (the start may be off), 3 sigma on the fine level
 PRIOR_MM, PRIOR_DEG = 20.0, 5.0  # how far the solve may wander from the predicted motion, softly
-ITERATIONS = (8, 8, 10)  # per ICP level, coarse to fine
-DEGENERATE = 0.02  # smallest / largest scaled shape eigenvalue below this: the shape slides
+ITERATIONS = (5, 5, 8)  # per ICP level, coarse to fine (each stops early once it has converged)
+DEGENERATE = 0.005  # smallest / largest scaled shape eigenvalue below this: the shape slides. Measured:
+                    # curved kettle 0.01-0.04, flat black part median 0.005, its flat top 0.0008
 
 
 OUTLIER_NEIGHBOURS, OUTLIER_RADIUS_M = 8, 0.004  # a point needs 8 others within 4 mm (surfaces have ~200)
@@ -112,7 +113,7 @@ def solve(source, target, init, prior=None, marker_pairs=None, radius_mm=60.0, m
             h += np.eye(6) * 1e-9 * max(np.trace(h), 1e-9)  # Levenberg-Marquardt damping: stays defined on a flat face
             xi = -np.linalg.solve(h, g)
             t = exp_se3(xi) @ t
-            if np.linalg.norm(xi[:3]) < 1e-5 and np.linalg.norm(xi[3:]) < 1e-3:
+            if np.linalg.norm(xi[:3]) < 2e-5 and np.linalg.norm(xi[3:]) < 5e-3:  # < 0.005 mm / 0.001 deg
                 break
     return t, summarise(last, radius_mm)
 

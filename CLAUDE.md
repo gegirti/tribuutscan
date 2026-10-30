@@ -192,7 +192,20 @@ P4 (`track.py`, now the default tracker):
   doubling 7% -> 26%.
 - Against the first version: tilt 60% -> 6.7% doubled and 0 jumps; face 13 -> 0 jumps; synthetic
   ATE 1.0-1.5 mm (was 1.7-6.0); standing drift 0.1 mm.
-- Cost: about 350 ms per frame offline (was about 110): live speed is P5's problem.
+P5 (live):
+- Speed: normals only on merged pixels, cleanup only around the object, ORB at half resolution on
+  luma (taken straight from YUYV), fewer solve iterations, `markers.detect_fast` (OpenCV blobs +
+  the same checks, 8 ms against 47), and merging in a background thread. Live worker 5.6 -> about
+  8 fps (simulated camera).
+- The object region must update on EVERY tracked frame: updating it only on merges let the region
+  take in too much, the model filled with it, and tilt doubling went 1% -> 65%.
+- The model rebuild waits for pending merges, so a replay of the worker's raw copy reproduces the
+  live poses (0.0005 mm).
+- The flat hint shows when the shape alone slides (degeneracy < 0.005) and no marker held the frame.
+- Sessions also save track.csv, keyframes.npz, markers.json and cloud_state.npz (for Optimise and
+  continuing a scan).
+- Final against the first version: tilt 60% -> 1.1% doubled; face 13 -> 0 jumps; synthetic ATE
+  1.2 / 1.3 / 0.94 mm (was 4.0 / 1.7 / 6.0).
 Markers: the retroreflective dot usually has depth on this scanner (about 90% of its pixels), and a
 plane fitted to the ring around the dot is flat to about 0.3 mm.
 

@@ -142,6 +142,54 @@ def detect_half(rgb):
     return [(2 * x, 2 * y, 2 * r, c) for x, y, r, c in detect(luma(half), HALF_RADII, rgb=half)]
 
 
+def point_contrast(gray, x, y, r):
+    """score() at one pixel: mean of the dot minus the brightest of four ring patches around it."""
+    def mean(cx, cy, half):
+        return gray[max(cy - half, 0):cy + half + 1, max(cx - half, 0):cx + half + 1].mean()
+    dot = mean(x, y, max(1, int(0.6 * r)))
+    d, half = int(round(1.35 * r)), max(1, int(0.35 * r))
+    ring = max(mean(x + d, y, half), mean(x - d, y, half), mean(x, y + d, half), mean(x, y - d, half))
+    return dot - ring if dot >= MIN_DOT else 0.0
+
+
+def detect_fast(luma, rgb=None):
+    """Like detect_half, ~10x faster with OpenCV: bright blobs from a background-subtracted threshold
+    and connected components are the candidates; each still passes refine()'s checks (round, filled,
+    dark ring all round, not tiny) and the white check when colour is given. Falls back to
+    detect_half without OpenCV. luma: (H, W) uint8 brightness of the colour image."""
+    try:
+        import cv2
+    except ImportError:
+        return detect_half(rgb if rgb is not None else np.repeat(luma[..., None], 3, axis=2))
+    g = np.ascontiguousarray(luma[::2, ::2]).astype(np.float32)
+    bright = ((g > MIN_DOT) & (g - cv2.blur(g, (25, 25)) > MIN_CONTRAST / 2)).astype(np.uint8)
+    n, _, stats, centres = cv2.connectedComponentsWithStats(bright, connectivity=8)
+    lo, hi = HALF_RADII[0], 3 * HALF_RADII[-1]
+    found = []
+    for k in range(1, n):
+        x, y, w, h, area = stats[k]
+        if not (np.pi * lo ** 2 * 0.5 <= area <= np.pi * hi ** 2) or max(w, h) > MAX_ELONGATION * min(w, h):
+            continue
+        cx, cy = centres[k]
+        r = max(lo, int(round(np.sqrt(area / np.pi))))
+        if not (2 * r <= cx < g.shape[1] - 2 * r - 1 and 2 * r <= cy < g.shape[0] - 2 * r - 1):
+            continue
+        ix, iy = int(round(cx)), int(round(cy))
+        if point_contrast(g, ix, iy, r) < MIN_CONTRAST:  # same test as score(): dot vs brightest ring patch
+            continue
+        fx, fy, rr, elongation, ring_dark = refine(g, ix, iy, r)
+        if elongation > MAX_ELONGATION or ring_dark < MIN_RING_DARK or rr < lo:
+            continue
+        if rgb is not None:
+            kk = max(1, int(0.6 * rr))
+            X, Y = int(round(2 * fx)), int(round(2 * fy))
+            dot = rgb[Y - 2 * kk:Y + 2 * kk + 1:2, X - 2 * kk:X + 2 * kk + 1:2].reshape(-1, 3).astype(np.int16)
+            if len(dot) and (dot.max(1) - dot.min(1)).mean() > MAX_TINT:
+                continue
+        found.append((2 * fx, 2 * fy, 2 * rr, float(g[int(round(fy)), int(round(fx))])))
+    return found
+
+
 def locate(depth, found):
     """3D centre (mm, depth camera: x right, y down, z forward) and unit normal of each marker, or None.
 

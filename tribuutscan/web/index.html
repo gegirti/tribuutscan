@@ -181,9 +181,12 @@ async function poll() {
       $("pd").textContent = s.point_distance_mm ? `${s.point_distance_mm} mm (${s.preset})` : "–";
       $("raw").textContent = s.raw_points ? s.raw_points.toLocaleString() : "–";
       $("frames").textContent = s.merged != null ? `${s.merged} of ${s.frames}` : "–";
-      $("tracking").innerHTML = s.tracking == null ? "–" : s.tracking
-        ? `ok${s.relocked ? ` (re-found ${s.relocked}×)` : ""}`
-        : '<span class="bad">lost: move back slowly</span>';
+      const cue = s.cue || {};
+      const held = [cue.markers ? `${cue.markers} markers` : "", cue.features ? "features" : ""].filter(Boolean).join(", ") || "shape";
+      $("tracking").innerHTML = s.tracking == null ? "–" : !s.tracking
+        ? '<span class="bad">lost: move back slowly</span>'
+        : cue.flat ? '<span class="bad">flat area: aim at an edge or markers</span>'
+        : `ok, held by ${held}${s.relocked ? ` (re-found ${s.relocked}×)` : ""}`;
       $("empty").classList.toggle("show", info.points === 0);
     }
     $("status").innerHTML = "<b>●</b> connected";

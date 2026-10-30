@@ -6,7 +6,8 @@ to it over two queues. The worker also serves the browser 3D view of the growing
 
 Commands:  ("start", preset, out_dir, keep_raw) | ("frame", yuyv, grey, y10, bytesperline, (t_colour, t_ir, t_depth))
            | ("stop",) | ("quit",)   (times: camera capture times, seconds)
-Replies:   ("ready", url) | ("log", text) | ("frame_done", merged, frames, points, tracking) | ("saved", path, points)
+Replies:   ("ready", url) | ("log", text) | ("frame_done", merged, frames, points, tracking, cue) | ("saved", path, points)
+           cue: {"markers": used, "features": ORB start, "flat": shape alone slides}
 
 With keep_raw, the frames the worker processed are also written to out_dir/<stamp>-rec/ (the
 viewer's recording format), so a scan can be replayed offline with cloud.py for debugging.
@@ -42,14 +43,16 @@ class LiveSource:
             s = self.scanner
             if s is None:
                 return "empty", self.cached[1], {"name": self.name, "points": 0, "session": {}}
-            key = (self.scan_id, s.stats["merged"], s.stats["tracking"])
+            key = (self.scan_id, s.stats["merged"], s.stats["tracking"], s.cue.get("flat"))
             if key != self.built_key and time.time() - self.built_at >= PAYLOAD_EVERY_S:
-                xyz, rgb, seen = s.cloud.points(LIVE_MIN_SEEN)
+                with s.cloud_lock:
+                    xyz, rgb, seen = s.cloud.points(LIVE_MIN_SEEN)
                 payload = view3d.pack_arrays(xyz @ cl.FLIP.T / 1000, rgb, seen)
                 info = {"name": self.name, "points": len(xyz), "session": {
                     "preset": s.preset, "point_distance_mm": s.cloud.point_mm,
                     "raw_points": s.cloud.raw_points,
-                    **{k: s.stats[k] for k in ("frames", "merged", "lost", "relocked", "tracking")}}}
+                    **{k: s.stats[k] for k in ("frames", "merged", "lost", "relocked", "tracking")},
+                    "cue": dict(s.cue)}}
                 self.cached = (f"{key[0]}-{key[1]}", payload, info)
                 self.built_key, self.built_at = key, time.time()
             return self.cached
@@ -103,8 +106,9 @@ def run(commands, replies, port=view3d.PORT):
             with source.lock:
                 s = source.scanner
                 s.feed(frame)
-                points = int((s.cloud.seen >= cl.MIN_SEEN).sum())
-            replies.put(("frame_done", s.stats["merged"], s.stats["frames"], points, s.stats["tracking"]))
+                with s.cloud_lock:
+                    points = int((s.cloud.seen >= cl.MIN_SEEN).sum())
+            replies.put(("frame_done", s.stats["merged"], s.stats["frames"], points, s.stats["tracking"], dict(s.cue)))
         elif kind == "frame":
             replies.put(("frame_done", 0, 0, 0))
         elif kind == "stop" and source.scanner is not None:

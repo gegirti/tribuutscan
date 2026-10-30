@@ -70,6 +70,7 @@ TRACKERS = {  # name: Scanner options (the scan mode comes from the dataset)
     "nomarkers": dict(track_with="jointnm"),  # joint solve against the model, without markers
     "nofeatures": dict(use_features=False),  # joint solve without the ORB starting pose (P4 part 1)
     "markers": dict(track_with="markers"),  # markers alone (P3)
+    "inline": dict(threaded_merge=False),  # merging in the tracking thread
 }
 
 
@@ -80,13 +81,16 @@ def make_scanner(tracker, preset, mode):
     return cl.Scanner(preset, log=lambda m: None, **options)
 
 
-def run(name, tracker="baseline", preset="small"):
+def run(name, tracker="baseline", preset="small", live_markers=False):
+    """live_markers: let the tracker detect markers itself (markers.detect_fast, as live) instead of
+    being handed the cached reference detections."""
     directory = dataset_path(name)
     found = cached_markers(name, directory)
     scanner = make_scanner(tracker, preset, DATASETS[name][2])
     sightings, elapsed, n = [], 0.0, 0
     for i, frame in enumerate(fr.read_recording(directory)):
-        frame["markers2d"] = found.get(i, [])
+        if not live_markers:
+            frame["markers2d"] = found.get(i, [])
         t0 = time.perf_counter()
         scanner.feed(frame, i)
         elapsed += time.perf_counter() - t0
@@ -96,6 +100,7 @@ def run(name, tracker="baseline", preset="small"):
             for loc in mk.locate(frame["depth"], found.get(i, [])):
                 if loc is not None:
                     sightings.append(loc[0] @ pose[:3, :3].T + pose[:3, 3] * 1000)
+    scanner.flush()
     scanner.trim_table()
     xyz, rgb, seen, normals = scanner.cloud.points(cl.MIN_SEEN, with_normals=True)
     tracked = [(i, p) for i, s, p in scanner.track_log if p is not None]
@@ -184,7 +189,7 @@ def main():
     results = []
     for name in names:
         t0 = time.time()
-        result, (xyz, rgb, normals) = run(name, tracker, preset)
+        result, (xyz, rgb, normals) = run(name, tracker, preset, "--live-markers" in args)
         results.append(result)
         if name not in PRIVATE:
             render_views(xyz, normals, out / f"{name}.png")

@@ -420,9 +420,12 @@ def main():
             elif kind == "frame_done":
                 live["inflight"] = max(0, live["inflight"] - 1)
                 if live["scanning"]:
-                    merged, frames, points, tracking = rest
-                    message["text"] = f"SCAN {merged} of {frames} frames merged, {points:,} points" + (
-                        "" if tracking else "   TRACKING LOST: move back slowly to where it was")
+                    merged, frames, points, tracking, cue = rest
+                    held = ", ".join(([f"{cue['markers']} markers"] if cue.get("markers") else [])
+                                     + (["features"] if cue.get("features") else [])) or "shape"
+                    hint = ("   TRACKING LOST: move back slowly to where it was" if not tracking else
+                            "   FLAT AREA: aim at an edge, a corner or markers" if cue.get("flat") else "")
+                    message["text"] = f"SCAN {merged} of {frames} frames merged, {points:,} points | held by {held}{hint}"
             elif kind == "saved":
                 path, points = rest
                 log(f"scan saved: {points:,} points -> {Path(path).parent.name}/cloud.ply")
