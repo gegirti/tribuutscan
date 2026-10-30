@@ -20,11 +20,11 @@ from .image import depth_to_rgb, ppm, yuyv_to_rgb
 
 PANE_W = 480
 
-# (label, node, control id): what the sliders drive.
+# (label, node, control id, column): what the sliders drive and which image they sit under.
 SLIDERS = [
-    ("IR exposure", "depth", v4l2.CID_EXPOSURE),
-    ("IR gain", "depth", v4l2.CID_GAIN),
-    ("Colour brightness", "color", v4l2.CID_BRIGHTNESS),
+    ("Colour brightness", "color", v4l2.CID_BRIGHTNESS, 0),
+    ("IR exposure", "depth", v4l2.CID_EXPOSURE, 1),
+    ("IR gain", "depth", v4l2.CID_GAIN, 1),
 ]
 
 # Auto IR: keep clipped pixels between CLIP_LO and CLIP_HI percent; brighten only if the mean is low.
@@ -125,16 +125,17 @@ def main():
         tk.Label(root, text=name).grid(row=0, column=col)
         labels[name] = tk.Label(root)
         labels[name].grid(row=1, column=col)
-    guide = tk.Label(root, anchor="w", font=("TkDefaultFont", 14, "bold"))
+    guide = tk.Label(root, anchor="center", font=("TkDefaultFont", 14, "bold"))
     guide.grid(row=2, column=0, columnspan=3, sticky="we", padx=6)
     status = tk.Label(root, anchor="w")
     status.grid(row=3, column=0, columnspan=2, sticky="we")
     message = {"text": ""}
 
-    sliders = tk.Frame(root)
-    sliders.grid(row=5, column=0, columnspan=3, sticky="we")
+    columns = [tk.Frame(root) for _ in streams]
+    for col, frame in enumerate(columns):
+        frame.grid(row=5, column=col, sticky="n")
     controls = {}  # label -> (node path, control id, info, scale)
-    for col, (label, node, cid) in enumerate(SLIDERS):
+    for label, node, cid, col in SLIDERS:
         info = next((c for c in v4l2.controls(nodes[node]).values() if c["id"] == cid), None)
         if info is None:
             continue
@@ -145,10 +146,10 @@ def main():
             except OSError as e:
                 message["text"] = f"{label}: {e.strerror}"
 
-        scale = tk.Scale(sliders, label=label, orient="horizontal", length=PANE_W - 40, from_=info["min"],
+        scale = tk.Scale(columns[col], label=label, orient="horizontal", length=PANE_W - 40, from_=info["min"],
                          to=info["max"], resolution=info["step"] or 1, command=set_value)
         scale.set(info["value"])
-        scale.grid(row=0, column=col, padx=10)
+        scale.pack(padx=10)
         controls[label] = (nodes[node], cid, info, scale)
 
     def reset():
@@ -158,8 +159,8 @@ def main():
     def control_values():
         return {label: v4l2.get_control(dev, cid) for label, (dev, cid, _, _) in controls.items()}
 
-    buttons = tk.Frame(sliders)
-    buttons.grid(row=0, column=len(SLIDERS), padx=10)
+    buttons = tk.Frame(columns[2])
+    buttons.pack(pady=10)
     tk.Button(buttons, text="Reset defaults", command=reset).pack(fill="x")
 
     auto = {"steps": 0}
