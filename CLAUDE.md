@@ -51,6 +51,13 @@ is simply getting colour, IR and depth out of the scanner on Linux.
   800 to 3000. Clipping cost depth: gain 8000 gave 33% clipped pixels and only 47% valid. The
   projector lights the scene on its own. So the rule is to avoid IR clipping, not to make the image
   brighter. Dark objects are not tested yet.
+- Markers: the standard is uncoded circular targets (white retroreflective dot in a black ring,
+  e.g. 6/10 mm). `markers.py` finds them in the colour image (numpy only). On the test frames it
+  found every marker that wasn't in shade, with about 1 false hit per 17 marker-free frames.
+  Markers in shade on vertical faces (contrast ~40) are deliberately missed, because below ~60
+  key labels, logos and glossy glints look the same. In IR they drown in the projector dot
+  pattern. The live search in the viewer runs at half resolution, 5 Hz, and costs depth about
+  19 -> 15 fps; there is a checkbox to turn it off.
 - The vendor control interface is `/dev/hidraw*` (root only); its protocol is unknown.
 
 ## Commands
@@ -64,6 +71,7 @@ python3 -m tribuutscan.viewer               # live colour + IR + depth; `s` save
                                             # events print to the console and captures/viewer.log
 python3 -m tribuutscan.pointcloud [dir]     # .ply from a saved set, or grab a live one
 python3 -m tribuutscan.measure <cm>         # depth stats for a flat target at a known distance
+python3 -m tribuutscan.markers captures/<stamp>   # find markers in a saved frame -> markers.png
 .venv/bin/python -m tribuutscan.fuse captures/<stamp>-rec   # ROUGH mesh.ply from a recording (Open3D)
 ```
 

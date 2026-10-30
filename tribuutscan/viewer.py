@@ -8,6 +8,8 @@ image has little clipping (clipping costs depth; see CLAUDE.md).
 The distance line reads the centre of the depth image; distances and the window are estimates.
 Press `m` or click Mesh to fuse the latest recording into mesh.ply (runs fuse.py in the Open3D .venv).
 Events are printed to the console and appended to captures/viewer.log.
+Markers (white dot in a black ring) are found in the colour image a few times a second and ringed
+in the colour view; saved frames list them in info.json.
 """
 import os
 import subprocess
@@ -19,7 +21,7 @@ from pathlib import Path
 import numpy as np
 
 from . import frames as fr
-from . import pointcloud, v4l2
+from . import markers, pointcloud, v4l2
 from .depth import decode_y10
 from .image import depth_to_rgb, ppm, yuyv_to_rgb
 
@@ -86,8 +88,32 @@ class Stream(threading.Thread):
         self.cap.close()
 
 
+MARKER_HZ = 5  # marker search rate; one search takes ~0.1 s at half resolution
+MARKER_RADII = (3, 4, 5, 7)  # dot radius in half-resolution pixels (smaller ones were glints)
+found_markers = {"on": True, "list": [], "stamp": 0.0}  # list in full-resolution pixels
+
+
+def find_markers_loop(color):
+    """Background thread: search the latest colour frame for markers at half resolution."""
+    while True:
+        t = time.time()
+        if found_markers["on"] and color.raw and color.stamp != found_markers["stamp"]:
+            found_markers["stamp"] = color.stamp
+            rgb = yuyv_to_rgb(color.raw, color.cap.width, color.cap.height)[::2, ::2]
+            hits = markers.detect(markers.luma(rgb), MARKER_RADII, rgb=rgb)
+            found_markers["list"] = [(2 * x, 2 * y, 2 * r, c) for x, y, r, c in hits]
+        elif not found_markers["on"]:
+            found_markers["list"] = []
+        time.sleep(max(0.0, 1 / MARKER_HZ - (time.time() - t)))
+
+
 def render_color(cap, buf):
-    return ppm(fit(yuyv_to_rgb(buf, cap.width, cap.height))), {"text": ""}
+    rgb = fit(yuyv_to_rgb(buf, cap.width, cap.height))
+    step = cap.width / rgb.shape[1]
+    hits = found_markers["list"]
+    if hits:
+        rgb = markers.draw(rgb, [(x / step, y / step, r / step, c) for x, y, r, c in hits])
+    return ppm(rgb), {"text": f"markers {len(hits)}" if found_markers["on"] else ""}
 
 
 def render_ir(cap, buf):
@@ -230,10 +256,12 @@ def main():
             log("nothing to save yet")
             return
         frames = fr.decode(color.raw, ir.raw, depth.raw, depth.cap.bytesperline)
-        out = fr.save(frames, extra={"controls": control_values()})
+        hits = markers.detect(markers.luma(frames["color"]), rgb=frames["color"])
+        out = fr.save(frames, extra={"controls": control_values(),
+                                     "markers": [[round(x, 2), round(y, 2), round(r, 2)] for x, y, r, _ in hits]})
         xyz, rgb = pointcloud.to_points(frames["depth"], pointcloud.register_color(frames["color"]))
         pointcloud.write_ply(out / "cloud.ply", xyz, rgb)
-        log(f"saved {out.name} (with cloud.ply)")
+        log(f"saved {out.name} (with cloud.ply, {len(hits)} markers)")
 
     rec = {"recorder": None}
 
@@ -314,6 +342,11 @@ def main():
     root.bind("s", save)
     root.bind("r", toggle_record)
     root.bind("m", mesh)
+
+    show = tk.BooleanVar(value=True)
+    tk.Checkbutton(columns[0], text="Find markers", variable=show,
+                   command=lambda: found_markers.update(on=show.get())).pack()
+    threading.Thread(target=find_markers_loop, args=(color,), daemon=True).start()
 
     for s in streams.values():
         s.start()
