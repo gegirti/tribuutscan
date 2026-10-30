@@ -43,15 +43,21 @@ def read_ply(path):
 
 
 def pack_cloud(rec):
-    """Binary payload for the page: u32 count, u32 has_seen, f32 xyz, u8 rgb (padded to 4), u16 seen."""
-    n = len(rec)
+    """Binary payload for the page from a PLY record array (see pack_arrays)."""
     names = rec.dtype.names
-    xyz = np.stack([rec["x"], rec["y"], rec["z"]], 1).astype("<f4")
-    rgb = (np.stack([rec["red"], rec["green"], rec["blue"]], 1).astype(np.uint8) if "red" in names
-           else np.full((n, 3), 200, np.uint8))
+    xyz = np.stack([rec["x"], rec["y"], rec["z"]], 1)
+    rgb = np.stack([rec["red"], rec["green"], rec["blue"]], 1) if "red" in names else None
+    return pack_arrays(xyz, rgb, rec["seen"] if "seen" in names else None)
+
+
+def pack_arrays(xyz, rgb=None, seen=None):
+    """Binary payload for the page: u32 count, u32 has_seen, f32 xyz, u8 rgb (padded to 4), u16 seen."""
+    n = len(xyz)
+    rgb = np.full((n, 3), 200, np.uint8) if rgb is None else np.asarray(rgb, np.uint8)
     rgb_bytes = rgb.tobytes() + b"\0" * (-3 * n % 4)
-    seen = rec["seen"].astype("<u2").tobytes() if "seen" in names else b""
-    return struct.pack("<II", n, int(bool(seen))) + xyz.tobytes() + rgb_bytes + seen
+    seen_bytes = b"" if seen is None else np.minimum(seen, 65535).astype("<u2").tobytes()
+    return (struct.pack("<II", n, int(seen is not None)) + np.asarray(xyz, "<f4").tobytes()
+            + rgb_bytes + seen_bytes)
 
 
 class FileSource:

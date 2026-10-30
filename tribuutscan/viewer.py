@@ -8,20 +8,25 @@ image has little clipping (clipping costs depth; see CLAUDE.md).
 The distance line reads the centre of the depth image; distances and the window are estimates.
 Press `m` or click Mesh to fuse the latest recording into mesh.ply (runs fuse.py in the Open3D .venv).
 Events are printed to the console and appended to captures/viewer.log.
+Press `c` or click Start scan to merge frames live into one compact cloud (cloud.py) in a worker
+process; Open 3D view shows it growing in the browser. Stop saves captures/<timestamp>-scan/.
 Markers (white dot in a black ring) are found in the colour image a few times a second and ringed
 in the colour view; saved frames list them in info.json.
 """
+import multiprocessing
 import os
+import queue
 import subprocess
 import threading
 import time
 import tkinter as tk
+import webbrowser
 from pathlib import Path
 
 import numpy as np
 
 from . import frames as fr
-from . import markers, pointcloud, v4l2
+from . import cloud, livescan, markers, pointcloud, v4l2
 from .depth import decode_y10
 from .image import depth_to_rgb, ppm, yuyv_to_rgb
 
@@ -277,7 +282,6 @@ def main():
         recorder.close()
 
     def toggle_record(_event=None):
-        check_mesh()
         recorder = rec["recorder"]
         if recorder:
             rec["recorder"] = None
@@ -343,6 +347,76 @@ def main():
     root.bind("r", toggle_record)
     root.bind("m", mesh)
 
+    live = {"proc": None, "commands": None, "replies": None, "url": None, "open": False,
+            "scanning": False, "busy": False, "sent": 0.0}
+
+    def start_worker():
+        ctx = multiprocessing.get_context("spawn")
+        if VENV_PYTHON.exists():
+            ctx.set_executable(str(VENV_PYTHON))  # has Open3D: tracking
+        live["commands"], live["replies"] = ctx.Queue(), ctx.Queue()
+        live["proc"] = ctx.Process(target=livescan.run, args=(live["commands"], live["replies"]), daemon=True)
+        live["proc"].start()
+
+    def toggle_scan(_event=None):
+        if live["scanning"]:
+            live["scanning"] = False
+            live["commands"].put(("stop",))
+            scan_button.configure(text="Saving...", state="disabled")
+            log("scan stopped, saving ...")
+            return
+        if live["proc"] is None:
+            start_worker()
+        out = fr.CAPTURES / (time.strftime("%Y%m%d-%H%M%S") + "-scan")
+        live.update(scanning=True, busy=False)
+        live["commands"].put(("start", preset.get(), out))
+        scan_button.configure(text="Stop scan (c)")
+        log(f"scan started: {out.name} ({preset.get()}, point distance {cloud.PRESETS_MM[preset.get()]} mm)")
+
+    def open_view():
+        if live["url"]:
+            webbrowser.open(live["url"])
+            return
+        if live["proc"] is None:
+            start_worker()
+        live["open"] = True  # opens when the worker reports ready
+        log("starting the 3D view ...")
+
+    def check_scan():
+        """Hand the worker a new frame when it is free; handle its replies."""
+        if live["scanning"] and not live["busy"] and color.raw and depth.raw and depth.stamp != live["sent"]:
+            live["sent"], live["busy"] = depth.stamp, True
+            live["commands"].put(("frame", color.raw, depth.raw, depth.cap.bytesperline))
+        while live["replies"] is not None:
+            try:
+                kind, *rest = live["replies"].get_nowait()
+            except queue.Empty:
+                break
+            if kind == "ready":
+                live["url"] = rest[0]
+                if live["open"] and rest[0]:
+                    webbrowser.open(rest[0])
+            elif kind == "log":
+                log(rest[0])
+            elif kind == "frame_done":
+                live["busy"] = False
+                if live["scanning"]:
+                    merged, frames, points = rest
+                    message["text"] = f"SCAN {merged} of {frames} frames merged, {points:,} points"
+            elif kind == "saved":
+                path, points = rest
+                log(f"scan saved: {points:,} points -> {Path(path).parent.name}/cloud.ply")
+                scan_button.configure(text="Start scan (c)", state="normal")
+
+    scan_box = tk.Frame(columns[2])
+    scan_box.pack(pady=4)
+    preset = tk.StringVar(value="small")
+    tk.OptionMenu(scan_box, preset, *cloud.PRESETS_MM).pack(side="left")
+    scan_button = tk.Button(scan_box, text="Start scan (c)", command=toggle_scan)
+    scan_button.pack(side="left")
+    tk.Button(scan_box, text="Open 3D view", command=open_view).pack(side="left")
+    root.bind("c", toggle_scan)
+
     show = tk.BooleanVar(value=True)
     tk.Checkbutton(columns[0], text="Find markers", variable=show,
                    command=lambda: found_markers.update(on=show.get())).pack()
@@ -362,6 +436,7 @@ def main():
             guide.configure(text=text, fg=colour)
         fps = "  ".join(f"{n.split()[0]}: {s.fps:4.1f} fps {s.stats.get('text', '')}" for n, s in streams.items())
         check_mesh()
+        check_scan()
         recorder = rec["recorder"]
         if recorder:
             message["text"] = f"REC {recorder.count} sets, {recorder.megabytes:.0f} MB"
@@ -374,6 +449,14 @@ def main():
         if rec["recorder"]:
             rec["recorder"] = None
             rec["thread"].join(timeout=2)  # let the last set and the files close cleanly
+        if live["proc"] is not None:
+            if live["scanning"]:
+                live["commands"].put(("stop",))  # save what was scanned
+                log("scan stopped by closing, saving ...")
+            live["commands"].put(("quit",))
+            live["proc"].join(timeout=15)
+            if live["proc"].is_alive():
+                live["proc"].terminate()
         for s in streams.values():
             s.stop()
         root.destroy()

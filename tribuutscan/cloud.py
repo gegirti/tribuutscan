@@ -25,6 +25,7 @@ from . import markers
 from . import pointcloud as pc
 
 PRESETS_MM = {"small": 0.5, "medium": 1.0, "large": 2.0}  # point distance; depth noise ~1 mm (estimate)
+PIXEL_MM = 0.25  # a depth pixel spans ~0.23 mm at 25 cm (estimate); frames are thinned to ~1 point per cube
 MIN_SEEN = 3  # frames a cube must be seen in to be kept
 NORMAL_RADIUS_MM = 2.0  # neighbourhood for normals
 
@@ -37,6 +38,7 @@ PLANE_MIN_CM2 = 80  # ...and cover this much area. A slice through a curved part
 CLUSTER_CELL_MM = 6.0  # cell size for finding the connected piece at the centre
 
 KEY_MOVE_MM, KEY_TURN_DEG = 3.0, 2.0  # merge a frame only after this much motion since the last one
+MAX_STEP_MM, MAX_STEP_DEG = 30.0, 15.0  # larger jumps between tracked frames are tracking failures
 BIAS = 1 << 20  # voxel coordinates are packed into one int64 key, 21 bits each
 FLIP = np.diag([1.0, -1.0, -1.0])  # camera (y down, z forward) -> y up, z toward scanner
 
@@ -122,11 +124,15 @@ class VoxelCloud:
         return np.linalg.eigh(cov)[1][:, :, 0]  # eigenvector of the smallest eigenvalue
 
 
-def frame_points(frame):
-    """Camera-frame points (mm; x right, y down, z forward), colours, and pixel coords of one frame."""
+def frame_points(frame, stride=1):
+    """Camera-frame points (mm; x right, y down, z forward), colours, and pixel coords of one frame.
+
+    `stride` takes every n-th pixel in both directions (more points than cubes is wasted work).
+    """
     d = frame["depth"]
     h, w = d.shape
-    v, u = np.nonzero(d > 0)
+    v, u = np.nonzero(d[::stride, ::stride] > 0)
+    v, u = v * stride, u * stride
     z = pc.depth_to_mm(d[v, u])
     f = (w / 2) / np.tan(np.radians(pc.HFOV_DEG) / 2)
     xyz = np.stack([(u - w / 2) * z / f, (v - h / 2) * z / f, z], 1)
@@ -175,11 +181,12 @@ def support_plane(xyz, rng, pix=None, shape=None, iterations=100, sample=2000, t
 
 def plane_area_cm2(xyz, n, c, cell_mm=10.0):
     """Area covered by the points within PLANE_TOL_MM of the plane, counted in cell_mm squares."""
+    xyz = xyz[::max(1, len(xyz) // 50000)]  # a sample is plenty to fill 1 cm squares
     on = xyz[np.abs(xyz @ n + c) < PLANE_TOL_MM]
     a = np.cross(n, [1.0, 0, 0] if abs(n[0]) < 0.9 else [0, 1.0, 0])
     a /= np.linalg.norm(a)
     cells = np.floor(np.c_[on @ a, on @ np.cross(n, a)] / cell_mm).astype(np.int64)
-    return len(np.unique(cells, axis=0)) * (cell_mm / 10) ** 2
+    return len(np.unique(cells[:, 0] * 1_000_003 + cells[:, 1])) * (cell_mm / 10) ** 2
 
 
 def _ransac_plane(pts, rng, iterations):
@@ -233,55 +240,87 @@ def isolate(xyz, rgb, pix, shape, rng):
     return xyz, rgb, plane is not None
 
 
+def plausible_step(t, xyz):
+    """Is a frame-to-frame motion believable? Judged at the object's centre, not the camera.
+
+    Turning the object a few degrees in place swings the camera-equivalent pose by centimetres
+    (it is ~25 cm away), so a limit on camera movement wrongly rejects it. The object's own centre
+    barely moves in that case; a tracking failure moves it a lot.
+    """
+    c = xyz.mean(0) / 1000
+    moved_mm = np.linalg.norm(t[:3, :3] @ c + t[:3, 3] - c) * 1000
+    return moved_mm <= MAX_STEP_MM and turned(t)[1] <= MAX_STEP_DEG
+
+
 def turned(t):
     """(movement mm, rotation degrees) of a 4x4 rigid transform in metres."""
     return np.linalg.norm(t[:3, 3]) * 1000, np.degrees(np.arccos(np.clip((np.trace(t[:3, :3]) - 1) / 2, -1, 1)))
 
 
-def scan(directory, preset="small", log=print):
-    """Merge a recording into a VoxelCloud. Returns (cloud, poses, stats)."""
-    try:
-        from . import fuse  # Open3D: frame-to-frame ICP
-    except ImportError:
-        fuse = None
-        log("Open3D not found: no tracking, frames are merged as if nothing moved")
-    rng = np.random.default_rng(0)
-    cloud = VoxelCloud(PRESETS_MM[preset])
-    pose, motion, prev, last_merged = np.eye(4), np.eye(4), None, None
-    poses, stats = [], {"frames": 0, "merged": 0, "lost": 0, "plane_frames": 0, "markers": []}
-    for i, frame in enumerate(fr.read_recording(directory)):
+class Scanner:
+    """Feeds frames one at a time: isolate the object, track it (ICP, if Open3D is present), merge."""
+
+    def __init__(self, preset="small", log=print):
+        try:
+            from . import fuse  # Open3D: frame-to-frame ICP
+        except ImportError:
+            fuse = None
+            log("Open3D not found: no tracking, frames are merged as if nothing moved")
+        self.fuse, self.log, self.preset = fuse, log, preset
+        self.rng = np.random.default_rng(0)
+        self.cloud = VoxelCloud(PRESETS_MM[preset])
+        self.stride = max(1, int(PRESETS_MM[preset] / PIXEL_MM))
+        self.pose, self.motion, self.prev, self.last_merged = np.eye(4), np.eye(4), None, None
+        self.poses = []
+        self.stats = {"frames": 0, "merged": 0, "lost": 0, "plane_frames": 0, "markers": []}
+
+    def feed(self, frame, index=None):
+        """Process one frame set ({'color', 'depth'}); returns True if it was merged into the cloud."""
+        stats, fuse = self.stats, self.fuse
+        index = stats["frames"] if index is None else index
         stats["frames"] += 1
-        xyz, rgb, pix = frame_points(frame)
-        xyz, rgb, had_plane = isolate(xyz, rgb, pix, frame["depth"].shape, rng)
+        xyz, rgb, pix = frame_points(frame, self.stride)
+        xyz, rgb, had_plane = isolate(xyz, rgb, pix, frame["depth"].shape, self.rng)
         stats["plane_frames"] += had_plane
-        if len(xyz) < 500:
+        if len(xyz) < 500 // self.stride ** 2:
             stats["lost"] += 1
-            continue
+            return False
         if fuse is not None:
             levels = fuse.levels(xyz / 1000)
-            if prev is not None:
-                result = fuse.icp(levels, prev, motion)
-                if result.fitness < fuse.MIN_FITNESS or not fuse.plausible(result.transformation):
+            if self.prev is not None:
+                result = fuse.icp(levels, self.prev, self.motion)
+                if result.fitness < fuse.MIN_FITNESS or not plausible_step(result.transformation, xyz):
                     stats["lost"] += 1
-                    continue
-                motion = result.transformation
-                pose = pose @ motion
-            prev = levels
-        if last_merged is not None:
-            move, turn = turned(np.linalg.inv(last_merged) @ pose)
+                    return False
+                self.motion = result.transformation
+                self.pose = self.pose @ self.motion
+            self.prev = levels
+        if self.last_merged is not None:
+            move, turn = turned(np.linalg.inv(self.last_merged) @ self.pose)
             if fuse is not None and move < KEY_MOVE_MM and turn < KEY_TURN_DEG:
-                continue
-        world = xyz @ pose[:3, :3].T + pose[:3, 3] * 1000
-        cloud.add(world, rgb)
-        last_merged = pose.copy()
-        poses.append((i, pose.copy()))
+                return False
+        world = xyz @ self.pose[:3, :3].T + self.pose[:3, 3] * 1000
+        self.cloud.add(world, rgb)
+        self.last_merged = self.pose.copy()
+        self.poses.append((index, self.pose.copy()))
         stats["merged"] += 1
         if not stats["markers"]:
             stats["markers"] = [[round(x, 1), round(y, 1)] for x, y, *_ in markers.detect(
                 markers.luma(frame["color"]), rgb=frame["color"])]
-        if stats["merged"] % 10 == 1:
-            log(f"frame {i:4d}: merged {stats['merged']:3d}, cubes {len(cloud):7d}, raw points so far {cloud.raw_points:9d}")
-    return cloud, poses, stats
+        return True
+
+    def save(self, directory, min_seen=MIN_SEEN):
+        return save(directory, self.cloud, self.poses, self.stats, self.preset, min_seen)
+
+
+def scan(directory, preset="small", log=print):
+    """Merge a recording into a VoxelCloud. Returns (cloud, poses, stats)."""
+    scanner = Scanner(preset, log)
+    for i, frame in enumerate(fr.read_recording(directory)):
+        if scanner.feed(frame, i) and scanner.stats["merged"] % 10 == 1:
+            log(f"frame {i:4d}: merged {scanner.stats['merged']:3d}, cubes {len(scanner.cloud):7d}, "
+                f"raw points so far {scanner.cloud.raw_points:9d}")
+    return scanner.cloud, scanner.poses, scanner.stats
 
 
 def save(directory, cloud, poses, stats, preset, min_seen=MIN_SEEN):

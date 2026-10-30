@@ -67,6 +67,16 @@ is simply getting colour, IR and depth out of the scanner on Linux.
   edge-on, it reaches the image edge, and it covers 80 cm2. Without those rules the kettle's lid and
   a slice through its handle were taken for tables. Without Open3D there is no tracking, and
   every frame is merged unmoved (smeared).
+- Live scan (`livescan.py`): a spawned worker using the `.venv` Python. It merges frames
+  (`cloud.Scanner`) and serves the 3D page; the viewer only sends a frame when the worker is
+  free. Two pitfalls hit:
+  - A spawned process inherits the parent's `sys.path`, so the old system `typing_extensions`
+    shadowed the venv's and Open3D failed to import. The worker puts its own site-packages first.
+  - A camera-movement limit rejected real turns of the object (8 degrees at 25 cm looks like
+    35-50 mm of camera movement). The limit is now judged at the object's centre.
+
+  Frames are thinned to about 1 point per cube (every 2nd pixel at 0.5 mm). Small preset runs
+  about 46 ms per frame offline, and the live worker handles about 13 fps.
 - The vendor control interface is `/dev/hidraw*` (root only); its protocol is unknown.
 
 ## Commands
@@ -78,6 +88,7 @@ python3 -m tribuutscan.viewer               # live colour + IR + depth; `s` save
                                             # Auto IR button, distance guide (estimate),
                                             # `m` meshes the latest recording via .venv fuse.py;
                                             # events print to the console and captures/viewer.log
+                                            # `c` live scan (merged cloud, worker process), Open 3D view
 python3 -m tribuutscan.pointcloud [dir]     # .ply from a saved set, or grab a live one
 python3 -m tribuutscan.measure <cm>         # depth stats for a flat target at a known distance
 python3 -m tribuutscan.markers captures/<stamp>   # find markers in a saved frame -> markers.png
