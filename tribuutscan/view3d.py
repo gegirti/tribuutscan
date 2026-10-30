@@ -82,6 +82,12 @@ class FileSource:
     def mesh_path(self):
         return self.ply.parent / "mesh.ply"
 
+    def ply_bytes(self):
+        return self.ply.read_bytes()
+
+    def download_name(self):
+        return self.ply.parent.name if self.ply.name == "cloud.ply" else self.ply.stem
+
     def current(self):
         version = self.ply.stat().st_mtime_ns
         with self.lock:
@@ -110,12 +116,14 @@ class Handler(BaseHTTPRequestHandler):
             return self.reply(json.dumps({"version": str(version), **info}).encode(), "application/json")
         if path == "/cloud.bin":
             return self.reply(payload, "application/octet-stream")
-        if path == "/cloud.ply" and isinstance(self.source, FileSource):
-            return self.reply(self.source.ply.read_bytes(), "application/octet-stream")
+        if path == "/cloud.ply":  # the live scan's page too (it used to give 404 there)
+            body = self.source.ply_bytes() if hasattr(self.source, "ply_bytes") else None
+            if body is not None:
+                return self.reply(body, "application/octet-stream", f"{self.source.download_name()}.ply")
         if path == "/mesh.ply":
             mesh = self.source.mesh_path() if hasattr(self.source, "mesh_path") else None
             if mesh is not None and mesh.exists():
-                return self.reply(mesh.read_bytes(), "application/octet-stream")
+                return self.reply(mesh.read_bytes(), "application/octet-stream", f"{self.source.download_name()}-mesh.ply")
         self.send_error(404)
 
     def do_POST(self):
@@ -129,9 +137,11 @@ class Handler(BaseHTTPRequestHandler):
             message = f"failed: {e}"
         self.reply(json.dumps({"message": message}).encode(), "application/json")
 
-    def reply(self, body, kind):
+    def reply(self, body, kind, filename=None):
         self.send_response(200)
         self.send_header("Content-Type", kind)
+        if filename:  # a download named after the scan, not cloud.ply every time
+            self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
         self.end_headers()

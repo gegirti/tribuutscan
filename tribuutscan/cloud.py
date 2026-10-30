@@ -808,9 +808,8 @@ def scan(directory, preset="small", log=print):
     return scanner.cloud, scanner.poses, scanner.stats
 
 
-def save(directory, cloud, poses, stats, preset, min_seen=MIN_SEEN):
-    """Write cloud.ply, poses.txt and session.json; returns (path, number of points)."""
-    directory.mkdir(parents=True, exist_ok=True)
+def ply_arrays(cloud, poses, min_seen=MIN_SEEN):
+    """What cloud.ply holds: (xyz metres y/z flipped for viewers, rgb, normals, seen, min_seen used)."""
     xyz, rgb, seen = cloud.points(min_seen)
     if not len(xyz) and len(cloud):  # too short a scan for min_seen: keep what there is, and say so
         min_seen = 1
@@ -820,8 +819,15 @@ def save(directory, cloud, poses, stats, preset, min_seen=MIN_SEEN):
         centres = np.array([p[:3, 3] for _, p in poses]) * 1000
         flip = np.einsum("ij,ij->i", normals, centres.mean(0) - xyz) < 0
         normals[flip] *= -1
+    return (xyz @ FLIP.T / 1000).astype(np.float32), rgb, normals @ FLIP.T, seen, min_seen
+
+
+def save(directory, cloud, poses, stats, preset, min_seen=MIN_SEEN):
+    """Write cloud.ply, poses.txt and session.json; returns (path, number of points)."""
+    directory.mkdir(parents=True, exist_ok=True)
+    xyz, rgb, normals, seen, min_seen = ply_arrays(cloud, poses, min_seen)
     out = directory / "cloud.ply"
-    pc.write_ply(out, (xyz @ FLIP.T / 1000).astype(np.float32), rgb, normals=normals @ FLIP.T, seen=seen)
+    pc.write_ply(out, xyz, rgb, normals=normals, seen=seen)
     with open(directory / "poses.txt", "w") as f:
         for i, p in poses:
             f.write(f"{i} " + " ".join(f"{v:.6f}" for v in p.ravel()) + "\n")

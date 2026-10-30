@@ -65,6 +65,9 @@ def write_ply(path, xyz, rgb, normals=None, seen=None):
         + "".join(f"property {types[t]} {name}\n" for name, t in fields)
         + "end_header\n"
     )
+    if hasattr(path, "write"):  # a file object, e.g. io.BytesIO for a download
+        path.write(header.encode() + rec.tobytes())
+        return
     with open(path, "wb") as f:
         f.write(header.encode())
         f.write(rec.tobytes())

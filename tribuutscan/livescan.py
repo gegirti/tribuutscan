@@ -13,6 +13,7 @@ Replies:   ("ready", url) | ("log", text) | ("frame_done", merged, frames, point
 With keep_raw, the frames the worker processed are also written to out_dir/<stamp>-rec/ (the
 viewer's recording format), so a scan can be replayed offline with cloud.py for debugging.
 """
+import io
 import multiprocessing
 import queue
 from pathlib import Path
@@ -25,6 +26,7 @@ import numpy as np
 
 from . import cloud as cl
 from . import frames as fr
+from . import pointcloud as pc
 from . import view3d
 from .depth import decode_y10
 
@@ -78,6 +80,23 @@ class LiveSource:
 
     def mesh_path(self):
         return self.out_dir / "mesh.ply" if self.out_dir else None
+
+    def ply_bytes(self):
+        """The scan's cloud.ply: the saved file once the scan is done, else built from the cloud so far."""
+        if self.phase in ("done", "idle") and self.out_dir and (self.out_dir / "cloud.ply").exists():
+            return (self.out_dir / "cloud.ply").read_bytes()
+        with self.lock:
+            s = self.scanner
+            if s is None:
+                return None
+            with s.cloud_lock:
+                xyz, rgb, normals, seen, _ = cl.ply_arrays(s.cloud, list(s.poses))
+        buf = io.BytesIO()
+        pc.write_ply(buf, xyz, rgb, normals=normals, seen=seen)
+        return buf.getvalue()
+
+    def download_name(self):
+        return self.out_dir.name if self.out_dir else "live-scan"
 
 
 def run(commands, replies, port=view3d.PORT):
