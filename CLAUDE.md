@@ -42,6 +42,10 @@ is simply getting colour, IR and depth out of the scanner on Linux.
 - Some depth frames arrive truncated; drop any frame shorter than `sizeimage`.
 - Only one program can stream from the scanner at a time. Close the viewer before running
   `python3 -m tribuutscan.pointcloud` (live grab) or `tribuutscan.measure`.
+- The scanner resets its USB connection 3-4 s after a program stops streaming: the kernel logs
+  "USB disconnect" and it re-enumerates within a second (`journalctl -k | grep "usb 9-1"`). Seen about
+  20 times on 2026-10-30; every one checked followed a viewer or capture closing. Harmless, but a
+  program that opens the scanner within those seconds can lose it.
 - The scene must be lit and the lenses uncovered, or all streams are black.
 - `pyorbbecsdk2` 2.9.3 does not enumerate the device ("No matched usb device found").
 - IR brightness is set through the depth node's standard V4L2 controls: exposure 100-6800 (default
