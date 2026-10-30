@@ -75,8 +75,18 @@ is simply getting colour, IR and depth out of the scanner on Linux.
   - A camera-movement limit rejected real turns of the object (8 degrees at 25 cm looks like
     35-50 mm of camera movement). The limit is now judged at the object's centre.
 
-  Frames are thinned to about 1 point per cube (every 2nd pixel at 0.5 mm). Small preset runs
-  about 46 ms per frame offline, and the live worker handles about 13 fps.
+  Frames are thinned to about 1 point per cube (every 2nd pixel at 0.5 mm), and colour is
+  converted only at those pixels. The worker takes about 74 ms per frame (13 fps); inside the
+  real viewer it ran about 6 fps.
+  - After a tracking loss the frame is matched against the cloud so far, from the last pose
+    ("move back"); otherwise one loss used to end the scan.
+  - The worker exits when its viewer dies (an orphan once held port 8765, and the page showed a
+    stale scan).
+  - The live page shows every cube; the saved cloud keeps cubes seen 3 times, or every cube if
+    that leaves none.
+  - With "keep raw frames" a live scan can be replayed exactly with cloud.py.
+  - A spawned worker re-runs the starting script, so test drivers need an
+    `if __name__ == "__main__"` guard.
 - The vendor control interface is `/dev/hidraw*` (root only); its protocol is unknown.
 
 ## Commands

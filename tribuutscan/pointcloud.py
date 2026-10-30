@@ -23,13 +23,17 @@ WINDOW_CM = (17.0, 32.0)  # depth window ESTIMATE from hand-held readings; beyon
 REG = {"ax": 1.134, "bx": -30.6, "ay": 1.0, "by": 5.0}  # eyeballed from one frame, see docstring
 
 
+def color_source(u, v, w, h, reg=REG):
+    """Colour-image pixel (x, y) for depth pixel (u, v), by the rough affine estimate."""
+    src_x = np.clip(np.round((u - reg["bx"]) / reg["ax"]).astype(int), 0, w - 1)
+    src_y = np.clip(np.round((v - reg["by"]) / reg["ay"]).astype(int), 0, h - 1)
+    return src_x, src_y
+
+
 def register_color(color, reg=REG):
     """Resample colour onto the depth pixel grid using the rough affine estimate."""
     h, w = color.shape[:2]
-    u = np.arange(w)
-    v = np.arange(h)
-    src_x = np.clip(np.round((u - reg["bx"]) / reg["ax"]).astype(int), 0, w - 1)
-    src_y = np.clip(np.round((v - reg["by"]) / reg["ay"]).astype(int), 0, h - 1)
+    src_x, src_y = color_source(np.arange(w), np.arange(h), w, h, reg)
     return color[src_y][:, src_x]
 
 

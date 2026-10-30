@@ -67,3 +67,11 @@ def test_flat_lid_in_the_middle_is_not_a_table():
     pix = np.c_[xyz[:, 0] * f / xyz[:, 2] + w / 2, xyz[:, 1] * f / xyz[:, 2] + h / 2]
     assert cl.support_plane(xyz, rng, pix, (h, w)) is None
     assert cl.support_plane(xyz, rng) is not None  # without the edge rule it would be taken
+
+
+def test_normals_point_out_of_a_sphere():
+    rng = np.random.default_rng(7)
+    d = rng.normal(size=(20000, 3))
+    d /= np.linalg.norm(d, axis=1)[:, None]
+    normals = cl.VoxelCloud(0.5).normals(d * 50)
+    assert np.median(np.abs(np.sum(normals * d, 1))) > 0.99

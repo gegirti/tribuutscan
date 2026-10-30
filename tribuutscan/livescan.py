@@ -4,9 +4,14 @@ The viewer starts it with the .venv Python when there is one (so ICP tracking wo
 to it over two queues. The worker also serves the browser 3D view of the growing cloud
 (view3d page), so cloud data never passes back through the viewer.
 
-Commands:  ("start", preset, out_dir) | ("frame", yuyv, y10, bytesperline) | ("stop",) | ("quit",)
-Replies:   ("ready", url) | ("log", text) | ("frame_done", merged, frames, points) | ("saved", path, points)
+Commands:  ("start", preset, out_dir, keep_raw) | ("frame", yuyv, grey, y10, bytesperline) | ("stop",) | ("quit",)
+Replies:   ("ready", url) | ("log", text) | ("frame_done", merged, frames, points, tracking) | ("saved", path, points)
+
+With keep_raw, the frames the worker processed are also written to out_dir/<stamp>-rec/ (the
+viewer's recording format), so a scan can be replayed offline with cloud.py for debugging.
 """
+import multiprocessing
+import queue
 import site
 import sys
 import threading
@@ -18,9 +23,9 @@ from . import cloud as cl
 from . import frames as fr
 from . import view3d
 from .depth import decode_y10
-from .image import yuyv_to_rgb
 
 PAYLOAD_EVERY_S = 0.5  # rebuild the page's cloud at most this often
+LIVE_MIN_SEEN = 1  # the page shows every cube while scanning; the saved cloud uses cloud.MIN_SEEN
 
 
 class LiveSource:
@@ -36,13 +41,14 @@ class LiveSource:
             s = self.scanner
             if s is None:
                 return "empty", self.cached[1], {"name": self.name, "points": 0, "session": {}}
-            key = (self.scan_id, s.stats["merged"])
+            key = (self.scan_id, s.stats["merged"], s.stats["tracking"])
             if key != self.built_key and time.time() - self.built_at >= PAYLOAD_EVERY_S:
-                xyz, rgb, seen = s.cloud.points(cl.MIN_SEEN)
+                xyz, rgb, seen = s.cloud.points(LIVE_MIN_SEEN)
                 payload = view3d.pack_arrays(xyz @ cl.FLIP.T / 1000, rgb, seen)
                 info = {"name": self.name, "points": len(xyz), "session": {
                     "preset": s.preset, "point_distance_mm": s.cloud.point_mm,
-                    "raw_points": s.cloud.raw_points, **{k: s.stats[k] for k in ("frames", "merged", "lost")}}}
+                    "raw_points": s.cloud.raw_points,
+                    **{k: s.stats[k] for k in ("frames", "merged", "lost", "relocked", "tracking")}}}
                 self.cached = (f"{key[0]}-{key[1]}", payload, info)
                 self.built_key, self.built_at = key, time.time()
             return self.cached
@@ -63,27 +69,47 @@ def run(commands, replies, port=view3d.PORT):
         replies.put(("log", f"3D view not available: port {port}: {e.strerror}"))
         server = None
     replies.put(("ready", f"http://localhost:{port}/" if server else None))
-    out_dir = None
+    out_dir, keep_raw, recorder = None, False, None
+    parent = multiprocessing.parent_process()
     while True:
-        cmd = commands.get()
+        try:
+            cmd = commands.get(timeout=1.0)
+        except queue.Empty:
+            if parent is not None and not parent.is_alive():  # viewer killed: don't linger holding the port
+                if source.scanner is not None and out_dir is not None and not (out_dir / "cloud.ply").exists():
+                    source.scanner.save(out_dir)  # keep what was scanned
+                if recorder is not None:
+                    recorder.close()
+                cmd = ("quit",)
+            else:
+                continue
         kind = cmd[0]
         if kind == "start":
-            _, preset, out_dir = cmd
+            _, preset, out_dir, keep_raw = cmd
+            recorder = None
             with source.lock:
                 source.scanner = cl.Scanner(preset, log=lambda m: replies.put(("log", m)))
                 source.scan_id += 1
                 source.name = f"live: {out_dir.name}"
         elif kind == "frame" and source.scanner is not None:
-            _, yuyv, y10, bytesperline = cmd
-            frame = {"color": yuyv_to_rgb(yuyv, fr.W, fr.H), "depth": decode_y10(y10, fr.W, fr.H, bytesperline)}
+            _, yuyv, grey, y10, bytesperline = cmd
+            if keep_raw:
+                if recorder is None:
+                    recorder = fr.Recorder(bytesperline, root=out_dir, extra={"note": "frames a live scan processed"})
+                now = time.time()
+                recorder.write({"color": yuyv, "ir": grey, "depth": y10}, {"color": now, "ir": now, "depth": now})
+            frame = {"yuyv": yuyv, "depth": decode_y10(y10, fr.W, fr.H, bytesperline)}  # colour decoded per point
             with source.lock:
                 s = source.scanner
                 s.feed(frame)
                 points = int((s.cloud.seen >= cl.MIN_SEEN).sum())
-            replies.put(("frame_done", s.stats["merged"], s.stats["frames"], points))
+            replies.put(("frame_done", s.stats["merged"], s.stats["frames"], points, s.stats["tracking"]))
         elif kind == "frame":
             replies.put(("frame_done", 0, 0, 0))
         elif kind == "stop" and source.scanner is not None:
+            if recorder is not None:
+                recorder.close()
+                recorder = None
             with source.lock:
                 path, kept = source.scanner.save(out_dir)
                 source.name = out_dir.name

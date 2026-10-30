@@ -44,12 +44,17 @@
   select { background: var(--bg); color: var(--text); border: 1px solid var(--line); border-radius: 6px;
     padding: 5px; font: inherit; }
   .hint { margin-top: 12px; color: var(--muted); font-size: 12px; }
+  .bad { color: #ff6b6b; font-weight: 600; }
+  #empty { position: fixed; inset: 0; display: none; place-items: center; text-align: center;
+    color: var(--muted); pointer-events: none; z-index: 1; padding: 0 24px; }
+  #empty.show { display: grid; }
   @media (max-width: 600px) { aside { left: 12px; right: 12px; width: auto; top: auto; bottom: 12px; } }
 </style>
 <script type="importmap">{ "imports": { "three": "./three.module.min.js" } }</script>
 </head>
 <body>
 <canvas id="view"></canvas>
+<div id="empty"><div>No points yet.<br>Keep the object at the green distance in the viewer and move slowly.</div></div>
 <header>
   <div class="brand">tri<span>BUUT</span>SCAN</div>
   <div class="menu"><button>Scan</button><ul>
@@ -75,6 +80,7 @@
     <dt>Point distance</dt><dd id="pd">–</dd>
     <dt>Raw points</dt><dd id="raw">–</dd>
     <dt>Frames merged</dt><dd id="frames">–</dd>
+    <dt>Tracking</dt><dd id="tracking">–</dd>
   </dl>
   <label for="size">Point size</label>
   <input id="size" type="range" min="0.3" max="4" step="0.1" value="1.5">
@@ -158,7 +164,7 @@ async function load() {
   if (points) { scene.remove(points); points.geometry.dispose(); }
   points = new THREE.Points(geometry, material);
   scene.add(points);
-  if (!framed) { frame(); framed = true; }
+  if (!framed && n > 0) { frame(); framed = true; }
 }
 
 async function poll() {
@@ -175,6 +181,10 @@ async function poll() {
       $("pd").textContent = s.point_distance_mm ? `${s.point_distance_mm} mm (${s.preset})` : "–";
       $("raw").textContent = s.raw_points ? s.raw_points.toLocaleString() : "–";
       $("frames").textContent = s.merged != null ? `${s.merged} of ${s.frames}` : "–";
+      $("tracking").innerHTML = s.tracking == null ? "–" : s.tracking
+        ? `ok${s.relocked ? ` (re-found ${s.relocked}×)` : ""}`
+        : '<span class="bad">lost: move back slowly</span>';
+      $("empty").classList.toggle("show", info.points === 0);
     }
     $("status").innerHTML = "<b>●</b> connected";
   } catch (e) {

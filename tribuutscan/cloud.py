@@ -23,11 +23,12 @@ import numpy as np
 from . import frames as fr
 from . import markers
 from . import pointcloud as pc
+from .image import yuyv_pixels, yuyv_to_rgb
 
 PRESETS_MM = {"small": 0.5, "medium": 1.0, "large": 2.0}  # point distance; depth noise ~1 mm (estimate)
 PIXEL_MM = 0.25  # a depth pixel spans ~0.23 mm at 25 cm (estimate); frames are thinned to ~1 point per cube
 MIN_SEEN = 3  # frames a cube must be seen in to be kept
-NORMAL_RADIUS_MM = 2.0  # neighbourhood for normals
+NORMAL_BLOCK_MM = 2.0  # normals are fitted over 3x3x3 blocks of this size (6 mm)
 
 PLANE_TOL_MM = 3.0  # points this close to the support plane are removed
 PLANE_MIN_SHARE = 0.1  # a plane must hold this share of the points to count as the support
@@ -39,6 +40,7 @@ CLUSTER_CELL_MM = 6.0  # cell size for finding the connected piece at the centre
 
 KEY_MOVE_MM, KEY_TURN_DEG = 3.0, 2.0  # merge a frame only after this much motion since the last one
 MAX_STEP_MM, MAX_STEP_DEG = 30.0, 15.0  # larger jumps between tracked frames are tracking failures
+RELOCK_FITNESS = 0.6  # after a loss, a frame must match this share of its points to the cloud so far
 BIAS = 1 << 20  # voxel coordinates are packed into one int64 key, 21 bits each
 FLIP = np.diag([1.0, -1.0, -1.0])  # camera (y down, z forward) -> y up, z toward scanner
 
@@ -84,14 +86,12 @@ class VoxelCloud:
         self.n[p] += n[old]
         self.seen[p] += 1
         new = ~old
-        self.keys = np.concatenate([self.keys, keys[new]])
-        self.xyz = np.concatenate([self.xyz, xyz_s[new]])
-        self.rgb = np.concatenate([self.rgb, rgb_s[new]])
-        self.n = np.concatenate([self.n, n[new]])
-        self.seen = np.concatenate([self.seen, np.ones(new.sum(), np.int32)])
-        order = np.argsort(self.keys, kind="stable")
-        self.keys, self.xyz, self.rgb = self.keys[order], self.xyz[order], self.rgb[order]
-        self.n, self.seen = self.n[order], self.seen[order]
+        at = pos[new]  # insertion points keep the keys sorted (no re-sort of the whole cloud)
+        self.keys = np.insert(self.keys, at, keys[new])
+        self.xyz = np.insert(self.xyz, at, xyz_s[new], axis=0)
+        self.rgb = np.insert(self.rgb, at, rgb_s[new], axis=0)
+        self.n = np.insert(self.n, at, n[new])
+        self.seen = np.insert(self.seen, at, np.ones(new.sum(), np.int32))
         self.frames += 1
         self.raw_points += len(xyz)
 
@@ -101,33 +101,36 @@ class VoxelCloud:
         n = self.n[keep, None]
         return (self.xyz[keep] / n, np.clip(self.rgb[keep] / n, 0, 255).astype(np.uint8), self.seen[keep])
 
-    def normals(self, xyz, radius_mm=NORMAL_RADIUS_MM):
-        """Unit normals of the kept points from their neighbours' spread (PCA), unoriented."""
-        cells = np.floor(xyz / self.point_mm).astype(np.int64)
-        keys = pack(cells)
-        order = np.argsort(keys)
-        keys_sorted, xyz_sorted = keys[order], xyz[order]
-        r = max(1, int(round(radius_mm / self.point_mm)))
-        s1, s2, cnt = np.zeros((len(xyz), 3)), np.zeros((len(xyz), 3, 3)), np.zeros(len(xyz))
-        for dx in range(-r, r + 1):
-            for dy in range(-r, r + 1):
-                for dz in range(-r, r + 1):
-                    nk = pack(cells + (dx, dy, dz))
-                    pos = np.clip(np.searchsorted(keys_sorted, nk), 0, len(keys_sorted) - 1)
-                    hit = keys_sorted[pos] == nk
-                    q = xyz_sorted[pos[hit]] - xyz[hit]  # relative, for precision
-                    s1[hit] += q
-                    s2[hit] += q[:, :, None] * q[:, None, :]
-                    cnt[hit] += 1
-        mean = s1 / cnt[:, None]
-        cov = s2 / cnt[:, None, None] - mean[:, :, None] * mean[:, None, :]
-        return np.linalg.eigh(cov)[1][:, :, 0]  # eigenvector of the smallest eigenvalue
+    def normals(self, xyz, block_mm=NORMAL_BLOCK_MM):
+        """Unit normals (unoriented) for shading: PCA of the points in each 3x3x3 group of blocks.
+
+        Computed once per block of `block_mm` and shared by the points in it, so the cost depends on
+        the object's size, not on the point distance (per-point neighbourhoods took 30 s at 0.5 mm).
+        """
+        keys, inv = np.unique(pack(np.floor(xyz / block_mm)), return_inverse=True)
+        origin = xyz.mean(0)
+        q = xyz - origin  # relative, for precision
+        n = np.bincount(inv, minlength=len(keys)).astype(np.float64)
+        s1 = np.stack([np.bincount(inv, q[:, i], len(keys)) for i in range(3)], 1)
+        s2 = np.stack([np.bincount(inv, q[:, i] * q[:, j], len(keys)) for i in range(3) for j in range(3)], 1)
+        a1, a2, an = np.zeros_like(s1), np.zeros_like(s2), np.zeros_like(n)
+        for step in np.concatenate([[0], STEPS_26]):
+            pos = np.minimum(np.searchsorted(keys, keys + step), len(keys) - 1)
+            hit = keys[pos] == keys + step
+            a1[hit] += s1[pos[hit]]
+            a2[hit] += s2[pos[hit]]
+            an[hit] += n[pos[hit]]
+        mean = a1 / an[:, None]
+        cov = a2.reshape(-1, 3, 3) / an[:, None, None] - mean[:, :, None] * mean[:, None, :]
+        return np.linalg.eigh(cov)[1][:, :, 0][inv]  # eigenvector of the smallest eigenvalue
 
 
 def frame_points(frame, stride=1):
     """Camera-frame points (mm; x right, y down, z forward), colours, and pixel coords of one frame.
 
     `stride` takes every n-th pixel in both directions (more points than cubes is wasted work).
+    The frame holds either decoded "color" or the raw "yuyv" buffer (then only the needed
+    pixels are converted, which is much cheaper live).
     """
     d = frame["depth"]
     h, w = d.shape
@@ -136,7 +139,11 @@ def frame_points(frame, stride=1):
     z = pc.depth_to_mm(d[v, u])
     f = (w / 2) / np.tan(np.radians(pc.HFOV_DEG) / 2)
     xyz = np.stack([(u - w / 2) * z / f, (v - h / 2) * z / f, z], 1)
-    return xyz, pc.register_color(frame["color"])[v, u], np.stack([u, v], 1)
+    if "color" in frame:
+        rgb = pc.register_color(frame["color"])[v, u]
+    else:
+        rgb = yuyv_pixels(frame["yuyv"], w, *pc.color_source(u, v, w, h))
+    return xyz, rgb, np.stack([u, v], 1)
 
 
 def support_plane(xyz, rng, pix=None, shape=None, iterations=100, sample=2000, tries=3):
@@ -207,25 +214,27 @@ def _ransac_plane(pts, rng, iterations):
     return best, best_mask
 
 
+STEPS_26 = np.array([(dx << 42) + (dy << 21) + dz for dx in (-1, 0, 1) for dy in (-1, 0, 1) for dz in (-1, 0, 1)
+                     if (dx, dy, dz) != (0, 0, 0)], np.int64)  # neighbour offsets in packed-key space
+
+
 def centre_piece(xyz, pix, shape):
     """Mask of the points connected (through CLUSTER_CELL_MM cells) to the point nearest the image centre."""
-    cells = np.floor(xyz / CLUSTER_CELL_MM).astype(np.int64)
-    keys = pack(cells)
-    uniq, inv = np.unique(keys, return_inverse=True)
+    keys = pack(np.floor(xyz / CLUSTER_CELL_MM).astype(np.int64))
+    cells, inv = np.unique(keys, return_inverse=True)
     h, w = shape
-    seed = uniq[inv[np.argmin(np.hypot(pix[:, 0] - w / 2, pix[:, 1] - h / 2))]]
-    occupied = set(uniq.tolist())
-    steps = [(dx << 42) + (dy << 21) + dz for dx in (-1, 0, 1) for dy in (-1, 0, 1) for dz in (-1, 0, 1)
-             if (dx, dy, dz) != (0, 0, 0)]
-    piece, todo = {seed}, [seed]
-    while todo:
-        k = todo.pop()
-        for s in steps:
-            nk = k + s
-            if nk in occupied and nk not in piece:
-                piece.add(nk)
-                todo.append(nk)
-    return np.isin(keys, np.fromiter(piece, np.int64))
+    start = inv[np.argmin(np.hypot(pix[:, 0] - w / 2, pix[:, 1] - h / 2))]
+    piece = np.zeros(len(cells), bool)
+    piece[start] = True
+    frontier = cells[[start]]
+    while frontier.size:  # grow one ring of neighbouring cells at a time (vectorised flood fill)
+        cand = (frontier[:, None] + STEPS_26).ravel()
+        pos = np.minimum(np.searchsorted(cells, cand), len(cells) - 1)
+        found = np.unique(pos[cells[pos] == cand])
+        found = found[~piece[found]]
+        piece[found] = True
+        frontier = cells[found]
+    return piece[inv]
 
 
 def isolate(xyz, rgb, pix, shape, rng):
@@ -272,7 +281,9 @@ class Scanner:
         self.stride = max(1, int(PRESETS_MM[preset] / PIXEL_MM))
         self.pose, self.motion, self.prev, self.last_merged = np.eye(4), np.eye(4), None, None
         self.poses = []
-        self.stats = {"frames": 0, "merged": 0, "lost": 0, "plane_frames": 0, "markers": []}
+        self.model, self.model_merged = None, -1  # cloud-so-far, prepared for relocking
+        self.stats = {"frames": 0, "merged": 0, "lost": 0, "relocked": 0, "plane_frames": 0, "markers": [],
+                      "tracking": True}
 
     def feed(self, frame, index=None):
         """Process one frame set ({'color', 'depth'}); returns True if it was merged into the cloud."""
@@ -284,17 +295,23 @@ class Scanner:
         stats["plane_frames"] += had_plane
         if len(xyz) < 500 // self.stride ** 2:
             stats["lost"] += 1
+            stats["tracking"] = False
             return False
         if fuse is not None:
             levels = fuse.levels(xyz / 1000)
             if self.prev is not None:
                 result = fuse.icp(levels, self.prev, self.motion)
-                if result.fitness < fuse.MIN_FITNESS or not plausible_step(result.transformation, xyz):
+                if result.fitness >= fuse.MIN_FITNESS and plausible_step(result.transformation, xyz):
+                    self.motion = result.transformation
+                    self.pose = self.pose @ self.motion
+                elif self.relock(levels):
+                    stats["relocked"] += 1
+                else:
                     stats["lost"] += 1
+                    stats["tracking"] = False
                     return False
-                self.motion = result.transformation
-                self.pose = self.pose @ self.motion
             self.prev = levels
+            stats["tracking"] = True
         if self.last_merged is not None:
             move, turn = turned(np.linalg.inv(self.last_merged) @ self.pose)
             if fuse is not None and move < KEY_MOVE_MM and turn < KEY_TURN_DEG:
@@ -305,8 +322,24 @@ class Scanner:
         self.poses.append((index, self.pose.copy()))
         stats["merged"] += 1
         if not stats["markers"]:
-            stats["markers"] = [[round(x, 1), round(y, 1)] for x, y, *_ in markers.detect(
-                markers.luma(frame["color"]), rgb=frame["color"])]
+            color = frame["color"] if "color" in frame else yuyv_to_rgb(frame["yuyv"], *frame["depth"].shape[::-1])
+            stats["markers"] = [[round(x, 1), round(y, 1)] for x, y, *_ in markers.detect(markers.luma(color), rgb=color)]
+        return True
+
+    def relock(self, levels):
+        """Tracking failed: try to place the frame against the cloud so far, from the last known pose.
+
+        Works when the scanner comes back near where tracking was lost (like the app's "move back").
+        """
+        if not len(self.cloud):
+            return False
+        if self.model_merged != self.stats["merged"]:
+            xyz, _, _ = self.cloud.points(min_seen=1)
+            self.model, self.model_merged = self.fuse.levels(xyz / 1000), self.stats["merged"]
+        result = self.fuse.icp(levels, self.model, self.pose)
+        if result.fitness < RELOCK_FITNESS:
+            return False
+        self.pose, self.motion = result.transformation, np.eye(4)
         return True
 
     def save(self, directory, min_seen=MIN_SEEN):
@@ -327,6 +360,9 @@ def save(directory, cloud, poses, stats, preset, min_seen=MIN_SEEN):
     """Write cloud.ply, poses.txt and session.json; returns (path, number of points)."""
     directory.mkdir(parents=True, exist_ok=True)
     xyz, rgb, seen = cloud.points(min_seen)
+    if not len(xyz) and len(cloud):  # too short a scan for min_seen: keep what there is, and say so
+        min_seen = 1
+        xyz, rgb, seen = cloud.points(min_seen)
     normals = cloud.normals(xyz) if len(xyz) else np.empty((0, 3))
     if poses:  # face the normals toward the cameras that saw the points
         centres = np.array([p[:3, 3] for _, p in poses]) * 1000

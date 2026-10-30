@@ -16,6 +16,17 @@ def yuyv_to_rgb(buf, w, h):
     return np.clip(rgb, 0, 255).astype(np.uint8)
 
 
+def yuyv_pixels(buf, w, xs, ys):
+    """RGB (uint8) of selected pixels of a YUYV frame, without converting the whole image."""
+    y = np.frombuffer(buf, np.uint8)
+    pair = (ys * w + (xs & ~1)) * 2  # each 2-pixel group is Y0 U Y1 V
+    luma = y[pair + (xs & 1) * 2].astype(np.float32)
+    u = y[pair + 1].astype(np.float32) - 128
+    v = y[pair + 3].astype(np.float32) - 128
+    rgb = np.stack([luma + 1.402 * v, luma - 0.344 * u - 0.714 * v, luma + 1.772 * u], -1)
+    return np.clip(rgb, 0, 255).astype(np.uint8)
+
+
 def ramp(x):
     """Cheap blue->red colour ramp for x in [0, 1] -> uint8 RGB."""
     r = np.clip(1.5 - np.abs(4 * x - 3), 0, 1)

@@ -348,7 +348,7 @@ def main():
     root.bind("m", mesh)
 
     live = {"proc": None, "commands": None, "replies": None, "url": None, "open": False,
-            "scanning": False, "busy": False, "sent": 0.0}
+            "scanning": False, "inflight": 0, "sent": 0.0}
 
     def start_worker():
         ctx = multiprocessing.get_context("spawn")
@@ -368,8 +368,8 @@ def main():
         if live["proc"] is None:
             start_worker()
         out = fr.CAPTURES / (time.strftime("%Y%m%d-%H%M%S") + "-scan")
-        live.update(scanning=True, busy=False)
-        live["commands"].put(("start", preset.get(), out))
+        live.update(scanning=True, inflight=0)
+        live["commands"].put(("start", preset.get(), out, keep_raw.get()))
         scan_button.configure(text="Stop scan (c)")
         log(f"scan started: {out.name} ({preset.get()}, point distance {cloud.PRESETS_MM[preset.get()]} mm)")
 
@@ -384,9 +384,11 @@ def main():
 
     def check_scan():
         """Hand the worker a new frame when it is free; handle its replies."""
-        if live["scanning"] and not live["busy"] and color.raw and depth.raw and depth.stamp != live["sent"]:
-            live["sent"], live["busy"] = depth.stamp, True
-            live["commands"].put(("frame", color.raw, depth.raw, depth.cap.bytesperline))
+        if live["scanning"] and live["inflight"] < 2 and color.raw and ir.raw and depth.raw \
+                and depth.stamp != live["sent"]:  # one frame in work, one waiting: the worker never idles
+            live["sent"] = depth.stamp
+            live["inflight"] += 1
+            live["commands"].put(("frame", color.raw, ir.raw, depth.raw, depth.cap.bytesperline))
         while live["replies"] is not None:
             try:
                 kind, *rest = live["replies"].get_nowait()
@@ -399,10 +401,11 @@ def main():
             elif kind == "log":
                 log(rest[0])
             elif kind == "frame_done":
-                live["busy"] = False
+                live["inflight"] = max(0, live["inflight"] - 1)
                 if live["scanning"]:
-                    merged, frames, points = rest
-                    message["text"] = f"SCAN {merged} of {frames} frames merged, {points:,} points"
+                    merged, frames, points, tracking = rest
+                    message["text"] = f"SCAN {merged} of {frames} frames merged, {points:,} points" + (
+                        "" if tracking else "   TRACKING LOST: move back slowly to where it was")
             elif kind == "saved":
                 path, points = rest
                 log(f"scan saved: {points:,} points -> {Path(path).parent.name}/cloud.ply")
@@ -415,6 +418,8 @@ def main():
     scan_button = tk.Button(scan_box, text="Start scan (c)", command=toggle_scan)
     scan_button.pack(side="left")
     tk.Button(scan_box, text="Open 3D view", command=open_view).pack(side="left")
+    keep_raw = tk.BooleanVar(value=True)  # debugging: replay a live scan offline with cloud.py
+    tk.Checkbutton(scan_box, text="keep raw frames", variable=keep_raw).pack(side="left")
     root.bind("c", toggle_scan)
 
     show = tk.BooleanVar(value=True)
