@@ -60,7 +60,8 @@ tribuutscan-viewer                          # launcher in ~/.local/bin, copy of 
 python3 -m tribuutscan.viewer               # live colour + IR + depth; `s` saves captures/<stamp>/
                                             # `r` records raw sets to captures/<stamp>-rec/ (~43 MB/s),
                                             # Auto IR button, distance guide (estimate),
-                                            # `m` meshes the latest recording via .venv fuse.py
+                                            # `m` meshes the latest recording via .venv fuse.py;
+                                            # events print to the console and captures/viewer.log
 python3 -m tribuutscan.pointcloud [dir]     # .ply from a saved set, or grab a live one
 python3 -m tribuutscan.measure <cm>         # depth stats for a flat target at a known distance
 .venv/bin/python -m tribuutscan.fuse captures/<stamp>-rec   # ROUGH mesh.ply from a recording (Open3D)

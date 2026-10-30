@@ -7,7 +7,9 @@ depth node: they change the IR sensor that depth is computed from. Auto IR steps
 image has little clipping (clipping costs depth; see CLAUDE.md).
 The distance line reads the centre of the depth image; distances and the window are estimates.
 Press `m` or click Mesh to fuse the latest recording into mesh.ply (runs fuse.py in the Open3D .venv).
+Events are printed to the console and appended to captures/viewer.log.
 """
+import os
 import subprocess
 import threading
 import time
@@ -41,6 +43,9 @@ GOOD, EDGE, BAD = "#2e7d32", "#ef6c00", "#c62828"
 
 REPO = Path(__file__).resolve().parent.parent
 VENV_PYTHON = REPO / ".venv" / "bin" / "python"  # has Open3D; see fuse.py
+
+
+LOG = fr.CAPTURES / "viewer.log"
 
 
 def latest_recording():
@@ -140,7 +145,21 @@ def main():
     guide.grid(row=2, column=0, columnspan=3, sticky="we", padx=6)
     status = tk.Label(root, anchor="w")
     status.grid(row=3, column=0, columnspan=2, sticky="we")
+    note = tk.Label(root, anchor="center", font=("TkDefaultFont", 12))  # messages: save, record, mesh
+    note.grid(row=4, column=0, columnspan=3, sticky="we", padx=6)
     message = {"text": ""}
+
+    def log(text):
+        """Show a message in the window, print it, and append it to captures/viewer.log."""
+        message["text"] = text
+        line = f"[{time.strftime('%H:%M:%S')}] {text}"
+        print(line, flush=True)
+        try:
+            LOG.parent.mkdir(exist_ok=True)
+            with LOG.open("a") as f:
+                f.write(time.strftime("%Y-%m-%d ") + line + "\n")
+        except OSError:
+            pass
 
     columns = [tk.Frame(root) for _ in streams]
     for col, frame in enumerate(columns):
@@ -155,7 +174,7 @@ def main():
             try:
                 v4l2.set_control(dev, cid, int(float(value)))
             except OSError as e:
-                message["text"] = f"{label}: {e.strerror}"
+                log(f"{label}: {e.strerror}")
 
         scale = tk.Scale(columns[col], label=label, orient="horizontal", length=PANE_W - 40, from_=info["min"],
                          to=info["max"], resolution=info["step"] or 1, command=set_value)
@@ -183,7 +202,7 @@ def main():
         clipped, mean = ir.stats.get("clipped"), ir.stats.get("mean")
         auto["steps"] += 1
         if clipped is None or auto["steps"] > AUTO_MAX_STEPS:
-            message["text"] = "Auto IR: gave up"
+            log("Auto IR: gave up")
             return
         if clipped > CLIP_HI and g > gain[2]["min"]:
             gain[3].set(max(gain[2]["min"], g * 0.7))
@@ -194,7 +213,7 @@ def main():
         elif clipped < CLIP_LO and mean < MEAN_LO and g < GAIN_CAP:
             gain[3].set(min(GAIN_CAP, g * 1.3))
         else:
-            message["text"] = f"Auto IR: done (exposure {e}, gain {g})"
+            log(f"Auto IR: done (exposure {e}, gain {g})")
             return
         message["text"] = f"Auto IR: step {auto['steps']}"
         root.after(AUTO_STEP_MS, auto_step)
@@ -208,13 +227,13 @@ def main():
 
     def save(_event=None):
         if not (color.raw and ir.raw and depth.raw):
-            message["text"] = "nothing to save yet"
+            log("nothing to save yet")
             return
         frames = fr.decode(color.raw, ir.raw, depth.raw, depth.cap.bytesperline)
         out = fr.save(frames, extra={"controls": control_values()})
         xyz, rgb = pointcloud.to_points(frames["depth"], pointcloud.register_color(frames["color"]))
         pointcloud.write_ply(out / "cloud.ply", xyz, rgb)
-        message["text"] = f"saved {out.name} (with cloud.ply)"
+        log(f"saved {out.name} (with cloud.ply)")
 
     rec = {"recorder": None}
 
@@ -235,15 +254,16 @@ def main():
         if recorder:
             rec["recorder"] = None
             record_button.configure(text="Record (r)")
-            message["text"] = f"recorded {recorder.count} sets to {recorder.dir.name}"
+            log(f"recorded {recorder.count} sets to {recorder.dir.name}")
             return
         if not depth.raw:
-            message["text"] = "nothing to record yet"
+            log("nothing to record yet")
             return
         recorder = fr.Recorder(depth.cap.bytesperline, extra={"controls": control_values(), "fps": RECORD_FPS})
         rec["recorder"] = recorder
         rec["thread"] = threading.Thread(target=record_loop, args=(recorder,), daemon=True)
         rec["thread"].start()
+        log(f"recording started: {recorder.dir.name}")
         record_button.configure(text="Stop recording (r)")
 
     job = {"process": None, "dir": None}
@@ -251,23 +271,24 @@ def main():
     def mesh(_event=None):
         """Fuse the latest recording in a separate process so the live view keeps running."""
         if job["process"]:
-            message["text"] = f"still meshing {job['dir'].name}"
+            log(f"still meshing {job['dir'].name}")
             return
         if rec["recorder"]:
-            message["text"] = "stop recording first"
+            log("stop recording first")
             return
         directory = latest_recording()
         if directory is None:
-            message["text"] = "no recording yet: press r to record"
+            log("no recording yet: press r to record")
             return
         if not VENV_PYTHON.exists():
-            message["text"] = "meshing needs Open3D in .venv (see fuse.py)"
+            log("meshing needs Open3D in .venv (see fuse.py)")
             return
         job["process"] = subprocess.Popen(
             [str(VENV_PYTHON), "-m", "tribuutscan.fuse", str(directory)], cwd=REPO,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         job["dir"] = directory
-        message["text"] = f"meshing {directory.name} ..."
+        mesh_button.configure(text="Meshing...", state="disabled")
+        log(f"meshing {directory.name} (takes about a minute) ...")
 
     def check_mesh():
         process = job["process"]
@@ -276,10 +297,11 @@ def main():
         lines = [ln for ln in process.stdout.read().splitlines() if ln.startswith(("mesh:", "Traceback"))]
         if process.returncode == 0:
             summary = lines[-1].split(" -> ")[0] if lines else "done"
-            message["text"] = f"meshed {job['dir'].name} ({summary}) -> mesh.ply"
+            log(f"meshed {job['dir'].name} ({summary}) -> mesh.ply")
         else:
-            message["text"] = f"meshing {job['dir'].name} failed (exit {process.returncode})"
+            log(f"meshing {job['dir'].name} failed (exit {process.returncode})")
         job["process"] = None
+        mesh_button.configure(text="Mesh last recording (m)", state="normal")
 
     # Actions: buttons for now, a menu later.
     actions = tk.Frame(root)
@@ -287,7 +309,8 @@ def main():
     tk.Button(actions, text="Save frame (s)", command=save).pack(side="left")
     record_button = tk.Button(actions, text="Record (r)", command=toggle_record)
     record_button.pack(side="left")
-    tk.Button(actions, text="Mesh last recording (m)", command=mesh).pack(side="left")
+    mesh_button = tk.Button(actions, text="Mesh last recording (m)", command=mesh)
+    mesh_button.pack(side="left")
     root.bind("s", save)
     root.bind("r", toggle_record)
     root.bind("m", mesh)
@@ -309,10 +332,12 @@ def main():
         recorder = rec["recorder"]
         if recorder:
             message["text"] = f"REC {recorder.count} sets, {recorder.megabytes:.0f} MB"
-        status.configure(text=f"{fps}   {message['text']}")
+        status.configure(text=fps)
+        note.configure(text=message["text"])
         root.after(33, tick)
 
     def close():
+        log("viewer closed")
         if rec["recorder"]:
             rec["recorder"] = None
             rec["thread"].join(timeout=2)  # let the last set and the files close cleanly
@@ -321,6 +346,7 @@ def main():
         root.destroy()
 
     root.protocol("WM_DELETE_WINDOW", close)
+    log(f"viewer started (pid {os.getpid()})")
     tick()
     root.mainloop()
 
