@@ -145,6 +145,16 @@ P1 (tracker "current" in evaluate.py; "baseline" keeps the first version):
 - camera constants live in `calib.py` (`CAMERA`, estimates until captures/calibration.json exists)
 - `v4l2.Capture` exposes the kernel capture time (`last_time`, monotonic) and sequence number; the
   viewer pairs streams by nearest capture time. This is not yet checked on the scanner.
+P2 (`scene.py`, scan modes still/turntable/free):
+- In "still", the table plane is found once (3 of the first 5 frames), kept in world coordinates,
+  and re-fitted to each frame near its kept place. The object is what lies above it, inside a
+  slowly growing region.
+- Tilt: plane applied in 153 of 155 tracked frames (was on/off in 88 of 168); doubled 39% -> 23%.
+- Measured and dropped: tracking on the whole scene or on the kept object region. A large flat
+  table lets point-to-plane ICP slide (synthetic error 4 -> 50 mm), and a plane placed by a
+  predicted pose leaks table points when the prediction is a few mm off. Tracking stays on each
+  frame's own piece; only merging uses the kept plane.
+- Flat objects still slide under shape-only tracking (synthetic error 3-6 mm): P3/P4.
 Markers: the retroreflective dot usually has depth on this scanner (about 90% of its pixels), and a
 plane fitted to the ring around the dot is flat to about 0.3 mm.
 

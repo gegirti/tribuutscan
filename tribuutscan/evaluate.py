@@ -26,15 +26,16 @@ from . import synth
 from .image import write_png
 
 EVAL = fr.CAPTURES / "eval"
-DATASETS = {  # name: (path or glob under captures/, notes)
-    "tilt": ("20261030-122746-scan/*-rec", "black part with markers, scanner tilted: the doubling case"),
-    "standing": ("20261030-123412-scan/*-rec", "black part, scanner held still"),
-    "kettle": ("20261030-094413-rec", "kettle, moved by hand"),
-    "hand": ("20261030-102704-rec", "a hand: deforms, robustness only"),
-    "face": ("20261030-101700-rec", "PRIVATE face scan: deforms, metrics only, never rendered"),
-    "synth": ("synth/box-tilt-rec", "synthetic box with markers, tilting path, ground truth"),
-    "synth7": ("synth/box-tilt-7fps-rec", "the same at ~7 fps (every 3rd frame), like a slow live worker"),
-    "synthhard": ("synth/box-hard-rec", "synthetic at 10 fps with a jerk and a stretch beyond the depth window"),
+DATASETS = {  # name: (path or glob under captures/, notes, scan mode)
+    "tilt": ("20261030-122746-scan/*-rec", "black part with markers, scanner tilted: the doubling case", "still"),
+    "standing": ("20261030-123412-scan/*-rec", "black part, scanner held still", "still"),
+    "kettle": ("20261030-094413-rec", "kettle, moved by hand", "turntable"),
+    "hand": ("20261030-102704-rec", "a hand: deforms, robustness only", "free"),
+    "face": ("20261030-101700-rec", "PRIVATE face scan: deforms, metrics only, never rendered", "free"),
+    "synth": ("synth/box-tilt-rec", "synthetic box with markers, tilting path, ground truth", "still"),
+    "synth7": ("synth/box-tilt-7fps-rec", "the same at ~7 fps (every 3rd frame), like a slow live worker", "still"),
+    "synthhard": ("synth/box-hard-rec", "synthetic at 10 fps with a jerk and a stretch beyond the depth window",
+                  "still"),
 }
 SYNTH = {"synth": dict(every=1), "synth7": dict(every=3), "synthhard": dict(every=2, hard=True)}
 PRIVATE = {"face"}
@@ -61,21 +62,21 @@ def cached_markers(name, directory):
     return found
 
 
-def make_scanner(tracker, preset):
+def make_scanner(tracker, preset, mode):
     quiet = lambda m: None
-    if tracker == "baseline":  # the first version: no depth cleanup, ungated re-finds, fixed-step guess
-        return cl.Scanner(preset, log=quiet, clean_depth=False, gate_refind=False, motion_dt=False)
+    if tracker == "baseline":  # the first version: no cleanup, ungated re-finds, fixed-step guess, free mode
+        return cl.Scanner(preset, log=quiet, clean_depth=False, gate_refind=False, motion_dt=False, mode="free")
+    if tracker == "p1":  # P1: as current but every dataset in free mode
+        return cl.Scanner(preset, log=quiet, mode="free")
     if tracker == "current":
-        return cl.Scanner(preset, log=quiet)
-    if tracker == "cleanboth":  # P1 with tracking on cleaned depth too (worse on ground truth)
-        return cl.Scanner(preset, log=quiet, clean_depth=True)
+        return cl.Scanner(preset, log=quiet, mode=mode)
     raise ValueError(f"unknown tracker {tracker}")
 
 
 def run(name, tracker="baseline", preset="small"):
     directory = dataset_path(name)
     found = cached_markers(name, directory)
-    scanner = make_scanner(tracker, preset)
+    scanner = make_scanner(tracker, preset, DATASETS[name][2])
     sightings, elapsed, n = [], 0.0, 0
     for i, frame in enumerate(fr.read_recording(directory)):
         t0 = time.perf_counter()
@@ -87,12 +88,14 @@ def run(name, tracker="baseline", preset="small"):
             for loc in mk.locate(frame["depth"], found.get(i, [])):
                 if loc is not None:
                     sightings.append(loc[0] @ pose[:3, :3].T + pose[:3, 3] * 1000)
+    scanner.trim_table()
     xyz, rgb, seen, normals = scanner.cloud.points(cl.MIN_SEEN, with_normals=True)
     tracked = [(i, p) for i, s, p in scanner.track_log if p is not None]
     centre = xyz.mean(0) if len(xyz) else np.zeros(3)
     gap = metrics.loop_gap(tracked, centre)
     result = {
         "dataset": name, "notes": DATASETS[name][1], "tracker": tracker, "preset": preset,
+        "mode": scanner.scene.mode, "plane_frames": scanner.stats["plane_frames"],
         "frames": n, "tracked": len(tracked), "merged": scanner.stats["merged"],
         "lost": scanner.stats["lost"], "relocked": scanner.stats["relocked"],
         "ms_per_frame": round(1000 * elapsed / max(n, 1), 1),

@@ -44,6 +44,7 @@ KEY_MOVE_MM, KEY_TURN_DEG = 3.0, 2.0  # merge a frame only after this much motio
 MAX_STEP_MM, MAX_STEP_DEG = 30.0, 15.0  # larger jumps between tracked frames are tracking failures
 RELOCK_FITNESS = 0.6  # after a loss, a frame must match this share of its points to the cloud so far
 RELOCK_MAX_SCALE = 2.0  # a re-found pose may be at most this many normal steps from the last good one
+OBJECT_ABOVE_MM = 3.0  # (scene.py) the object starts this far above the table
 BIAS = 1 << 20  # voxel coordinates are packed into one int64 key, 21 bits each
 FLIP = np.diag([1.0, -1.0, -1.0])  # camera (y down, z forward) -> y up, z toward scanner
 
@@ -101,6 +102,11 @@ class VoxelCloud:
         self.seen = np.insert(self.seen, at, np.ones(new.sum(), np.int32))
         self.frames += 1
         self.raw_points += len(xyz)
+
+    def keep(self, mask):
+        """Keep only the cubes in `mask` (e.g. to cut out a table found late)."""
+        for name in ("keys", "xyz", "rgb", "n", "nrm", "seen"):
+            setattr(self, name, getattr(self, name)[mask])
 
     def points(self, min_seen=MIN_SEEN, with_normals=False):
         """(xyz mm, rgb uint8, seen[, oriented unit normals]) of the cubes seen in >= `min_seen` frames.
@@ -256,13 +262,19 @@ STEPS_26 = np.array([(dx << 42) + (dy << 21) + dz for dx in (-1, 0, 1) for dy in
 
 def centre_piece(xyz, pix, shape):
     """Mask of the points connected (through CLUSTER_CELL_MM cells) to the point nearest the image centre."""
+    h, w = shape
+    seeds = np.zeros(len(xyz), bool)
+    seeds[np.argmin(np.hypot(pix[:, 0] - w / 2, pix[:, 1] - h / 2))] = True
+    return connected_piece(xyz, seeds)
+
+
+def connected_piece(xyz, seeds):
+    """Mask of the points connected (through CLUSTER_CELL_MM cells) to any seed point (bool mask)."""
     keys = pack(np.floor(xyz / CLUSTER_CELL_MM).astype(np.int64))
     cells, inv = np.unique(keys, return_inverse=True)
-    h, w = shape
-    start = inv[np.argmin(np.hypot(pix[:, 0] - w / 2, pix[:, 1] - h / 2))]
     piece = np.zeros(len(cells), bool)
-    piece[start] = True
-    frontier = cells[[start]]
+    piece[inv[seeds]] = True
+    frontier = cells[piece]
     while frontier.size:  # grow one ring of neighbouring cells at a time (vectorised flood fill)
         cand = (frontier[:, None] + STEPS_26).ravel()
         pos = np.minimum(np.searchsorted(cells, cand), len(cells) - 1)
@@ -318,6 +330,13 @@ def scale_motion(t, s):
     return out
 
 
+def scene_transform(pose):
+    """Camera -> world transform with the translation in mm (scene.py works in mm)."""
+    out = pose.copy()
+    out[:3, 3] = pose[:3, 3] * 1000
+    return out
+
+
 def turned(t):
     """(movement mm, rotation degrees) of a 4x4 rigid transform in metres."""
     return np.linalg.norm(t[:3, 3]) * 1000, np.degrees(np.arccos(np.clip((np.trace(t[:3, :3]) - 1) / 2, -1, 1)))
@@ -326,6 +345,13 @@ def turned(t):
 class Scanner:
     """Feeds frames one at a time: isolate the object, track it (ICP, if Open3D is present), merge.
 
+    `mode` (scene.MODES): "still" tracks on each frame's piece at the image centre and merges only
+    the object above the table plane, which is found once and kept (no flicker); "turntable" tracks
+    and merges the object above the kept plane; "free" uses the piece at the image centre for both.
+    Measured and dropped for "still": tracking on the whole scene or on the kept object region (a
+    large flat table lets ICP slide: synthetic error 4 -> 50 mm), and on the object plus a ring of
+    table.
+
     Options (all on by default; off reproduces the first version, for evaluate.py's baseline):
     clean_depth (prep.clean: "merge" cleans only what is merged and tracks on the uncleaned depth,
     whose edges and steep faces hold flat objects in place; True cleans both), gate_refind
@@ -333,7 +359,8 @@ class Scanner:
     between frames).
     """
 
-    def __init__(self, preset="small", log=print, clean_depth="merge", gate_refind=True, motion_dt=True):
+    def __init__(self, preset="small", log=print, clean_depth="merge", gate_refind=True, motion_dt=True,
+                 mode="still"):
         try:
             from . import fuse  # Open3D: frame-to-frame ICP
         except ImportError:
@@ -349,6 +376,8 @@ class Scanner:
         self.stats = {"frames": 0, "merged": 0, "lost": 0, "relocked": 0, "plane_frames": 0, "markers": [],
                       "tracking": True}
         self.clean_depth, self.gate_refind, self.motion_dt = clean_depth, gate_refind, motion_dt
+        from .scene import Scene
+        self.scene = Scene(mode, self.rng)
         self.last_t, self.motion_s, self.lost_run = None, None, 0  # time of the last tracked frame, of `motion`
         self.track_log = []  # per frame: (index, status, pose or None); for evaluation
         self.on_merge = None  # optional callback(index, world_xyz_mm, rgb, world_normals, pose)
@@ -360,10 +389,15 @@ class Scanner:
         stats["frames"] += 1
         if self.clean_depth is True:  # track on cleaned depth as well
             frame = self.cleaned(frame)
-        xyz, rgb, pix, nrm = frame_points(frame, self.stride, normals=True)
-        keep, had_plane = isolate_mask(xyz, pix, frame["depth"].shape, self.rng)
-        xyz, rgb, nrm, pix = xyz[keep], rgb[keep], nrm[keep], pix[keep]
-        stats["plane_frames"] += had_plane
+        shape = frame["depth"].shape
+        all_xyz, all_rgb, all_pix, all_nrm = frame_points(frame, self.stride, normals=True)
+        scene = self.scene
+        if scene.mode == "turntable":
+            scene.observe(all_xyz, all_pix, shape, np.eye(4))
+            keep = scene.object_mask(all_xyz, all_pix, shape, np.eye(4))
+        else:
+            keep = isolate_mask(all_xyz, all_pix, shape, self.rng)[0]
+        xyz, rgb, nrm, pix = all_xyz[keep], all_rgb[keep], all_nrm[keep], all_pix[keep]
         if len(xyz) < 500 // self.stride ** 2:
             stats["lost"] += 1
             stats["tracking"] = False
@@ -383,7 +417,7 @@ class Scanner:
                     self.motion = result.transformation
                     self.motion_s = (t - self.last_t) if (t is not None and self.last_t is not None) else None
                     self.pose = self.pose @ self.motion
-                elif self.relock(levels, xyz):
+                elif self.relock(*self.relock_source(levels, xyz, all_xyz, all_pix, shape)):
                     stats["relocked"] += 1
                     status = "relocked"
                 else:
@@ -396,6 +430,12 @@ class Scanner:
             self.prev = levels
             stats["tracking"] = True
         self.track_log.append((index, status, self.pose.copy()))
+        if scene.mode == "still":  # the object to merge: above the kept table plane, in its region
+            to_world = scene_transform(self.pose)
+            scene.observe(all_xyz, all_pix, shape, to_world)
+            obj = scene.object_mask(all_xyz, all_pix, shape, to_world)
+            xyz, rgb, nrm, pix = all_xyz[obj], all_rgb[obj], all_nrm[obj], all_pix[obj]
+        stats["plane_frames"] += scene.plane is not None
         if self.last_merged is not None:
             move, turn = turned(np.linalg.inv(self.last_merged) @ self.pose)
             if fuse is not None and move < KEY_MOVE_MM and turn < KEY_TURN_DEG:
@@ -419,6 +459,16 @@ class Scanner:
             color = frame["color"] if "color" in frame else yuyv_to_rgb(frame["yuyv"], *frame["depth"].shape[::-1])
             stats["markers"] = [[round(x, 1), round(y, 1)] for x, y, *_ in markers.detect(markers.luma(color), rgb=color)]
         return True
+
+    def relock_source(self, levels, xyz, all_xyz, all_pix, shape):
+        """Points to re-find with. The cloud holds only the object, so in "still" mode (tracking on
+        the whole scene) use the frame's object piece, not the scene."""
+        if self.scene.mode != "still":
+            return levels, xyz
+        obj = isolate_mask(all_xyz, all_pix, shape, self.rng)[0]
+        if obj.sum() < 50:
+            return levels, xyz
+        return self.fuse.levels(all_xyz[obj] / 1000), all_xyz[obj]
 
     def cleaned(self, frame):
         """The frame with prep.clean applied to the pixels tracking samples (every stride-th)."""
@@ -451,7 +501,20 @@ class Scanner:
         return True
 
     def save(self, directory, min_seen=MIN_SEEN):
+        self.trim_table()
         return save(directory, self.cloud, self.poses, self.stats, self.preset, min_seen)
+
+    def trim_table(self):
+        """Drop cubes merged before the table plane was settled: on/below it or outside the region."""
+        scene = self.scene
+        if scene.mode != "still" or scene.plane is None or scene.axis is None or not len(self.cloud):
+            return
+        c = self.cloud.xyz / self.cloud.n[:, None]
+        n = scene.plane[0]
+        h = scene.height(c)
+        flat = c - np.outer((c - scene.axis) @ n, n)
+        keep = (h > OBJECT_ABOVE_MM) & (np.linalg.norm(flat - scene.axis, axis=1) <= scene.radius)
+        self.cloud.keep(keep)
 
 
 def scan(directory, preset="small", log=print):

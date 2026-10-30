@@ -95,3 +95,24 @@ def test_refind_gate_rejects_a_jump():
     small = np.eye(4)
     small[0, 3] = 0.02
     assert cl.plausible_step(small, xyz)
+
+
+def test_scene_keeps_the_table_once_found():
+    from tribuutscan.scene import Scene
+    rng = np.random.default_rng(8)
+    # camera looks down +z at a table (z = 300 mm) with a box; then the camera moves so only a
+    # small strip of table stays in view: the kept plane must still remove it
+    table = np.c_[rng.uniform(-250, 250, (20000, 2)), np.full(20000, 300.0)]
+    box = np.c_[rng.uniform(-20, 20, (4000, 2)), np.full(4000, 260.0)]
+    side = np.c_[np.full(2000, 20.0), rng.uniform(-20, 20, 2000), rng.uniform(260, 297, 2000)]
+    xyz = np.concatenate([table, box, side])
+    f, w, h = 1000.0, 1280, 800
+    pix = np.c_[xyz[:, 0] * f / xyz[:, 2] + w / 2, xyz[:, 1] * f / xyz[:, 2] + h / 2]
+    scene = Scene("still", rng)
+    for _ in range(3):
+        scene.observe(xyz, pix, (h, w), np.eye(4))
+    assert scene.plane is not None
+    small = np.concatenate([table[np.abs(table[:, 0] - 40) < 10][:300], box, side])  # under 80 cm2 of table
+    spix = np.c_[small[:, 0] * f / small[:, 2] + w / 2, small[:, 1] * f / small[:, 2] + h / 2]
+    obj = scene.object_mask(small, spix, (h, w), np.eye(4))
+    assert not obj[:300].any() and obj[300:].mean() > 0.9  # the table strip is gone, the box stays
