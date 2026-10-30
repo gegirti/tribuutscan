@@ -4,7 +4,8 @@ The viewer starts it with the .venv Python when there is one (so ICP tracking wo
 to it over two queues. The worker also serves the browser 3D view of the growing cloud
 (view3d page), so cloud data never passes back through the viewer.
 
-Commands:  ("start", preset, out_dir, keep_raw) | ("frame", yuyv, grey, y10, bytesperline, (t_colour, t_ir, t_depth))
+Commands:  ("start", preset, out_dir, keep_raw, continue_from or None)
+           | ("frame", yuyv, grey, y10, bytesperline, (t_colour, t_ir, t_depth))
            | ("stop",) | ("quit",)   (times: camera capture times, seconds)
 Replies:   ("ready", url) | ("log", text) | ("frame_done", merged, frames, points, tracking, cue) | ("saved", path, points)
            cue: {"markers": used, "features": ORB start, "flat": shape alone slides}
@@ -14,6 +15,7 @@ viewer's recording format), so a scan can be replayed offline with cloud.py for 
 """
 import multiprocessing
 import queue
+from pathlib import Path
 import site
 import sys
 import threading
@@ -109,10 +111,15 @@ def run(commands, replies, port=view3d.PORT):
                 continue
         kind = cmd[0]
         if kind == "start":
-            _, preset, out_dir, keep_raw = cmd
+            _, preset, out_dir, keep_raw, continue_from = cmd
             recorder = None
+            log = lambda m: replies.put(("log", m))
             with source.lock:
-                source.scanner = cl.Scanner(preset, log=lambda m: replies.put(("log", m)))
+                if continue_from:  # go on with a saved scan: it re-finds its place, then merges into it
+                    source.scanner = cl.Scanner.continue_from(continue_from, log=log)
+                    log(f"continuing {Path(continue_from).name}: show the scanner a part it has seen")
+                else:
+                    source.scanner = cl.Scanner(preset, log=log)
                 source.scan_id += 1
                 source.name = f"live: {out_dir.name}"
                 source.phase, source.out_dir = "scanning", out_dir

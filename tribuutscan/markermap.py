@@ -16,6 +16,7 @@ PAIR_MM = 2.0  # distances between matched markers must agree to this
 SIDE_MM, SIDE_SHARE = 2.0, 0.01  # triangle sides agree to 2 mm + 1%
 INLIER_MM = 3.0  # a marker fits a pose if it lands this close to its map marker
 MIN_TRIANGLE_HEIGHT_MM = 15.0  # a 3-marker match needs a triangle at least this "fat"
+MAX_SEARCH = 10  # triangle search uses at most this many frame markers (the work grows with the cube)
 
 
 def kabsch(src, dst):
@@ -59,30 +60,39 @@ def consistent(frame_pts, map_pts, tol=PAIR_MM):
     return keep
 
 
+def triangles(pts):
+    """All marker triangles that are not near-collinear: (index triples (K, 3), sorted sides (K, 3), heights)."""
+    idx = np.array(list(itertools.combinations(range(len(pts)), 3)), int).reshape(-1, 3)
+    a, b, c = pts[idx[:, 0]], pts[idx[:, 1]], pts[idx[:, 2]]
+    sides = np.sort(np.stack([np.linalg.norm(a - b, axis=1), np.linalg.norm(b - c, axis=1),
+                              np.linalg.norm(c - a, axis=1)], 1), axis=1)
+    heights = np.linalg.norm(np.cross(b - a, c - a), axis=1) / np.maximum(sides[:, 2], 1e-9)
+    keep = heights > 5.0
+    return idx[keep], sides[keep], heights[keep]
+
+
 def search(frame_pts, map_pts):
     """Best transform (4x4, mm) placing frame_pts on map_pts by triangle matching, or None if there
-    are too few inliers or an equally good, different answer (a symmetric layout)."""
+    are too few inliers or an equally good, different answer (a symmetric layout). Map triangles are
+    compared all at once (numpy); the frame side is capped at MAX_SEARCH markers (best first)."""
     if len(frame_pts) < 3 or len(map_pts) < 3:
         return None
-    sides = lambda p: np.sort([np.linalg.norm(p[0] - p[1]), np.linalg.norm(p[1] - p[2]), np.linalg.norm(p[2] - p[0])])
-    map_tris = [(idx, sides(map_pts[list(idx)])) for idx in itertools.combinations(range(len(map_pts)), 3)
-                if triangle_height(*map_pts[list(idx)]) > 5.0]
+    frame_pts = frame_pts[:MAX_SEARCH]
+    map_idx, map_sides, _ = triangles(map_pts)
+    f_idx, f_sides, f_heights = triangles(frame_pts)
     best = []
-    for fidx in itertools.combinations(range(len(frame_pts)), 3):
-        f3 = frame_pts[list(fidx)]
-        if triangle_height(*f3) <= 5.0:
-            continue
-        fs = sides(f3)
-        for midx, ms in map_tris:
-            if np.all(np.abs(fs - ms) <= SIDE_MM + SIDE_SHARE * ms):
-                for perm in itertools.permutations(midx):  # which map marker is which frame marker
-                    t = kabsch(f3, map_pts[list(perm)])
-                    moved = f3 @ t[:3, :3].T + t[:3, 3]
-                    if np.linalg.norm(moved - map_pts[list(perm)], axis=1).max() > INLIER_MM:
-                        continue
-                    all_moved = frame_pts @ t[:3, :3].T + t[:3, 3]
-                    d = np.linalg.norm(all_moved[:, None] - map_pts[None], axis=2).min(1)
-                    best.append(((d < INLIER_MM).sum(), triangle_height(*f3), t))
+    for fi, fs, fh in zip(f_idx, f_sides, f_heights):
+        f3 = frame_pts[fi]
+        close = np.all(np.abs(map_sides - fs) <= SIDE_MM + SIDE_SHARE * map_sides, axis=1)
+        for midx in map_idx[close]:
+            for perm in itertools.permutations(midx):  # which map marker is which frame marker
+                t = kabsch(f3, map_pts[list(perm)])
+                moved = f3 @ t[:3, :3].T + t[:3, 3]
+                if np.linalg.norm(moved - map_pts[list(perm)], axis=1).max() > INLIER_MM:
+                    continue
+                all_moved = frame_pts @ t[:3, :3].T + t[:3, 3]
+                d = np.linalg.norm(all_moved[:, None] - map_pts[None], axis=2).min(1)
+                best.append(((d < INLIER_MM).sum(), fh, t))
     if not best:
         return None
     best.sort(key=lambda b: (-b[0], -b[1]))
@@ -124,7 +134,9 @@ class MarkerMap:
         on every map marker that fits (the camera position is sensitive to marker noise: a few mm
         of lever arm when the markers are nearly coplanar and 25 cm away).
         """
-        t = search(frame_pts, self.pos[self.count >= TRUSTED])
+        trusted = np.nonzero(self.count >= TRUSTED)[0]
+        best = trusted[np.argsort(-self.count[trusted])]  # most-seen markers first
+        t = search(frame_pts, self.pos[best])
         if t is None:
             return None
         moved = frame_pts @ t[:3, :3].T + t[:3, 3]

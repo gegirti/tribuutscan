@@ -373,7 +373,7 @@ def main():
         live["proc"] = ctx.Process(target=livescan.run, args=(live["commands"], live["replies"]), daemon=True)
         live["proc"].start()
 
-    def toggle_scan(_event=None):
+    def toggle_scan(_event=None, continue_from=None):
         if live["scanning"]:
             live["scanning"] = False
             live["commands"].put(("stop",))
@@ -384,9 +384,20 @@ def main():
             start_worker()
         out = fr.CAPTURES / (time.strftime("%Y%m%d-%H%M%S") + "-scan")
         live.update(scanning=True, inflight=0)
-        live["commands"].put(("start", preset.get(), out, keep_raw.get()))
+        live["commands"].put(("start", preset.get(), out, keep_raw.get(), continue_from))
         scan_button.configure(text="Stop scan (c)")
-        log(f"scan started: {out.name} ({preset.get()}, point distance {cloud.PRESETS_MM[preset.get()]} mm)")
+        log(f"scan started: {out.name} ({preset.get()}, point distance {cloud.PRESETS_MM[preset.get()]} mm)"
+            + (f", continuing {continue_from.name}" if continue_from else ""))
+
+    def continue_scan():
+        """Go on with the newest saved scan (saved by this version: it has merged.npz)."""
+        if live["scanning"]:
+            return
+        saved = sorted(d for d in fr.CAPTURES.glob("*-scan") if (d / "merged.npz").exists())
+        if not saved:
+            log("nothing to continue: no saved scan with its frames yet")
+            return
+        toggle_scan(continue_from=saved[-1])
 
     def open_view():
         if live["url"]:
@@ -440,6 +451,7 @@ def main():
     tk.OptionMenu(scan_box, preset, *cloud.PRESETS_MM).pack(side="left")
     scan_button = tk.Button(scan_box, text="Start scan (c)", command=toggle_scan)
     scan_button.pack(side="left")
+    tk.Button(scan_box, text="Continue last", command=continue_scan).pack(side="left")
     tk.Button(scan_box, text="Open 3D view", command=open_view).pack(side="left")
     keep_raw = tk.BooleanVar(value=True)  # debugging: replay a live scan offline with cloud.py
     tk.Checkbutton(scan_box, text="keep raw frames", variable=keep_raw).pack(side="left")

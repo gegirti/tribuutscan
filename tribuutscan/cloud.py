@@ -412,6 +412,7 @@ class Scanner:
         self.cue = {}  # what held the last frame: markers used, ORB start, flat (shape alone slides)
         self.keyframes = []  # merged frames: (index, pose, points mm (camera, 2 mm grid), ORB, markers mm)
         self.merged_data = {}  # index -> (camera points mm float32, rgb, camera normals float32): re-merging
+        self.refind_needed = False  # set by continue_from(): the next frames must find the saved world first
         import concurrent.futures
         import threading
         self.cloud_lock = threading.Lock()
@@ -472,7 +473,18 @@ class Scanner:
                     if self.cue["features"]:
                         guess = found
                         self.feature_starts += 1
-            if self.prev is not None:
+            if joint and self.refind_needed:  # continuing a saved scan: find this frame in its world first
+                from . import session
+                found = session.refind(self, xyz, marker_pts, levels)
+                if found is None:
+                    stats["lost"] += 1
+                    stats["tracking"] = False
+                    self.track_log.append((index, "lost", None))
+                    return False
+                self.pose, self.motion, self.motion_s = found, np.eye(4), None
+                self.refind_needed, status = False, "re-found"
+                self.log(f"continuing: found my place in the saved scan at frame {index}")
+            elif self.prev is not None:
                 if joint:
                     step, ok = self.joint_step(levels, xyz, marker_pts, guess, index)
                 else:
@@ -596,6 +608,14 @@ class Scanner:
         sc.remerge({})
         return sc
 
+    @classmethod
+    def continue_from(cls, directory, log=print):
+        """A Scanner that goes on with a saved scan: restored, and re-finding its place first."""
+        sc = cls.restore(directory, log=log)
+        sc.refind_needed = True
+        sc.prev, sc.prev_feat = None, None
+        return sc
+
     def flush(self):
         """Wait for merges still running in the background (before reading or saving the cloud)."""
         for job in self.pending:
@@ -711,7 +731,8 @@ class Scanner:
         if not len(self.cloud):
             return False
         if self.model_merged != self.stats["merged"]:
-            xyz, _, _ = self.cloud.points(min_seen=1)
+            with self.cloud_lock:  # a background merge may be replacing the cloud's arrays
+                xyz, _, _ = self.cloud.points(min_seen=1)
             self.model, self.model_merged = self.fuse.levels(xyz / 1000), self.stats["merged"]
         result = self.fuse.icp(levels, self.model, self.pose)
         if result.fitness < RELOCK_FITNESS:

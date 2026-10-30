@@ -106,6 +106,7 @@ python3 -m tribuutscan.markers captures/<stamp>   # find markers in a saved fram
                                             # merged point cloud -> captures/<stamp>-scan/
 python3 -m tribuutscan.view3d captures/<stamp>-scan    # browser 3D view at http://localhost:8765
 .venv/bin/python -m tribuutscan.optimise captures/<stamp>-scan   # loop closures + pose graph + merge again
+.venv/bin/python -m tribuutscan.session merge A-scan B-scan AB-scan   # merge two scans into one
 .venv/bin/python -m tribuutscan.evaluate [datasets] [--label x] [--against report.json]
                                             # tracking metrics on saved + synthetic recordings
 .venv/bin/python -m tribuutscan.synth [out] [frames] [every] [hard]   # synthetic box scan, ground truth
@@ -217,6 +218,16 @@ P6 (`optimise.py`, runs automatically after Stop; Process menu: Optimise again, 
   keyframes (every pair took 60 s for the same gain).
 - The mesh is Poisson from the oriented cloud (a TSDF mesh needs depth images, which are not kept).
 - Our real paths do not close a loop; a closed-loop recording is planned for the scanner session.
+P7 (`session.py`; viewer "Continue last"):
+- A continued scan re-finds its place in the saved one (global marker match, else FPFH + RANSAC
+  against the saved cloud, checked by `track.solve`), then tracks and merges into it. Stop's
+  Optimise ties old and new together.
+- Tilt scan split in two and continued: re-found on the first frame; 0.14 mm median from one
+  uninterrupted run.
+- Merging two separate scans: 0.09 mm median from the single run, 46 s.
+- Marker triangle search is vectorised over the map: the merge took 488 s with a Python loop over
+  every map triangle.
+- A race fixed: `relock()` read the cloud while a background merge replaced its arrays.
 Markers: the retroreflective dot usually has depth on this scanner (about 90% of its pixels), and a
 plane fitted to the ring around the dot is flat to about 0.3 mm.
 
