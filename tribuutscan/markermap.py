@@ -96,7 +96,8 @@ def search(frame_pts, map_pts):
 
 
 class MarkerMap:
-    def __init__(self):
+    def __init__(self, add_mm=INLIER_MM):
+        self.add_mm = add_mm  # a sighting this close to a map marker is that marker (else a new one)
         self.pos = np.empty((0, 3))  # world mm, running means
         self.count = np.empty(0, int)  # sightings; a false detection rarely gets a second one
 
@@ -145,7 +146,7 @@ class MarkerMap:
             if len(self):
                 d = np.linalg.norm(self.pos - w, axis=1)
                 k = int(np.argmin(d))
-                if d[k] < INLIER_MM:  # the pose is final here: a marker lands within a few mm
+                if d[k] < self.add_mm:  # the pose is final here: a marker lands within a few mm
                     self.count[k] += 1
                     self.pos[k] += (w - self.pos[k]) / self.count[k]
                     continue

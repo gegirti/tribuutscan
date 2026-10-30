@@ -40,11 +40,14 @@ PLANE_MIN_CM2 = 80  # ...and cover this much area. A slice through a curved part
                     # a mostly hidden table 100 cm2 (one test each; revisit with turntable scans)
 CLUSTER_CELL_MM = 6.0  # cell size for finding the connected piece at the centre
 
-KEY_MOVE_MM, KEY_TURN_DEG = 3.0, 2.0  # merge a frame only after this much motion since the last one
+KEY_MOVE_MM, KEY_TURN_DEG = 3.0, 2.0  # merge a frame after this much motion since the last one...
+KEY_EVERY = 10  # ...or every 10th tracked frame anyway (a still scanner keeps averaging the view)
 MAX_STEP_MM, MAX_STEP_DEG = 30.0, 15.0  # larger jumps between tracked frames are tracking failures
 RELOCK_FITNESS = 0.6  # after a loss, a frame must match this share of its points to the cloud so far
 RELOCK_MAX_SCALE = 2.0  # a re-found pose may be at most this many normal steps from the last good one
 OBJECT_ABOVE_MM = 3.0  # (scene.py) the object starts this far above the table
+JOINT_MIN_FITNESS, JOINT_MAX_RMSE_MM = 0.3, 2.0  # accepting a joint-solve pose (markers: see Scanner)
+MODEL_EVERY = 5  # target="model": rebuild the model's levels after this many merges
 BIAS = 1 << 20  # voxel coordinates are packed into one int64 key, 21 bits each
 FLIP = np.diag([1.0, -1.0, -1.0])  # camera (y down, z forward) -> y up, z toward scanner
 
@@ -360,7 +363,7 @@ class Scanner:
     """
 
     def __init__(self, preset="small", log=print, clean_depth="merge", gate_refind=True, motion_dt=True,
-                 mode="still", track_with="icp"):
+                 mode="still", track_with="joint", target="model"):
         try:
             from . import fuse  # Open3D: frame-to-frame ICP
         except ImportError:
@@ -379,7 +382,19 @@ class Scanner:
         from .scene import Scene
         self.scene = Scene(mode, self.rng)
         from .markermap import MarkerMap
-        self.track_with, self.marker_map = track_with, MarkerMap()  # "icp" or "markers" (markers only)
+        # "joint" (track.solve: shape + markers + motion prior, flat-face check; default), "jointnm"
+        # (joint without markers), "icp" (frame-to-frame point-to-plane, Open3D: P2), "markers" (only)
+        # Markers are weighted strictly (1 mm) and noisy ones are dropped inside the solve (3 sigma):
+        # measured better than loose weighting (3 mm) even with the estimated colour registration,
+        # where loose let marker noise pull poses off and the map drift (tilt doubling 16% vs 78%).
+        self.marker_sigma, self.marker_accept = 1.0, 2.0
+        self.track_with, self.marker_map = track_with, MarkerMap(add_mm=3.0)
+        # joint solve against the "model" (cloud so far; default) or the previous "frame". Measured:
+        # model + markers halved synthetic error (3.4 -> 1.7 mm, hard path 6.1 -> 1.5); the model
+        # WITHOUT markers drifts (synthetic 25 mm): markers keep the model honest.
+        self.target = target
+        self.model_levels, self.model_at = None, -1
+        self.track_info = []  # per tracked frame: (index, info from track.solve); for evaluation
         self.last_t, self.motion_s, self.lost_run = None, None, 0  # time of the last tracked frame, of `motion`
         self.track_log = []  # per frame: (index, status, pose or None); for evaluation
         self.on_merge = None  # optional callback(index, world_xyz_mm, rgb, world_normals, pose)
@@ -417,11 +432,22 @@ class Scanner:
             status = "first" if self.prev is None else "tracked"
             self.prev = True
         elif fuse is not None:
-            levels = fuse.levels(xyz / 1000)
+            joint = self.track_with in ("joint", "jointnm")
+            if joint:
+                from . import track
+                levels = track.levels(xyz / 1000)
+                marker_pts = self.frame_markers(frame) if self.track_with == "joint" else np.empty((0, 3))
+            else:
+                levels = fuse.levels(xyz / 1000)
             if self.prev is not None:
-                result = fuse.icp(levels, self.prev, guess)
-                if result.fitness >= fuse.MIN_FITNESS and plausible_step(result.transformation, xyz):
-                    self.motion = result.transformation
+                if joint:
+                    step, ok = self.joint_step(levels, xyz, marker_pts, guess, index)
+                else:
+                    result = fuse.icp(levels, self.prev, guess)
+                    step = result.transformation
+                    ok = result.fitness >= fuse.MIN_FITNESS and plausible_step(step, xyz)
+                if ok:
+                    self.motion = step
                     self.motion_s = (t - self.last_t) if (t is not None and self.last_t is not None) else None
                     self.pose = self.pose @ self.motion
                 elif self.relock(*self.relock_source(levels, xyz, all_xyz, all_pix, shape)):
@@ -436,6 +462,8 @@ class Scanner:
             self.last_t, self.lost_run = t, 0
             self.prev = levels
             stats["tracking"] = True
+            if joint and len(marker_pts):
+                self.marker_map.add(marker_pts, self.pose)
         self.track_log.append((index, status, self.pose.copy()))
         if scene.mode == "still":  # the object to merge: above the kept table plane, in its region
             to_world = scene_transform(self.pose)
@@ -443,10 +471,12 @@ class Scanner:
             obj = scene.object_mask(all_xyz, all_pix, shape, to_world)
             xyz, rgb, nrm, pix = all_xyz[obj], all_rgb[obj], all_nrm[obj], all_pix[obj]
         stats["plane_frames"] += scene.plane is not None
+        self.since_merge = getattr(self, "since_merge", 0) + 1
         if self.last_merged is not None:
             move, turn = turned(np.linalg.inv(self.last_merged) @ self.pose)
-            if fuse is not None and move < KEY_MOVE_MM and turn < KEY_TURN_DEG:
+            if fuse is not None and move < KEY_MOVE_MM and turn < KEY_TURN_DEG and self.since_merge < KEY_EVERY:
                 return False
+        self.since_merge = 0
         mxyz, mrgb, mnrm = xyz, rgb, nrm
         if self.clean_depth == "merge":  # merge the cleaned pixels of the same isolated object
             kept = np.zeros(frame["depth"].shape, bool)
@@ -465,6 +495,45 @@ class Scanner:
         if not stats["markers"]:
             color = frame["color"] if "color" in frame else yuyv_to_rgb(frame["yuyv"], *frame["depth"].shape[::-1])
             stats["markers"] = [[round(x, 1), round(y, 1)] for x, y, *_ in markers.detect(markers.luma(color), rgb=color)]
+        return True
+
+    def joint_step(self, levels, xyz, marker_pts, guess, index):
+        """One frame with track.solve (shape + markers + prior), against the previous frame or the
+        model (the cloud so far, rebuilt every MODEL_EVERY merges). Returns (step from the previous
+        pose, accepted)."""
+        from . import track
+        use_model = self.target == "model" and self.model_ready()
+        ref = np.eye(4) if use_model else self.pose  # the target's frame -> world
+        pairs = None
+        if len(marker_pts) and len(self.marker_map):
+            matched = self.marker_map.match_predicted(marker_pts, self.pose @ guess)
+            if matched:
+                to_ref = np.linalg.inv(scene_transform(ref))  # world (mm) -> target frame (mm)
+                dst = self.marker_map.pos[[m for _, m in matched]] @ to_ref[:3, :3].T + to_ref[:3, 3]
+                pairs = (marker_pts[[f for f, _ in matched]], dst)
+        radius = float(np.percentile(np.linalg.norm(xyz - xyz.mean(0), axis=1), 90)) if len(xyz) else 60.0
+        init = self.pose @ guess if use_model else guess
+        found, info = track.solve(levels, self.model_levels if use_model else self.prev, init, prior=init,
+                                  marker_pairs=pairs, radius_mm=radius, marker_sigma_mm=self.marker_sigma)
+        step = np.linalg.inv(self.pose) @ found if use_model else found
+        self.track_info.append((index, info))
+        if info["degeneracy"] is not None and info["degeneracy"] < track.DEGENERATE:
+            self.stats["flat"] = self.stats.get("flat", 0) + 1
+        ok = (info["fitness"] >= JOINT_MIN_FITNESS and info["rmse_mm"] is not None
+              and info["rmse_mm"] <= JOINT_MAX_RMSE_MM and plausible_step(step, xyz)
+              and (info["marker_rmse_mm"] is None or info["marker_rmse_mm"] <= self.marker_accept))
+        return step, ok
+
+    def model_ready(self):
+        """Prepare the model target (levels of the cloud so far, world); False until it has enough points."""
+        from . import fuse
+        if self.stats["merged"] < 2:
+            return False
+        if self.model_levels is None or self.stats["merged"] - self.model_at >= MODEL_EVERY:
+            xyz, _, _ = self.cloud.points(min_seen=1)
+            if len(xyz) < 500:
+                return self.model_levels is not None
+            self.model_levels, self.model_at = fuse.levels(xyz / 1000), self.stats["merged"]
         return True
 
     def frame_markers(self, frame):

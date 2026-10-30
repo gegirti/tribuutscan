@@ -168,6 +168,24 @@ P3 (`markermap.py`):
   1.5-3.7 mm with 0.3 mm marker noise, while the markers themselves land within 0.5 mm.
 - A field-of-view sweep (54-66 degrees) by marker scatter was inconclusive (tracking error
   dominates), so 60 degrees stays the estimate until calibration.
+P4 (`track.py`, now the default tracker):
+- One Gauss-Newton solve combines point-to-plane (Tukey 3 mm, plus a distance down-weight), marker
+  terms (sigma 1 mm, dropped beyond 3 sigma on the fine level) and a motion prior (20 mm / 5
+  degrees). It runs against the model (the cloud so far), after stray-point removal.
+- Results against the first version:
+  - tilt doubling 60% -> 16% and 0 jumps (one clean shell in the renders)
+  - face 13 -> 1 jumps
+  - synthetic ATE 4.0 -> 1.7 mm, 1.7 -> 1.0 mm, and 6.0 -> 1.5 mm on the hard path
+- Measured and dropped:
+  - the model target WITHOUT markers drifts (synthetic 25 mm)
+  - loose marker weighting (3 mm) lets marker noise pull poses off (tilt 78% doubled)
+  - Open3D's own ICP fails with 20% clutter (390 mm), whereas this solve stays at 0.1 mm once
+    stray points are removed
+- Real marker positions are noisy (median 2.4 mm against the map) until the colour registration
+  is calibrated.
+- The flat-face flag fires on most frames of flat parts, so its threshold needs tuning before it
+  can be a hint.
+- Cost: about 300 ms per frame offline (was about 110): live speed is P5's problem.
 Markers: the retroreflective dot usually has depth on this scanner (about 90% of its pixels), and a
 plane fitted to the ring around the dot is flat to about 0.3 mm.
 

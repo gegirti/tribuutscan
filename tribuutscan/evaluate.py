@@ -62,17 +62,21 @@ def cached_markers(name, directory):
     return found
 
 
+TRACKERS = {  # name: Scanner options (the scan mode comes from the dataset)
+    "current": {},
+    "baseline": dict(clean_depth=False, gate_refind=False, motion_dt=False, track_with="icp", mode="free"),
+    "p2": dict(track_with="icp"),  # frame-to-frame ICP with P1/P2 (gate, cleanup, scan modes)
+    "frame": dict(target="frame"),  # joint solve against the previous frame
+    "nomarkers": dict(track_with="jointnm"),  # joint solve against the model, without markers
+    "markers": dict(track_with="markers"),  # markers alone (P3)
+}
+
+
 def make_scanner(tracker, preset, mode):
-    quiet = lambda m: None
-    if tracker == "baseline":  # the first version: no cleanup, ungated re-finds, fixed-step guess, free mode
-        return cl.Scanner(preset, log=quiet, clean_depth=False, gate_refind=False, motion_dt=False, mode="free")
-    if tracker == "p1":  # P1: as current but every dataset in free mode
-        return cl.Scanner(preset, log=quiet, mode="free")
-    if tracker == "current":
-        return cl.Scanner(preset, log=quiet, mode=mode)
-    if tracker == "markers":  # P3: poses from markers alone
-        return cl.Scanner(preset, log=quiet, mode=mode, track_with="markers")
-    raise ValueError(f"unknown tracker {tracker}")
+    options = dict(mode=mode, **TRACKERS[tracker]) if tracker in TRACKERS else None
+    if options is None:
+        raise ValueError(f"unknown tracker {tracker}; one of {list(TRACKERS)}")
+    return cl.Scanner(preset, log=lambda m: None, **options)
 
 
 def run(name, tracker="baseline", preset="small"):
@@ -104,6 +108,7 @@ def run(name, tracker="baseline", preset="small"):
         "ms_per_frame": round(1000 * elapsed / max(n, 1), 1),
         "points": int(len(xyz)),
         "pose_jumps": metrics.pose_jumps(tracked, centre),
+        "flat_frames": scanner.stats.get("flat", 0),
         "double_surface_ratio": round(metrics.double_surface_ratio(xyz, normals), 4),
         "marker_scatter": metrics.marker_scatter(sightings),
         "loop_gap": {"mm": round(gap[0], 1), "deg": round(gap[1], 1)},
