@@ -35,7 +35,7 @@ is simply getting colour, IR and depth out of the scanner on Linux.
   shows the projector dot pattern, mirrored vs colour/depth), `/dev/video4` colour (YUYV/MJPG).
   Odd nodes are metadata. `tribuutscan/v4l2.py:discover()` finds them by USB interface.
 - Depth packing is an MSB-first 10-bit bitstream, 4 pixels per 5 bytes (not MIPI Y10P).
-  Values ~1..200 in the default window, nearer = larger, 0 = invalid.
+  Values seen: about 280 at 25 cm, about 3-55 at 30-31 cm (window edge); nearer = larger, 0 = invalid.
 - ffmpeg and GStreamer cannot negotiate the depth format, and camera apps pick it up and show
   black. Capture goes through raw V4L2 ioctl + mmap (struct offsets assume 64-bit).
 - Some depth frames arrive truncated; drop any frame shorter than `sizeimage`.
