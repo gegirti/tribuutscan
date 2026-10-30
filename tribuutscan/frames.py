@@ -4,6 +4,7 @@ Colour is requested at 1280x800 so it shares the depth map's pixel grid. Whether
 registered (different cameras, different baselines) is not verified; identity is assumed.
 """
 import json
+import select
 import time
 from pathlib import Path
 
@@ -39,6 +40,25 @@ def grab(warmup=10):
         if len(last) != 3:
             raise RuntimeError(f"no usable frames from: {set(('color', 'ir', 'depth')) - set(last)}")
         return decode(last["color"], last["ir"], last["depth"], d.bytesperline)
+
+
+def paired(caps, max_skew_s=0.02, timeout=2.0):
+    """The newest frames of {name: Capture}, all captured within max_skew_s of each other, as
+    {name: (bytes, capture time)}; None after `timeout` seconds. Reads whichever stream is ready, so
+    no stream waits behind another (reading them in turn leaves them a frame or more apart)."""
+    names = {cap.fd: name for name, cap in caps.items()}
+    latest, end = {}, time.monotonic() + timeout
+    while time.monotonic() < end:
+        for fd in select.select(list(names), [], [], 0.1)[0]:
+            cap = caps[names[fd]]
+            buf = cap.read(timeout=0)
+            if buf is not None and len(buf) >= cap.sizeimage:
+                latest[names[fd]] = (buf, cap.last_time)
+        if len(latest) == len(caps) and not any(cap.ready() for cap in caps.values()):
+            times = [t for _, t in latest.values()]
+            if max(times) - min(times) <= max_skew_s:
+                return latest
+    return None
 
 
 def save(frames, root=CAPTURES, extra=None):

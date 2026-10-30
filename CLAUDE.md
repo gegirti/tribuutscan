@@ -240,7 +240,20 @@ P7 (`session.py`; viewer "Continue last"):
 - A race fixed: `relock()` read the cloud while a background merge replaced its arrays.
 Scanner session preparation:
 - `calibrate.py` writes an exact-size A4 ChArUco board (captures/calib/board.svg), a live capture
-  window (colour + IR, IR median-blurred against the projector dots) and the solver.
+  window and the solver.
+- On the scanner, IR shows the board only through the projector's dots, so its ArUco codes cannot
+  be read at 30 cm (median, Gaussian, dilation and plain chessboard detection all failed), and corner
+  refinement follows the dots (2-3 px off). The board is found in colour; IR is aligned to it: whole
+  board by ECC from the colour corners + the estimated colour -> depth mapping, then each corner by a
+  shift-only ECC of a one-square patch (keeps lens distortion). Still board: 0.03 px scatter;
+  synthetic dot-lit views: 0.26 px median error. The synthetic end-to-end solve with dots and lens
+  distortion recovered fx 1107.7 (1108), T within 0.1 mm, law a 319874 (320000).
+- OpenCV's CharucoDetector corners sit about 0.5 px off; `detect()` refines them with cornerSubPix.
+- The capture window keeps a view by itself when the board has been still for 0.5 s at a new place
+  (so the user can hold the scanner), and pairs the three streams by capture time
+  (`frames.paired`: reading them in turn left them a frame or more apart).
+- A board page on a spiral pad was bowed by 6 mm: the depth map showed both ends 3-4.5 mm nearer
+  than the middle. Tape the page flat on a desk.
 - The solver finds colour/IR intrinsics, stereo extrinsics (`CALIB_FIX_INTRINSIC`), and the depth
   law per pixel against the board plane. It compares v = A/z + B with A/z^2 + B, which hand
   readings could not tell apart.
