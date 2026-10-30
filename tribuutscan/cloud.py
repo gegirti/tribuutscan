@@ -164,12 +164,10 @@ def frame_points(frame, stride=1, normals=False):
     valid = ds > 0
     v, u = np.nonzero(valid)
     v, u = v * stride, u * stride
-    xyz = CAMERA.backproject(u, v, pc.depth_to_mm(d[v, u]))
-    if "color" in frame:
-        src_x, src_y = pc.color_source(u, v, w, h)  # only the needed pixels, not the whole image
-        rgb = frame["color"][src_y, src_x]
-    else:
-        rgb = yuyv_pixels(frame["yuyv"], w, *pc.color_source(u, v, w, h))
+    z = pc.depth_to_mm(d[v, u])
+    xyz = CAMERA.backproject(u, v, z)
+    src_x, src_y = pc.color_source(u, v, w, h, z)  # only the needed pixels; parallax-aware when calibrated
+    rgb = frame["color"][src_y, src_x] if "color" in frame else yuyv_pixels(frame["yuyv"], w, src_x, src_y)
     if not normals:
         return xyz, rgb, np.stack([u, v], 1)
     return xyz, rgb, np.stack([u, v], 1), pixel_normals(ds, stride, v // stride, u // stride, xyz)

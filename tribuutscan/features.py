@@ -46,7 +46,12 @@ def extract(luma, depth, mask_pixels=None):
     """
     h, w = depth.shape
     v, u = np.mgrid[0:h:SCALE, 0:w:SCALE]
-    src_x, src_y = pc.color_source(u, v, w, h)  # depth-grid pixel -> colour pixel (registration)
+    z = None
+    if CAMERA.colour is not None:  # calibrated: each grid pixel's own distance (median where none)
+        raw = depth[::SCALE, ::SCALE]
+        z = np.where(raw > 0, CAMERA.depth_mm(np.maximum(raw, 1)),
+                     np.median(CAMERA.depth_mm(raw[raw > 0])) if (raw > 0).any() else 250.0)
+    src_x, src_y = pc.color_source(u, v, w, h, z)  # depth-grid pixel -> colour pixel (registration)
     grey = _clahe.apply(np.ascontiguousarray(luma[src_y, src_x]))
     mask = None
     if mask_pixels is not None:

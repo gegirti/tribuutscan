@@ -203,6 +203,11 @@ def locate(depth, found):
     out = []
     for x, y, r, _ in found:
         u0, v0 = CAMERA.depth_px(x, y)
+        if CAMERA.colour is not None:  # calibrated: redo at the marker's own distance (parallax)
+            ui, vi = int(round(u0)), int(round(v0))
+            near = depth[max(vi - 12, 0):vi + 13, max(ui - 12, 0):ui + 13]
+            if (near > 0).any():
+                u0, v0 = CAMERA.depth_px(x, y, float(np.median(CAMERA.depth_mm(near[near > 0]))))
         rd = max(r * CAMERA.reg["ax"], 2.0)
         k = int(RING[1] * rd) + 1
         u_lo, u_hi, v_lo, v_hi = int(u0) - k, int(u0) + k + 1, int(v0) - k, int(v0) + k + 1

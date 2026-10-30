@@ -107,6 +107,8 @@ python3 -m tribuutscan.markers captures/<stamp>   # find markers in a saved fram
 python3 -m tribuutscan.view3d captures/<stamp>-scan    # browser 3D view at http://localhost:8765
 .venv/bin/python -m tribuutscan.optimise captures/<stamp>-scan   # loop closures + pose graph + merge again
 .venv/bin/python -m tribuutscan.session merge A-scan B-scan AB-scan   # merge two scans into one
+.venv/bin/python -m tribuutscan.calibrate board|capture [square_mm]|solve <dir> [square_mm]
+                                            # ChArUco calibration -> captures/calibration.json
 .venv/bin/python -m tribuutscan.evaluate [datasets] [--label x] [--against report.json]
                                             # tracking metrics on saved + synthetic recordings
 .venv/bin/python -m tribuutscan.synth [out] [frames] [every] [hard]   # synthetic box scan, ground truth
@@ -228,6 +230,19 @@ P7 (`session.py`; viewer "Continue last"):
 - Marker triangle search is vectorised over the map: the merge took 488 s with a Python loop over
   every map triangle.
 - A race fixed: `relock()` read the cloud while a background merge replaced its arrays.
+Scanner session preparation:
+- `calibrate.py` writes an exact-size A4 ChArUco board (captures/calib/board.svg), a live capture
+  window (colour + IR, IR median-blurred against the projector dots) and the solver.
+- The solver finds colour/IR intrinsics, stereo extrinsics (`CALIB_FIX_INTRINSIC`), and the depth
+  law per pixel against the board plane. It compares v = A/z + B with A/z^2 + B, which hand
+  readings could not tell apart.
+- On synthetic views with known truth it recovered fx 1109.0 (1108.5), baseline 25.16 mm (25.20)
+  and law a 320064 / b 999.7 (320000 / 1000), at reprojection < 0.4 px.
+- `calib.Camera` has the full model: lens distortion, and colour <-> depth through 3D at each
+  pixel's distance. The two cameras sit apart, so the offset swings about 58 px between 18 and
+  31 cm. The old fixed affine REG is only right at one distance, which likely explains the 2-5 mm
+  marker noise.
+- Estimate mode is unchanged (same evaluation numbers).
 Markers: the retroreflective dot usually has depth on this scanner (about 90% of its pixels), and a
 plane fitted to the ring around the dot is flat to about 0.3 mm.
 

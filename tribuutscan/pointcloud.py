@@ -19,9 +19,9 @@ from .calib import CAMERA
 WINDOW_CM = tuple(z / 10 for z in CAMERA.window_mm)  # beyond it depth is 0 (estimate until calibrated)
 
 
-def color_source(u, v, w, h):
-    """Colour-image pixel (x, y) (rounded, clipped) for depth pixel (u, v)."""
-    x, y = CAMERA.colour_px(u, v)
+def color_source(u, v, w, h, z_mm=None):
+    """Colour-image pixel (x, y) (rounded, clipped) for depth pixel (u, v), at distance z_mm if known."""
+    x, y = CAMERA.colour_px(u, v, z_mm)
     return np.clip(np.round(x).astype(int), 0, w - 1), np.clip(np.round(y).astype(int), 0, h - 1)
 
 
