@@ -343,7 +343,7 @@ def capture(square_mm=SQUARE_MM, out=None):
     nodes = v4l2.discover()
     caps = {"color": v4l2.Capture(nodes["color"], "YUYV", fr.W, fr.H),
             "ir": v4l2.Capture(nodes["ir"], "GREY", fr.W, fr.H),
-            "depth": v4l2.Capture(nodes["depth"], "Y10", fr.W, fr.H)}
+            "depth": fr.open_depth(nodes)}
 
     def keep(frame, col, place):
         i = ir_corners(frame["ir"], col, brd)

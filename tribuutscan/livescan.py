@@ -5,7 +5,7 @@ to it over two queues. The worker also serves the browser 3D view of the growing
 (view3d page), so cloud data never passes back through the viewer.
 
 Commands:  ("start", preset, out_dir, keep_raw, continue_from or None)
-           | ("frame", yuyv, grey, y10, bytesperline, (t_colour, t_ir, t_depth))
+           | ("frame", yuyv, grey, depth_buf, bytesperline, (t_colour, t_ir, t_depth))
            | ("stop",) | ("quit",)   (times: camera capture times, seconds)
 Replies:   ("ready", url) | ("log", text) | ("frame_done", merged, frames, points, tracking, cue) | ("saved", path, points)
            cue: {"markers": used, "features": ORB start, "flat": shape alone slides}
@@ -28,7 +28,7 @@ from . import cloud as cl
 from . import frames as fr
 from . import pointcloud as pc
 from . import view3d
-from .depth import decode_y10
+from .depth import decode_depth
 
 PAYLOAD_EVERY_S = 0.5  # rebuild the page's cloud at most this often
 LIVE_MIN_SEEN = 1  # the page shows every cube while scanning; the saved cloud uses cloud.MIN_SEEN
@@ -147,14 +147,14 @@ def run(commands, replies, port=view3d.PORT):
                 source.name = f"live: {out_dir.name}"
                 source.phase, source.out_dir = "scanning", out_dir
         elif kind == "frame" and source.scanner is not None:
-            _, yuyv, grey, y10, bytesperline, (t_c, t_i, t_d) = cmd
+            _, yuyv, grey, depth_buf, bytesperline, (t_c, t_i, t_d) = cmd
             t0 = time.perf_counter()
             if keep_raw:
                 if recorder is None:
                     recorder = fr.Recorder(bytesperline, root=out_dir, extra={"note": "frames a live scan processed"})
-                recorder.write({"color": yuyv, "ir": grey, "depth": y10}, {"color": t_c, "ir": t_i, "depth": t_d})
+                recorder.write({"color": yuyv, "ir": grey, "depth": depth_buf}, {"color": t_c, "ir": t_i, "depth": t_d})
             t1 = time.perf_counter()
-            frame = {"yuyv": yuyv, "depth": decode_y10(y10, fr.W, fr.H, bytesperline),  # colour decoded per point
+            frame = {"yuyv": yuyv, "depth": decode_depth(depth_buf, fr.W, fr.H, bytesperline),  # colour decoded per point
                      "t": t_d, "skew_ms": (t_c - t_d) * 1000}
             t2 = time.perf_counter()
             with source.lock:

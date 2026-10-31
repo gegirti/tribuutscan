@@ -2,16 +2,19 @@
 
 Colour is requested at 1280x800 so it shares the depth map's pixel grid. Whether the two are truly
 registered (different cameras, different baselines) is not verified; identity is assumed.
+Depth is 14-bit over USB (usbdepth.py) when allowed, else 10-bit over V4L2; decoded depth is on the
+Y10 scale either way, and recordings note which one they hold (depth_bytesperline).
 """
 import json
+import os
 import select
 import time
 from pathlib import Path
 
 import numpy as np
 
-from . import v4l2
-from .depth import decode_y10
+from . import usbdepth, v4l2
+from .depth import decode_depth
 from .image import depth_to_rgb, write_png, yuyv_to_rgb
 
 W, H = 1280, 800
@@ -22,15 +25,29 @@ def decode(color_buf, ir_buf, depth_buf, depth_bytesperline):
     return {
         "color": yuyv_to_rgb(color_buf, W, H),
         "ir": np.frombuffer(ir_buf, np.uint8, W * H).reshape(H, W)[:, ::-1].copy(),  # flipped to match colour/depth
-        "depth": decode_y10(depth_buf, W, H, depth_bytesperline),
+        "depth": decode_depth(depth_buf, W, H, depth_bytesperline),
     }
+
+
+def open_depth(nodes, log=print):
+    """The depth capture: 14-bit over USB when the udev rule allows it, else V4L2 10-bit (also when
+    TRIBUUTSCAN_DEPTH=y10). Call v4l2.discover() first: the USB capture takes /dev/video0 away."""
+    if os.environ.get("TRIBUUTSCAN_DEPTH", "").lower() != "y10":
+        if usbdepth.available():
+            try:
+                return usbdepth.DepthCapture("Y14")
+            except OSError as e:
+                log(f"14-bit depth over USB failed ({e.strerror or e}); using 10-bit V4L2 depth")
+        else:
+            log("14-bit depth needs udev/70-tribuutscan.rules (see README); using 10-bit V4L2 depth")
+    return v4l2.Capture(nodes["depth"], "Y10", W, H)
 
 
 def grab(warmup=10):
     """Open all three nodes, discard warm-up frames, and return one decoded frame set."""
     nodes = v4l2.discover()
     with v4l2.Capture(nodes["color"], "YUYV", W, H) as c, v4l2.Capture(nodes["ir"], "GREY", W, H) as i, \
-            v4l2.Capture(nodes["depth"], "Y10", W, H) as d:
+            open_depth(nodes) as d:
         last = {}
         for _ in range(warmup):
             for key, cap in (("color", c), ("ir", i), ("depth", d)):
@@ -77,28 +94,29 @@ def save(frames, root=CAPTURES, extra=None):
         "size": [W, H],
         "depth_valid_fraction": round(float((frames["depth"] > 0).mean()), 4),
         "depth_median": float(np.median(valid)) if valid.size else None,
-        "note": "ir is flipped horizontally to match colour/depth (sensor output is mirrored); depth is raw, units unknown",
+        "note": "ir is flipped horizontally to match colour/depth (sensor output is mirrored); depth is raw, on the Y10 scale",
         **(extra or {}),
     }, indent=2))
     return out
 
 
 STREAMS = ("color", "ir", "depth")
-FRAME_BYTES = {"color": W * H * 2, "ir": W * H, "depth": W * H * 10 // 8}  # YUYV, GREY, packed Y10
+FRAME_BYTES = {"color": W * H * 2, "ir": W * H, "depth": W * H * 10 // 8}  # YUYV, GREY, packed Y10 (Y14: 14 // 8)
 
 
 class Recorder:
     """Append raw frame sets to captures/<timestamp>-rec/: one file per stream plus stamps.csv.
 
-    Frames are stored undecoded (about 4.3 MB per set) so recording keeps up with the camera;
-    `read_recording` decodes them later.
+    Frames are stored undecoded (about 4.3 MB per set, 4.9 MB with 14-bit depth) so recording keeps up
+    with the camera; `read_recording` decodes them later.
     """
 
     def __init__(self, depth_bytesperline, root=CAPTURES, extra=None):
         self.dir = Path(root) / (time.strftime("%Y%m%d-%H%M%S") + "-rec")
         self.dir.mkdir(parents=True, exist_ok=True)
+        self.frame_bytes = {**FRAME_BYTES, "depth": depth_bytesperline * H}
         (self.dir / "info.json").write_text(json.dumps({
-            "size": [W, H], "depth_bytesperline": depth_bytesperline, "frame_bytes": FRAME_BYTES,
+            "size": [W, H], "depth_bytesperline": depth_bytesperline, "frame_bytes": self.frame_bytes,
             "note": "raw sensor buffers; ir is NOT flipped here (read_recording flips it)",
             **(extra or {}),
         }, indent=2))
@@ -110,13 +128,13 @@ class Recorder:
     def write(self, bufs, stamps):
         """bufs/stamps: dicts keyed by stream name; buffers are cut to their fixed frame size."""
         for k in STREAMS:
-            self.files[k].write(bufs[k][: FRAME_BYTES[k]])
+            self.files[k].write(bufs[k][: self.frame_bytes[k]])
         self.stamps.write(f"{self.count}," + ",".join(f"{stamps[k]:.4f}" for k in STREAMS) + "\n")
         self.count += 1
 
     @property
     def megabytes(self):
-        return self.count * sum(FRAME_BYTES.values()) / 1e6
+        return self.count * sum(self.frame_bytes.values()) / 1e6
 
     def close(self):
         for f in (*self.files.values(), self.stamps):
@@ -131,11 +149,12 @@ def read_recording(directory):
     """
     directory = Path(directory)
     info = json.loads((directory / "info.json").read_text())
+    sizes = {**FRAME_BYTES, **info.get("frame_bytes", {})}
     data = {k: np.memmap(directory / f"{k}.raw", np.uint8, "r") for k in STREAMS}
     stamps_file = directory / "stamps.csv"
     stamps = np.loadtxt(stamps_file, delimiter=",", skiprows=1, ndmin=2) if stamps_file.exists() else None
-    for i in range(len(data["depth"]) // FRAME_BYTES["depth"]):
-        bufs = [data[k][i * FRAME_BYTES[k]:(i + 1) * FRAME_BYTES[k]].tobytes() for k in STREAMS]
+    for i in range(len(data["depth"]) // sizes["depth"]):
+        bufs = [data[k][i * sizes[k]:(i + 1) * sizes[k]].tobytes() for k in STREAMS]
         frame = decode(*bufs, info["depth_bytesperline"])
         if stamps is not None and i < len(stamps):
             frame["t"] = float(stamps[i, 3])

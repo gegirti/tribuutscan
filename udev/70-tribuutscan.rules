@@ -1,0 +1,5 @@
+# Lets the logged-in desktop user open the CR-Scan Ferret over USB (usbfs), which
+# tribuutscan.usbdepth needs for 14-bit depth. Touches no other device.
+# Install:  sudo cp udev/70-tribuutscan.rules /etc/udev/rules.d/
+#           sudo udevadm control --reload && sudo udevadm trigger --subsystem-match=usb --attr-match=idVendor=2bc5
+SUBSYSTEM=="usb", ATTR{idVendor}=="2bc5", ATTR{idProduct}=="069c", TAG+="uaccess"

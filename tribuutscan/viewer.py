@@ -3,7 +3,8 @@
 Press `s` or click Save to write the current frame set to captures/<timestamp>/.
 Press `r` or click Record to start/stop recording raw frame sets to captures/<timestamp>-rec/.
 Sliders set IR exposure/gain and colour brightness live. IR exposure and gain are controls on the
-depth node: they change the IR sensor that depth is computed from. Auto IR steps them until the IR
+depth function: they change the IR sensor that depth is computed from. Depth is 14-bit over USB
+(usbdepth.py, which then also owns those two controls) when allowed, else 10-bit V4L2. Auto IR steps them until the IR
 image has little clipping (clipping costs depth; see CLAUDE.md).
 The distance line reads the centre of the depth image; distances and the window are estimates.
 Press `m` or click Mesh to fuse the latest recording into mesh.ply (runs fuse.py in the Open3D .venv).
@@ -27,8 +28,8 @@ from pathlib import Path
 import numpy as np
 
 from . import frames as fr
-from . import cloud, livescan, markers, pointcloud, v4l2
-from .depth import decode_y10
+from . import cloud, livescan, markers, pointcloud, usbdepth, v4l2
+from .depth import decode_depth
 from .image import depth_to_rgb, ppm, yuyv_pixels, yuyv_to_rgb
 
 PANE_W = 480
@@ -74,9 +75,9 @@ class Stream(threading.Thread):
     frames are kept so `nearest(t)` can pair streams by time instead of taking whatever is latest.
     """
 
-    def __init__(self, dev, fourcc, w, h, render):
+    def __init__(self, cap, render):
         super().__init__(daemon=True)
-        self.cap = v4l2.Capture(dev, fourcc, w, h)
+        self.cap = cap
         self.render = render
         self.latest = None
         self.version = 0  # bumped with each new preview (the window redraws only on change)
@@ -151,7 +152,7 @@ def render_ir(cap, buf):
 
 
 def render_depth(cap, buf):
-    d = decode_y10(buf, cap.width, cap.height, cap.bytesperline)
+    d = decode_depth(buf, cap.width, cap.height, cap.bytesperline)
     h, w = d.shape
     centre = d[h * 3 // 8:h * 5 // 8, w * 3 // 8:w * 5 // 8]
     valid = centre[centre > 0]
@@ -177,12 +178,31 @@ def distance_hint(stats):
     return text + " - good", GOOD
 
 
+def node_controls(target):
+    """Controls of a V4L2 node path, or of the USB depth capture (it owns the depth function's controls)."""
+    return target.controls() if isinstance(target, usbdepth.DepthCapture) else v4l2.controls(target)
+
+
+def get_control(target, cid):
+    return target.get_control(cid) if isinstance(target, usbdepth.DepthCapture) else v4l2.get_control(target, cid)
+
+
+def set_control(target, cid, value):
+    if isinstance(target, usbdepth.DepthCapture):
+        target.set_control(cid, value)
+    else:
+        v4l2.set_control(target, cid, value)
+
+
 def main():
     nodes = v4l2.discover()
+    depth_cap = fr.open_depth(nodes)
+    on_usb = isinstance(depth_cap, usbdepth.DepthCapture)
+    targets = {**nodes, "depth": depth_cap if on_usb else nodes["depth"]}  # where each slider's control lives
     streams = {
-        "Colour": Stream(nodes["color"], "YUYV", fr.W, fr.H, render_color),
-        "IR (flipped)": Stream(nodes["ir"], "GREY", fr.W, fr.H, render_ir),
-        "Depth (raw, near=red)": Stream(nodes["depth"], "Y10", fr.W, fr.H, render_depth),
+        "Colour": Stream(v4l2.Capture(nodes["color"], "YUYV", fr.W, fr.H), render_color),
+        "IR (flipped)": Stream(v4l2.Capture(nodes["ir"], "GREY", fr.W, fr.H), render_ir),
+        f"Depth, {'14-bit USB' if on_usb else '10-bit'} (raw, near=red)": Stream(depth_cap, render_depth),
     }
     color, ir, depth = streams.values()
 
@@ -218,13 +238,13 @@ def main():
         frame.grid(row=5, column=col, sticky="n")
     controls = {}  # label -> (node path, control id, info, scale)
     for label, node, cid, col in SLIDERS:
-        info = next((c for c in v4l2.controls(nodes[node]).values() if c["id"] == cid), None)
+        info = next((c for c in node_controls(targets[node]).values() if c["id"] == cid), None)
         if info is None:
             continue
 
-        def set_value(value, dev=nodes[node], cid=cid, label=label):
+        def set_value(value, dev=targets[node], cid=cid, label=label):
             try:
-                v4l2.set_control(dev, cid, int(float(value)))
+                set_control(dev, cid, int(float(value)))
             except OSError as e:
                 log(f"{label}: {e.strerror}")
 
@@ -232,14 +252,14 @@ def main():
                          to=info["max"], resolution=info["step"] or 1, command=set_value)
         scale.set(info["value"])
         scale.pack(padx=10)
-        controls[label] = (nodes[node], cid, info, scale)
+        controls[label] = (targets[node], cid, info, scale)
 
     def reset():
         for _, _, info, scale in controls.values():
             scale.set(info["default"])  # triggers set_value
 
     def control_values():
-        return {label: v4l2.get_control(dev, cid) for label, (dev, cid, _, _) in controls.items()}
+        return {label: get_control(dev, cid) for label, (dev, cid, _, _) in controls.items()}
 
     buttons = tk.Frame(columns[2])
     buttons.pack(pady=10)
@@ -511,7 +531,7 @@ def main():
         root.destroy()
 
     root.protocol("WM_DELETE_WINDOW", close)
-    log(f"viewer started (pid {os.getpid()})")
+    log(f"viewer started (pid {os.getpid()}, depth {'14-bit over USB' if on_usb else '10-bit V4L2'})")
     tick()
     root.mainloop()
 

@@ -38,6 +38,19 @@ is simply getting colour, IR and depth out of the scanner on Linux.
   Odd nodes are metadata. `tribuutscan/v4l2.py:discover()` finds them by USB interface.
 - Depth packing is an MSB-first 10-bit bitstream, 4 pixels per 5 bytes (not MIPI Y10P).
   Values seen: about 280 at 25 cm, about 3-55 at 30-31 cm (window edge); nearer = larger, 0 = invalid.
+- 14-bit depth (found 2026-10-31): the depth function's descriptors list Y14 (format 1), Y10 (2) and
+  Y8 (3); uvcvideo drops Y14 ("Unknown video format 20343159-..."). Y14 is the same MSB-first
+  bitstream, 4 px per 7 bytes, 1,792,000 bytes per frame; Y10 = Y14 >> 4 (fit Y14 = 15.996 Y10 + 7.8),
+  same window. `usbdepth.py` streams it through usbfs (stdlib: fcntl + ctypes; the URB pointer
+  ioctls go through libc because fcntl.ioctl takes only a C int). Measured: 30 fps with colour + IR on
+  V4L2 at the same time, 0 bad frames, ~10% of one core, 8 URBs of 12288 bytes (the device refuses
+  whole-frame payloads). Payload headers are 12 bytes with a PTS (1 MHz); stamps from it are exactly
+  33.32 ms apart and pair like V4L2 (colour - depth -6.7 ms USB vs -6.8 ms V4L2). `decode_depth`
+  puts Y14 on the Y10 scale ((Y14 - 8) / 16, float32; < 16 -> 0), so the calibrated law and every
+  consumer are unchanged; recordings tell the formats apart by `depth_bytesperline` (1600 / 2240).
+  Needs udev/70-tribuutscan.rules; otherwise, or with TRIBUUTSCAN_DEPTH=y10, depth is 10-bit V4L2.
+  After a kill -9 the scanner's own reset gave /dev/video0 back in 6 s. The depth function also has
+  a vendor extension unit (unit 4, 17 controls), not explored: a lead for the depth window.
 - ffmpeg and GStreamer cannot negotiate the depth format, and camera apps pick it up and show
   black. Capture goes through raw V4L2 ioctl + mmap (struct offsets assume 64-bit).
 - Some depth frames arrive truncated; drop any frame shorter than `sizeimage`.
@@ -53,6 +66,11 @@ is simply getting colour, IR and depth out of the scanner on Linux.
   3000) and gain 1000-15000 (default 1000). The IR node's own exposure is read-only (EACCES). The colour
   node has the usual UVC controls (brightness, gain, white balance, auto exposure). There is no V4L2
   control for projector power. Helpers live in `v4l2.py` (`controls`, `get_control`, `set_control`).
+  With 14-bit depth the depth node is gone and `usbdepth.DepthCapture` carries these two controls
+  (camera terminal 1 exposure, processing unit 3 gain; same values). They only act while the IR
+  node's auto exposure is 2: on 2026-10-31 it was 0, the exposure read back drifted (968-985) and
+  setting it changed nothing, on both paths. With 2: exposure 500/1500/3000/6000 gave IR mean
+  9.5/28.8/54.6/95.7, identical over USB and V4L2.
 - One test with light boxes at about 25 cm in a dark room: depth stayed at about 72% valid from exposure
   800 to 3000. Clipping cost depth: gain 8000 gave 33% clipped pixels and only 47% valid. The
   projector lights the scene on its own. So the rule is to avoid IR clipping, not to make the image
@@ -99,13 +117,15 @@ is simply getting colour, IR and depth out of the scanner on Linux.
 ```
 tribuutscan-viewer                          # launcher in ~/.local/bin, copy of tribuutscan-viewer.sh
 python3 -m tribuutscan.viewer               # live colour + IR + depth; `s` saves captures/<stamp>/
-                                            # `r` records raw sets to captures/<stamp>-rec/ (~43 MB/s),
+                                            # `r` records raw sets to captures/<stamp>-rec/ (~49 MB/s),
                                             # Auto IR button, distance guide (estimate),
                                             # `m` meshes the latest recording via .venv fuse.py;
                                             # events print to the console and captures/viewer.log
                                             # `c` live scan (merged cloud, worker process), Open 3D view
 python3 -m tribuutscan.pointcloud [dir]     # .ply from a saved set, or grab a live one
-python3 -m tribuutscan.measure <cm>         # depth stats for a flat target at a known distance
+python3 -m tribuutscan.measure [cm]         # flat target: plane RMS, noise, step -> captures/measure.csv
+python3 -m tribuutscan.usbdepth [s] [--all] # 14-bit USB depth throughput check (--all: + colour, IR)
+                                            # TRIBUUTSCAN_DEPTH=y10 forces 10-bit V4L2 depth anywhere
 python3 -m tribuutscan.markers captures/<stamp>   # find markers in a saved frame -> markers.png
 .venv/bin/python -m tribuutscan.cloud captures/<stamp>-rec [small|medium|large]
                                             # merged point cloud -> captures/<stamp>-scan/

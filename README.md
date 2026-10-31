@@ -47,6 +47,14 @@ Light the scene and uncover the lenses, or every stream is black.
 python3 -m tribuutscan.viewer        # live colour + IR + depth
 ```
 
+For 14-bit depth (16x finer steps than the 10-bit depth V4L2 offers), allow your desktop user to
+open the scanner over USB once. Without it, depth stays 10-bit and everything else works the same.
+
+```
+sudo cp udev/70-tribuutscan.rules /etc/udev/rules.d/
+sudo udevadm control --reload && sudo udevadm trigger --subsystem-match=usb --attr-match=idVendor=2bc5
+```
+
 Scanning, calibration and meshing need Open3D and OpenCV, kept in a separate environment that the
 viewer finds by itself:
 
@@ -64,7 +72,7 @@ In the viewer:
 - **Open 3D view**: the scan in the browser. *Process* has Optimise again, merge again at
   0.5 / 1 / 2 mm point distance, and Make mesh; *Export* downloads `cloud.ply` and `mesh.ply`.
 - **Save frame (s)** writes one colour + IR + depth set (and a `cloud.ply`) to `captures/<stamp>/`.
-  **Record (r)** writes raw sets, about 10 a second (about 43 MB/s), for processing later;
+  **Record (r)** writes raw sets, about 10 a second (about 49 MB/s), for processing later;
   **Mesh last recording (m)** makes a rough mesh from the latest one.
 - Sliders set colour and IR brightness; *Auto IR* finds an IR exposure without clipping.
 
@@ -145,7 +153,7 @@ USB `2bc5:069c` (Orbbec vendor ID, strings "Creality" / "CR-Scan Ferret", also o
 
 | Node | USB iface | Content | Format |
 |---|---|---|---|
-| `/dev/video0` | 1.0 | depth, 1280x800 | `Y10 `, bytesperline 1600 (packed 10-bit) |
+| `/dev/video0` | 1.0 | depth, 1280x800 | `Y10 `, bytesperline 1600 (packed 10-bit); 14-bit over USB only |
 | `/dev/video2` | 1.2 | IR, 1280x800, dot pattern visible | GREY / MJPG |
 | `/dev/video4` | 1.4 | colour, up to 1920x1080 (we use 1280x800) | YUYV / MJPG |
 
@@ -156,6 +164,15 @@ The IR projector turns on by itself when the IR stream is opened.
 
 - **Depth packing**: an MSB-first 10-bit bitstream, 4 pixels per 5 bytes. It is not MIPI Y10P.
   See `tribuutscan/depth.py`. Raw values run 1..1023, nearer = larger; 0 = invalid.
+- **14-bit depth**: the depth camera also offers a 14-bit format (`Y14`, 4 pixels per 7 bytes, the
+  same bitstream) that `uvcvideo` drops as an unknown format, so V4L2 never shows it. 10-bit depth
+  is exactly the 14-bit value with its low 4 bits cut off: same range, but one 10-bit step is about
+  0.25 mm at 26 cm, a 14-bit step 0.015 mm. `tribuutscan/usbdepth.py` streams it: it takes the
+  depth function (USB interfaces 0 and 1) from `uvcvideo` through usbfs, asks for format 1 with UVC
+  probe/commit and reads the bulk endpoint, while colour and IR stay on V4L2. All three run at 30
+  fps together; frames are stamped from the device clock and pair with colour and IR exactly as
+  before. It also carries the IR exposure and gain controls, which live on the depth function.
+  If the program dies, the scanner's own USB reset gives the depth node back to `uvcvideo`.
 - **Depth range**: the 10-bit scale spans about 15 cm (1023) to 33 cm (1), and beyond 33 cm there
   is no depth at all. So this is a near mode of the scanner. Creality's app offers size modes
   (150-250, 250-500 and 500-2000 mm), presumably switched through the vendor interface.
@@ -185,7 +202,8 @@ The IR projector turns on by itself when the IR stream is opened.
 
 ## Layout
 
-- Capture: `v4l2.py` (V4L2 capture, node discovery, timestamps), `depth.py` (depth decode),
+- Capture: `v4l2.py` (V4L2 capture, node discovery, timestamps), `usbdepth.py` (14-bit depth over
+  USB), `depth.py` (depth decode),
   `frames.py` (frame sets, recordings, pairing by time), `image.py`
 - Viewer: `viewer.py` (the window), `livescan.py` (the scan worker process), `view3d.py` + `web/`
   (browser 3D view; three.js r160 is vendored so it works offline)
@@ -195,9 +213,10 @@ The IR projector turns on by itself when the IR stream is opened.
   `fuse.py` (rough TSDF mesh from a recording)
 - Camera: `calib.py` (the camera model), `calibrate.py` (board calibration)
 - Measuring: `evaluate.py` + `metrics.py` (tracking scores on saved and synthetic recordings),
-  `synth.py` (synthetic scans with known motion), `measure.py` (depth at a known distance),
+  `synth.py` (synthetic scans with known motion), `measure.py` (depth flatness and noise),
   `pointcloud.py` (single-frame export)
 - `tribuutscan-viewer.sh` launcher (copy to `~/.local/bin/tribuutscan-viewer`)
+- `udev/70-tribuutscan.rules` USB access for 14-bit depth
 - `examples/0-day-kettle/` the first saved frame set
 - `tests/` plain test functions: run with pytest, or call them directly
 
