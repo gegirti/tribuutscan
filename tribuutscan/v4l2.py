@@ -178,7 +178,10 @@ class Capture:
     def close(self):
         if self._streaming:
             self._streaming = False
-            fcntl.ioctl(self.fd, VIDIOC_STREAMOFF, struct.pack("<I", BUF_TYPE_CAPTURE))
+            try:
+                fcntl.ioctl(self.fd, VIDIOC_STREAMOFF, struct.pack("<I", BUF_TYPE_CAPTURE))
+            except OSError:
+                pass  # the device is gone (the scanner reset itself): nothing left to stop
             for m in self._bufs:
                 m.close()
             os.close(self.fd)

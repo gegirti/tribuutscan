@@ -66,7 +66,7 @@ class ImuReader:
             raise OSError("scanner not found")
         self.usb = os.open(path, os.O_RDWR)
         try:
-            fcntl.ioctl(self.usb, usbdepth.USBDEVFS_DISCONNECT_CLAIM, struct.pack("<II256s", IFACE, 0, b""))
+            usbdepth.claim(self.usb, IFACE)
         except OSError:
             os.close(self.usb)
             raise

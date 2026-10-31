@@ -14,9 +14,11 @@ Run with `python -m tribuutscan.viewer`. Panels (panels.py, each folds):
 - View: markers (white dot in a black ring) are found in the colour image a few times a second and
   ringed in the colour view; saved frames list them in info.json.
 The distance bar reads the centre of the depth image. Events go to the message line, the console
-and captures/viewer.log.
+and captures/viewer.log. One viewer at a time (captures/.viewer.lock). When the scanner resets its USB
+connection (it does so on its own now and then), the viewer reconnects by itself.
 """
 import collections
+import fcntl
 import multiprocessing
 import os
 import queue
@@ -24,6 +26,7 @@ import subprocess
 import threading
 import time
 import tkinter as tk
+import tkinter.messagebox
 import webbrowser
 from pathlib import Path
 
@@ -59,6 +62,8 @@ VENV_PYTHON = REPO / ".venv" / "bin" / "python"  # has Open3D; see fuse.py
 
 
 LOG = fr.CAPTURES / "viewer.log"
+LOCK = fr.CAPTURES / ".viewer.lock"
+RETRY_S = 10.0  # after a failed reconnect, try again this much later
 
 
 def latest_recording():
@@ -142,6 +147,7 @@ class Stream(threading.Thread):
     def resume(self, cap):
         self.cap = cap
         self.recent.clear()
+        self.idle.clear()  # running again from now on, before the thread wakes (the reconnect check reads it)
         self.resumed.set()
 
     def stop(self):
@@ -285,6 +291,7 @@ class App:
                      "inflight": 0, "sent": 0.0}
         self.scan_state = "idle"  # idle | scanning | saving | optimising
         self.imu, self.imu_note, self.imu_want = None, "", usbdepth.available()
+        self.retry_at = 0.0  # time.monotonic() before which a lost scanner is not reconnected again
         self.ranges, self.sliders = RANGES, SLIDERS  # for the Scanner panel
         self.range_names = {mode: label for label, mode in RANGES.items()}
         self.range_var = tk.StringVar(value=self.range_name())
@@ -350,7 +357,12 @@ class App:
             pass
 
     def tick(self):
-        if self.switching["done"]:  # back in the Tk thread after a range switch
+        if not self.switching["busy"] and time.monotonic() > self.retry_at \
+                and any(s.idle.is_set() for s in self.streams.values()):  # a stream lost its device
+            self.switching["busy"] = True
+            self.log("lost the scanner (it resets its USB connection now and then): reconnecting ...")
+            threading.Thread(target=self.reconnect, daemon=True).start()
+        if self.switching["done"]:  # back in the Tk thread after a range switch or a reconnect
             self.switching.update(done=None, busy=False)
             self.views["Depth"][0].configure(text=depth_title(self.depth.cap))
             self.range_var.set(self.range_name())
@@ -396,7 +408,10 @@ class App:
                 self.live["proc"].terminate()
         self.imu_off()  # while the depth capture still carries the vendor commands
         for s in self.streams.values():
-            s.stop()
+            try:
+                s.stop()
+            except OSError:  # the scanner is already gone
+                pass
         self.root.destroy()
 
     # --- scanner settings ------------------------------------------------------------------------
@@ -502,8 +517,32 @@ class App:
                 self.imu_on()
             self.switching["done"] = True
 
+    def reconnect(self):
+        """Background thread, after a stream lost its device (the scanner reset itself): stop what
+        depended on the old connection, then open everything again; the depth range is read anew
+        (a reset puts the scanner back in close range)."""
+        try:
+            if self.rec["recorder"]:
+                self.stop_recording()
+                self.log("recording stopped: the scanner reset itself")
+            if self.scan_state == "scanning":
+                self.toggle_scan()  # stops and saves; frames after a reset may be in another range
+                self.log("scan stopped and saved: the scanner reset itself")
+            self.imu_off(quiet=True)
+            for s in self.streams.values():
+                s.pause()
+            if self.reopen():
+                self.log(f"scanner back ({calib.CAMERA.mode})")
+                if self.imu_want:
+                    self.imu_on()
+            else:
+                self.retry_at = time.monotonic() + RETRY_S
+        finally:
+            self.switching["done"] = True
+
     def reopen(self):
-        """Open all three streams again (node paths can change after the scanner re-enumerates)."""
+        """Open all three streams again (node paths can change after the scanner re-enumerates).
+        Returns False (and says so) if they could not be opened."""
         try:
             self.nodes.update(wait_for_scanner())
             ir_exposure_by_hand(self.nodes, self.log)  # a USB reset puts it back to auto
@@ -512,8 +551,10 @@ class App:
             cap = fr.open_depth(self.nodes, self.log)
             self.targets.update(self.nodes, depth=cap if isinstance(cap, usbdepth.DepthCapture) else self.nodes["depth"])
             self.depth.resume(cap)
+            return True
         except Exception as e:  # noqa: BLE001 - shown to the user; the viewer stays up
-            self.log(f"could not restart the streams ({e}): close the viewer and start it again")
+            self.log(f"could not open the scanner ({e}): is it plugged in? trying again in {RETRY_S:.0f} s")
+            return False
 
     # --- IMU -------------------------------------------------------------------------------------
     def vendor_channel(self):
@@ -541,7 +582,7 @@ class App:
         s = self.imu.settings
         self.log(f"IMU on: gyro {s['gyro_hz']} Hz +-{s['gyro_dps']} deg/s, accel {s['accel_hz']} Hz +-{s['accel_g']} g")
 
-    def imu_off(self):
+    def imu_off(self, quiet=False):
         stream, self.imu = self.imu, None
         if stream is None:
             return
@@ -554,7 +595,8 @@ class App:
             finally:
                 ch.close()
         except (OSError, RuntimeError, vendor.VendorError) as e:
-            self.log(f"IMU not switched off ({e}); it stops at the next power-up")
+            if not quiet:  # after a reset the IMU is off anyway
+                self.log(f"IMU not switched off ({e}); it stops at the next power-up")
 
     def toggle_imu(self):
         self.imu_want = self.imu_wanted.get()
@@ -746,9 +788,29 @@ class App:
                 self.scan_state = "idle"
 
 
-def main():
+def refuse(text):
+    print(text, flush=True)
     root = tk.Tk()
-    app = App(root)
+    root.withdraw()
+    tkinter.messagebox.showerror("triBUUTSCAN", text)
+    root.destroy()
+
+
+def main():
+    LOCK.parent.mkdir(exist_ok=True)
+    lock = open(LOCK, "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)  # released by the system when this process ends
+    except BlockingIOError:
+        refuse("The viewer is already running: use that window, or close it first.")
+        return
+    root = tk.Tk()
+    try:
+        app = App(root)
+    except (RuntimeError, OSError) as e:
+        root.destroy()
+        refuse(f"Could not open the scanner: {e}\n\nIs it plugged in, and is no other program using it?")
+        return
     app.build_window()
     app.start()
     root.mainloop()

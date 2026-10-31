@@ -42,6 +42,13 @@ USBDEVFS_IOCTL = 0xC0105512
 USBDEVFS_CLEAR_HALT = 0x80045515
 USBDEVFS_CONNECT = 0x00005517
 USBDEVFS_DISCONNECT_CLAIM = 0x8108551B
+CLAIM_EXCEPT_USBFS = struct.pack("<I", 0x02)  # DISCONNECT_CLAIM_EXCEPT_DRIVER "usbfs": take an interface
+# from uvcvideo/usbhid, but fail with EBUSY instead of taking it from another program reading it over usbfs
+
+
+def claim(fd, interface):
+    """Unbind the kernel driver from `interface` and claim it; EBUSY if another program has it."""
+    fcntl.ioctl(fd, USBDEVFS_DISCONNECT_CLAIM, struct.pack("<I", interface) + CLAIM_EXCEPT_USBFS + b"usbfs".ljust(256, b"\0"))
 URB_TYPE_BULK = 3
 
 # UVC requests and the two controls the viewer uses (unit IDs from the depth function's descriptors)
@@ -171,7 +178,7 @@ class DepthCapture:
         self._claimed = []
         try:
             for i in (VC, VS):  # unbind uvcvideo (if bound) and claim, in one step
-                fcntl.ioctl(self.usb, USBDEVFS_DISCONNECT_CLAIM, struct.pack("<II256s", i, 0, b""))
+                claim(self.usb, i)
                 self._claimed.append(i)
             index, bits = FORMATS[fmt]
             self.width, self.height, self.fourcc = W, H, fmt.ljust(4)

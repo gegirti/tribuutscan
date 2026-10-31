@@ -182,6 +182,18 @@ is simply getting colour, IR and depth out of the scanner on Linux.
   range switches ~10 s each with the IMU back, and after close the IMU switches read 0 and hidraw
   returned. Recordings: imu.csv (host_t monotonic at arrival, device_us, accel g, gyro deg/s, temp),
   `frames.read_imu`; info.json "imu" has the rates and ranges.
+- Viewer robustness (2026-10-31, after the user's first session with v2):
+  - Two viewers ran at once and the second silently took the scanner. The USB claims now use
+    DISCONNECT_CLAIM with EXCEPT_DRIVER "usbfs" (`usbdepth.claim`): they unbind uvcvideo/usbhid
+    but get EBUSY instead of taking an interface from another program. The viewer also holds
+    captures/.viewer.lock (flock), and a second one shows "already running".
+  - The scanner reset itself 10 s after a range switch back to close range, and the viewer froze
+    silently. Now `App.tick` sees a stream that lost its device. `App.reconnect` then stops a recording
+    or scan (it saves them), pauses everything, reopens with the mode read anew (a reset means close
+    range) and switches the IMU back on. Retries after 10 s if the scanner is not back. Checked with a
+    simulated loss: back in 4 s. A real reset was not forced.
+  - The close crashed on a vanished device (STREAMOFF -> ENODEV), so it took three clicks. Now
+    `v4l2.Capture.close` ignores that.
   - PITFALL: GET_STRUCTURE 1044 got no reply (GET_CUR selector 1 timed out, -110), and ~30 s later
     the scanner dropped off USB ("device not accepting address", error -71) until it was
     physically replugged. vendor.py refuses 1044 and stops on any timeout.
