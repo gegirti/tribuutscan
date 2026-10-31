@@ -173,6 +173,9 @@ The IR projector turns on by itself when the IR stream is opened.
   fps together; frames are stamped from the device clock and pair with colour and IR exactly as
   before. It also carries the IR exposure and gain controls, which live on the depth function.
   If the program dies, the scanner's own USB reset gives the depth node back to `uvcvideo`.
+  On a flat sheet of paper the gain is small: the surface's spread from a plane drops 3-4% (0.144 ->
+  0.138 mm at 20 cm, 0.356 -> 0.345 mm at 30 cm), because the sensor's own unevenness is larger than
+  the 10-bit rounding. 14-bit removes the rounding, which matters most on smooth sloped surfaces.
 - **Depth range**: the 10-bit scale spans about 15 cm (1023) to 33 cm (1), and beyond 33 cm there
   is no depth at all. So this is a near mode of the scanner. Creality's app offers size modes
   (150-250, 250-500 and 500-2000 mm), presumably switched through the vendor interface.

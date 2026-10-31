@@ -49,7 +49,13 @@ is simply getting colour, IR and depth out of the scanner on Linux.
   puts Y14 on the Y10 scale ((Y14 - 8) / 16, float32; < 16 -> 0), so the calibrated law and every
   consumer are unchanged; recordings tell the formats apart by `depth_bytesperline` (1600 / 2240).
   Needs udev/70-tribuutscan.rules; otherwise, or with TRIBUUTSCAN_DEPTH=y10, depth is 10-bit V4L2.
-  After a kill -9 the scanner's own reset gave /dev/video0 back in 6 s. The depth function also has
+  After a kill -9 the scanner's own reset gave /dev/video0 back in 6 s.
+  Flat taped paper (measure.py, 2026-10-31), plane RMS Y10 / Y14: 0.144 / 0.138 mm at 20 cm,
+  0.227 / 0.218 at 25 cm, 0.356 / 0.345 at 30 cm. The Y10 excess is exactly its rounding (step /
+  sqrt 12 added in quadrature), so Y14 removes it, but the sensor's own per-frame unevenness
+  (0.14-0.35 mm, growing with distance) dominates: 3-4% better on a flat face. That unevenness is
+  nearly fixed over time (Y14 frame-to-frame 0.015-0.07 mm; Y10 shows 0, below one step). Not
+  measured yet: sloped smooth surfaces, where Y10 steps (0.14-0.31 mm) make terraces and bad normals. The depth function also has
   a vendor extension unit (unit 4, 17 controls), not explored: a lead for the depth window.
 - ffmpeg and GStreamer cannot negotiate the depth format, and camera apps pick it up and show
   black. Capture goes through raw V4L2 ioctl + mmap (struct offsets assume 64-bit).
