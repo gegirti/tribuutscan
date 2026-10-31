@@ -10,6 +10,7 @@ Goes through uvcvideo (UVCIOC_CTRL_QUERY on the depth node), so it needs /dev/vi
 V4L2, not the USB capture. Only the read opcodes below can be sent: `request` refuses the others.
 
     python3 -m tribuutscan.vendor            # known properties and structures
+    python3 -m tribuutscan.vendor modes      # the depth modes the scanner offers (list 4034)
     python3 -m tribuutscan.vendor scan       # also try every property id 0-299 and structure 1000-1043
 Careful: a read of structure 1044 hung the scanner's firmware until it was replugged. Any timeout
 ends the run (TimeoutError is not caught).
@@ -45,6 +46,8 @@ PROPERTIES = {2: "LDP", 3: "LASER", 4: "LASER_PULSE_WIDTH", 14: "DEPTH_MIRROR", 
               22: "MIN_DEPTH", 23: "MAX_DEPTH", 32: "LDP_STATUS", 75: "DEPTH_PRECISION_LEVEL", 79: "LASER_MODE",
               95: "DEVICE_WORK_MODE", 98: "SWITCH_IR_MODE", 99: "LASER_POWER_LEVEL", 100: "LDP_MEASURE_DISTANCE",
               119: "LASER_POWER_ACTUAL_LEVEL", 182: "LASER_CONTROL", 184: "IR_BRIGHTNESS"}
+DEPTH_MODE_LIST = 4034  # OB_RAW_DATA_DEPTH_ALG_MODE_LIST (OrbbecSDK_v2 InternalProperty.hpp)
+LIST_CHUNK = 252  # bytes per list read; the SDK uses up to DEFAULT_CMD_MAX_DATA_SIZE
 STRUCTURES = {1002: "BASELINE_CALIBRATION_PARAM", 1003: "DEVICE_TEMPERATURE", 1035: "DEVICE_SERIAL_NUMBER",
               1043: "CURRENT_DEPTH_ALG_MODE", 1045: "DEPTH_PRECISION_SUPPORT_LIST",
               1069: "PRESET_RESOLUTION_CONFIG"}
@@ -109,6 +112,28 @@ class Channel:
     def get_structure(self, sid, reply_len=512):
         return self.request(GET_STRUCTURE, struct.pack("<I", sid), reply_len)
 
+    def read_list(self, pid, cmd_version=0):
+        """A structure list, the SDK's way (getStructureDataListProtoV1_1): start (cmdVer, size), read in
+        chunks, finish. Returns the bytes; finish is sent whenever start succeeded (not after a timeout)."""
+        ver, size = struct.unpack_from("<HI", self.request(INIT_READ_LIST, struct.pack("<I", pid)))
+        if ver != cmd_version:
+            raise VendorError(f"list {pid}: command version {ver}, expected {cmd_version}")
+        out = bytearray()
+        try:
+            while len(out) < size:
+                n = min(LIST_CHUNK, size - len(out))
+                out += self.request(READ_LIST, struct.pack("<III", pid, len(out), n), 1024)[:n]
+        finally:
+            self.request(FINISH_READ_LIST, struct.pack("<I", pid), 1024)
+        return bytes(out)
+
+    def depth_modes(self):
+        """[(name, option code, checksum hex)] from the mode list; entries are OBDepthWorkMode_Internal."""
+        data = self.read_list(DEPTH_MODE_LIST)
+        return [(data[i + 16:i + 48].split(b"\0")[0].decode(errors="replace"),
+                 struct.unpack_from("<I", data, i + 48)[0], data[i:i + 16].hex())
+                for i in range(0, len(data) - 51, 52)]
+
     def close(self):
         os.close(self.fd)
 
@@ -121,6 +146,11 @@ def show(data):
 def main():
     ch = Channel()
     try:
+        if "modes" in sys.argv:
+            cur = ch.get_structure(1043)[16:48].split(b"\0")[0].decode()
+            for name, option, checksum in ch.depth_modes():
+                print(f"  {'*' if name == cur else ' '} {name:32} option {option:#x}  checksum {checksum}")
+            return
         print("properties (cur, max, min, def, step):")
         ids = range(300) if "scan" in sys.argv else PROPERTIES
         for pid in ids:

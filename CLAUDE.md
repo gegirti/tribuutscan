@@ -137,6 +137,12 @@ is simply getting colour, IR and depth out of the scanner on Linux.
   - properties: LDP 2 (0/1), laser 3 (0 while idle), 4 = 1627 of 100-6800 (default 2200, same range
     as IR exposure), depth precision level 75 = 1 of 0-1, LDP distance 100 = 0 of 0-3000; MIN/MAX
     DEPTH 22/23 unsupported; ~40 more ids answer (scan output not interpreted yet)
+  - depth mode list (4034 = OB_RAW_DATA_DEPTH_ALG_MODE_LIST, read with the struct-list opcodes 29/30/31
+    as OrbbecSDK_v2 does; 52-byte entries: 16-byte checksum, 32-byte name, u32 option code):
+    Close_range_mode Default (0x8, ACTIVE), Long_range_mode Default (0x8), Close/Long_range_mode
+    Interleave (0x18), Close/Long_range_mode Narrow_View (0x18), Grid_of_Dots Calibration (0xe),
+    In_scene Calibration (0xa). The SDK switches by SET_STRUCTURE_V1_1 of 1043 with the chosen entry,
+    only while nothing streams, then resets the device. Not tried yet.
   - PITFALL: GET_STRUCTURE 1044 got no reply (GET_CUR selector 1 timed out, -110), and ~30 s later
     the scanner dropped off USB ("device not accepting address", error -71) until it was
     physically replugged. vendor.py refuses 1044 and stops on any timeout.
