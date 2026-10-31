@@ -147,7 +147,9 @@ is simply getting colour, IR and depth out of the scanner on Linux.
     USB, the mode reads back and survives stream start/stop. Depth formats unchanged (Y14/Y10, no RLE).
     Same flat surface (close mode raw 93.4 = 299.5 mm): long mode raw 564.7; areas that were beyond
     the close window now have depth. IF long mode keeps a = 289570, b_long = 402.1 and the window is
-    ~203-718 mm (raw 1023..1): an UNVERIFIED estimate; a second known distance tests it (50 cm -> 177).
+    ~203-718 mm (raw 1023..1). Tested at a hand-measured 50 cm: centre raw 175.7 (predicted 177), i.e.
+    501 mm. So long mode is z = 289570 / (v + 402.1), ~20-72 cm: still an estimate (one hand distance).
+    Close mode at that 50 cm: 0% valid.
     While in long mode the calibration law, prep's window and the viewer's distance guide are WRONG
     (they are close-mode). Back: `python3 -m tribuutscan.vendor switch "Close_range_mode Default"`.
   - PITFALL: GET_STRUCTURE 1044 got no reply (GET_CUR selector 1 timed out, -110), and ~30 s later
