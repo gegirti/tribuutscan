@@ -1,6 +1,6 @@
 """Merge many depth frames into one compact point cloud: the "point distance" rule real scanners use.
 
-    python3 -m tribuutscan.cloud captures/<stamp>-rec [small|medium|large]
+    python3 -m tribuutscan.cloud captures/<stamp>-rec [small|medium|large] [--keep-base]
     .venv/bin/python -m tribuutscan.cloud ...      # with Open3D: tracks motion (ICP) between frames
 
 Space is cut into cubes of side `point distance`. Every point that lands in a cube is averaged into
@@ -39,6 +39,7 @@ BORDER_PX = 40  # a support plane must have points this close to the image edge
 PLANE_MIN_CM2 = 80  # ...and cover this much area. A slice through a curved part covered 33-53 cm2,
                     # a mostly hidden table 100 cm2 (one test each; revisit with turntable scans)
 CLUSTER_CELL_MM = 6.0  # cell size for finding the connected piece at the centre
+OUTPUT_CELL_MM = 3.0  # connectivity of the saved cloud: cubes further apart than this are not connected
 
 KEY_MOVE_MM, KEY_TURN_DEG = 3.0, 2.0  # merge a frame after this much motion since the last one...
 KEY_EVERY = 10  # ...or every 10th tracked frame anyway (a still scanner keeps averaging the view)
@@ -110,6 +111,14 @@ class VoxelCloud:
         """Keep only the cubes in `mask` (e.g. to cut out a table found late)."""
         for name in ("keys", "xyz", "rgb", "n", "nrm", "seen"):
             setattr(self, name, getattr(self, name)[mask])
+
+    def subset(self, mask):
+        """A new cloud with only the cubes in `mask` (this one is left as it is)."""
+        out = VoxelCloud(self.point_mm)
+        for name in ("keys", "xyz", "rgb", "n", "nrm", "seen"):
+            setattr(out, name, getattr(self, name)[mask])
+        out.frames, out.raw_points = self.frames, self.raw_points
+        return out
 
     def points(self, min_seen=MIN_SEEN, with_normals=False):
         """(xyz mm, rgb uint8, seen[, oriented unit normals]) of the cubes seen in >= `min_seen` frames.
@@ -193,15 +202,17 @@ def pixel_normals(ds, stride, rows, cols, xyz):
     return np.nan_to_num(n)
 
 
-def support_plane(xyz, rng, pix=None, shape=None, iterations=60, sample=1500, tries=3):
+def support_plane(xyz, rng, pix=None, shape=None, iterations=60, sample=1500, tries=3,
+                  min_share=PLANE_MIN_SHARE, min_cm2=PLANE_MIN_CM2, accept=None):
     """The table/turntable plane (normal n, offset c with n.p + c = 0, n toward the scanner), or None.
 
-    A plane counts only if it holds PLANE_MIN_SHARE of the points AND most other points lie on the
+    A plane counts only if it holds `min_share` of the points AND most other points lie on the
     scanner's side of it (the object stands on it) AND the scanner is not looking along it (an
     object's side wall seen edge-on is not a table). With `pix`/`shape` given, it must also run out
-    of the picture: a table does, a flat lid or face in the middle of the view does not. Finally it
-    must cover PLANE_MIN_CM2: a plane slicing a curved surface only catches thin bands.
-    A plane that fails is set aside and the next largest plane is tried.
+    of the picture: a table does, a flat lid or face in the middle of the view does not. It must
+    cover `min_cm2`: a plane slicing a curved surface only catches thin bands. Finally `accept(n, c)`,
+    if given, must agree (scene.py: the object at the centre stands on it).
+    A plane that fails is set aside and the next largest plane is tried, up to `tries` planes.
     """
     if len(xyz) < 100:
         return None
@@ -216,7 +227,7 @@ def support_plane(xyz, rng, pix=None, shape=None, iterations=60, sample=1500, tr
     rest, rest_border = pts, border
     for _ in range(tries):
         plane, inliers = _ransac_plane(rest, rng, iterations)
-        if plane is None or inliers.sum() < PLANE_MIN_SHARE * len(pts):
+        if plane is None or inliers.sum() < min_share * len(pts):
             return None
         n, c = plane
         if c < 0:  # orient so the scanner (origin) is on the positive side
@@ -227,7 +238,7 @@ def support_plane(xyz, rng, pix=None, shape=None, iterations=60, sample=1500, tr
         facing = abs(n @ centre) / np.linalg.norm(centre)  # 0 = seen edge-on, 1 = head-on
         reaches_edge = pix is None or rest_border[inliers].any()
         if facing >= PLANE_MIN_FACING and reaches_edge and (not off.any() or (dist[off] > 0).mean() >= 0.8) \
-                and plane_area_cm2(xyz, n, c) >= PLANE_MIN_CM2:
+                and plane_area_cm2(xyz, n, c) >= min_cm2 and (accept is None or accept(n, c)):
             return n, c
         rest, rest_border = rest[~inliers], rest_border[~inliers]
     return None
@@ -273,9 +284,9 @@ def centre_piece(xyz, pix, shape):
     return connected_piece(xyz, seeds)
 
 
-def connected_piece(xyz, seeds):
-    """Mask of the points connected (through CLUSTER_CELL_MM cells) to any seed point (bool mask)."""
-    keys = pack(np.floor(xyz / CLUSTER_CELL_MM).astype(np.int64))
+def connected_piece(xyz, seeds, cell_mm=CLUSTER_CELL_MM):
+    """Mask of the points connected (through cells of `cell_mm`) to any seed point (bool mask)."""
+    keys = pack(np.floor(xyz / cell_mm).astype(np.int64))
     cells, inv = np.unique(keys, return_inverse=True)
     piece = np.zeros(len(cells), bool)
     piece[inv[seeds]] = True
@@ -335,6 +346,11 @@ def scale_motion(t, s):
     return out
 
 
+def scene_margin():
+    from .scene import REGION_MARGIN_MM
+    return REGION_MARGIN_MM
+
+
 def scene_transform(pose):
     """Camera -> world transform with the translation in mm (scene.py works in mm)."""
     out = pose.copy()
@@ -365,7 +381,8 @@ class Scanner:
     """
 
     def __init__(self, preset="small", log=print, clean_depth="merge", gate_refind=True, motion_dt=True,
-                 mode="still", track_with="joint", target="model", use_features=True, threaded_merge=True):
+                 mode="still", track_with="joint", target="model", use_features=True, threaded_merge=True,
+                 remove_base=True):
         try:
             from . import fuse  # Open3D: frame-to-frame ICP
         except ImportError:
@@ -420,12 +437,15 @@ class Scanner:
         self.last_t, self.motion_s, self.lost_run = None, None, 0  # time of the last tracked frame, of `motion`
         self.track_log = []  # per frame: (index, status, pose or None); for evaluation
         self.on_merge = None  # optional callback(index, world_xyz_mm, rgb, world_normals, pose)
+        self.remove_base = remove_base  # the saved/shown cloud leaves the base out (it is merged either way)
+        self.last_view = None  # (pixels, object mask, base mask, shape) of the last tracked frame, for the viewer
 
     def feed(self, frame, index=None):
         """Process one frame set ({'color', 'depth'}); returns True if it was merged into the cloud."""
         stats, fuse = self.stats, self.fuse
         index = stats["frames"] if index is None else index
         stats["frames"] += 1
+        self.last_view = None
         if self.clean_depth is True:  # track on cleaned depth as well
             frame = self.cleaned(frame)
         shape = frame["depth"].shape
@@ -509,10 +529,14 @@ class Scanner:
                 self.marker_map.add(marker_pts, self.pose)
             self.prev_feat = feat
         self.track_log.append((index, status, self.pose.copy()))
-        if scene.mode == "still":  # the object to merge: above the kept table plane, in its region
+        if scene.mode == "still":  # the object (above the kept base, in its region) and the base under it
             to_world = scene_transform(self.pose)  # (every tracked frame: the region grows per frame)
             scene.observe(all_xyz, all_pix, shape, to_world)
-            pix = all_pix[scene.object_mask(all_xyz, all_pix, shape, to_world)]
+            obj, base = scene.masks(all_xyz, all_pix, shape, to_world)
+            pix = all_pix[obj | base]
+            self.last_view = (all_pix, obj, base, shape)
+        else:
+            self.last_view = (all_pix, keep, np.zeros(len(keep), bool), shape)
         stats["plane_frames"] += scene.plane is not None
         self.since_merge = getattr(self, "since_merge", 0) + 1
         if self.last_merged is not None:
@@ -586,7 +610,8 @@ class Scanner:
         """A Scanner rebuilt from a saved session (keyframes, merged frames, scene), for Optimise."""
         directory = Path(directory)
         session = json.loads((directory / "session.json").read_text())
-        sc = cls(session.get("preset", "small"), log=log, mode=session.get("mode", "still"))
+        sc = cls(session.get("preset", "small"), log=log, mode=session.get("mode", "still"),
+                 remove_base=session.get("remove_base", True))
         kf = np.load(directory / "keyframes.npz")
         at = lambda name: kf[name + "_at"]
         for k, index in enumerate(kf["index"]):
@@ -656,8 +681,7 @@ class Scanner:
             return False
         if self.model_levels is None or self.stats["merged"] - self.model_at >= MODEL_EVERY:
             self.flush()  # the model must not depend on how far background merges have got (replays match)
-            with self.cloud_lock:
-                xyz, _, _ = self.cloud.points(min_seen=1)
+            xyz = self.model_points()
             if len(xyz) < 500:
                 return self.model_levels is not None
             self.model_levels, self.model_at = fuse.levels(xyz / 1000), self.stats["merged"]
@@ -729,8 +753,7 @@ class Scanner:
         if not len(self.cloud):
             return False
         if self.model_merged != self.stats["merged"]:
-            with self.cloud_lock:  # a background merge may be replacing the cloud's arrays
-                xyz, _, _ = self.cloud.points(min_seen=1)
+            xyz = self.model_points()  # (under the cloud lock: a background merge may replace its arrays)
             self.model, self.model_merged = self.fuse.levels(xyz / 1000), self.stats["merged"]
         result = self.fuse.icp(levels, self.model, self.pose)
         if result.fitness < RELOCK_FITNESS:
@@ -742,10 +765,53 @@ class Scanner:
         self.pose, self.motion, self.motion_s = result.transformation, np.eye(4), None
         return True
 
+    def model_points(self, min_seen=1):
+        """The cloud so far without its base: what tracking matches against (the object only, as it
+        was before the base was kept in the cloud)."""
+        with self.cloud_lock:
+            xyz, _, _ = self.cloud.points(min_seen)
+        scene = self.scene
+        if scene.mode == "still" and scene.plane is not None:
+            xyz = xyz[scene.height(xyz) > OBJECT_ABOVE_MM]
+        return xyz
+
+    def output_mask(self, xyz, connect=True):
+        """Which cubes (world centres, mm) are shown and saved: inside the object's region (the
+        cylinder on the base, or the ball when no base was found), above the base when remove_base,
+        and (`connect`) only what is connected to the object's core, which drops floating leftovers."""
+        scene, keep = self.scene, np.ones(len(xyz), bool)
+        if scene.mode != "still" or not len(xyz):
+            return keep
+        if scene.plane is not None and scene.axis is not None:
+            n, h = scene.plane[0], scene.height(xyz)
+            r = np.linalg.norm(xyz - np.outer((xyz - scene.axis) @ n, n) - scene.axis, axis=1)
+            keep = (r <= scene.radius) & (h <= scene.top) & (h > (OBJECT_ABOVE_MM if self.remove_base else -PLANE_TOL_MM))
+            core = keep & (h > OBJECT_ABOVE_MM) & (r <= max(scene.radius - scene_margin(), scene.radius / 2))
+        elif scene.ball is not None:
+            centre, radius, _ = scene.ball
+            d = np.linalg.norm(xyz - centre, axis=1)
+            keep, core = d <= radius, d <= radius / 2
+        else:
+            return keep
+        if connect and core.any() and keep.sum() > core.sum():
+            idx = np.nonzero(keep)[0]
+            piece = connected_piece(xyz[idx], core[idx], max(OUTPUT_CELL_MM, 3 * self.cloud.point_mm))
+            keep[idx[~piece]] = False
+        return keep
+
+    def output_cloud(self, connect=True):
+        """The cloud as shown and saved (see output_mask); the merged cloud itself is left whole."""
+        with self.cloud_lock:
+            cloud = self.cloud
+            if not len(cloud):
+                return cloud
+            return cloud.subset(self.output_mask(cloud.xyz / cloud.n[:, None], connect))
+
     def save(self, directory, min_seen=MIN_SEEN):
         self.flush()
         self.trim_table()
-        out = save(directory, self.cloud, self.poses, self.stats, self.preset, min_seen)
+        self.stats["remove_base"], self.stats["base_found"] = self.remove_base, self.scene.plane is not None
+        out = save(directory, self.output_cloud(), self.poses, self.stats, self.preset, min_seen)
         self.save_state(directory)
         return out
 
@@ -785,7 +851,8 @@ class Scanner:
         (directory / "scene.json").write_text(json.dumps(self.scene.state()))
 
     def trim_table(self):
-        """Drop cubes merged before the table plane was settled: on/below it or outside the region."""
+        """Drop cubes merged before the table plane was settled: below it or outside the region (the
+        base itself stays; output_mask leaves it out when remove_base)."""
         self.flush()
         scene = self.scene
         if scene.mode != "still" or scene.plane is None or scene.axis is None or not len(self.cloud):
@@ -794,18 +861,20 @@ class Scanner:
         n = scene.plane[0]
         h = scene.height(c)
         flat = c - np.outer((c - scene.axis) @ n, n)
-        keep = (h > OBJECT_ABOVE_MM) & (np.linalg.norm(flat - scene.axis, axis=1) <= scene.radius)
-        self.cloud.keep(keep)
+        keep = (h > -PLANE_TOL_MM) & (np.linalg.norm(flat - scene.axis, axis=1) <= scene.radius)
+        with self.cloud_lock:
+            self.cloud.keep(keep)
 
 
-def scan(directory, preset="small", log=print):
-    """Merge a recording into a VoxelCloud. Returns (cloud, poses, stats)."""
-    scanner = Scanner(preset, log)
+def scan(directory, preset="small", log=print, remove_base=True):
+    """Merge a recording; returns the Scanner (its cloud, poses and stats; save() writes the result)."""
+    scanner = Scanner(preset, log, remove_base=remove_base)
     for i, frame in enumerate(fr.read_recording(directory)):
         if scanner.feed(frame, i) and scanner.stats["merged"] % 10 == 1:
             log(f"frame {i:4d}: merged {scanner.stats['merged']:3d}, cubes {len(scanner.cloud):7d}, "
                 f"raw points so far {scanner.cloud.raw_points:9d}")
-    return scanner.cloud, scanner.poses, scanner.stats
+    scanner.flush()
+    return scanner
 
 
 def ply_arrays(cloud, poses, min_seen=MIN_SEEN):
@@ -842,16 +911,19 @@ def save(directory, cloud, poses, stats, preset, min_seen=MIN_SEEN):
 
 def main():
     directory = Path(sys.argv[1])
-    preset = sys.argv[2] if len(sys.argv) > 2 else "small"
+    args = [a for a in sys.argv[2:] if not a.startswith("--")]
+    preset = args[0] if args else "small"
     t0 = time.time()
-    cloud, poses, stats = scan(directory, preset)
+    scanner = scan(directory, preset, remove_base="--keep-base" not in sys.argv)
     out_dir = directory.parent / (directory.name.removesuffix("-rec") + "-scan")
-    out, kept = save(out_dir, cloud, poses, stats, preset)
+    out, kept = scanner.save(out_dir)
+    cloud, stats = scanner.cloud, scanner.stats
     raw_mb = cloud.raw_points * 15 / 1e6  # float32 xyz + rgb per raw point
+    base = ("base found, " + ("removed" if scanner.remove_base else "kept")) if stats["base_found"] else "no base found"
     print(f"{stats['frames']} frames, {stats['merged']} merged, {stats['lost']} lost or skipped, "
-          f"support plane in {stats['plane_frames']}")
+          f"support plane in {stats['plane_frames']}; {base}")
     print(f"raw points {cloud.raw_points} (~{raw_mb:.0f} MB) -> {len(cloud)} cubes at {cloud.point_mm} mm "
-          f"-> {kept} kept (seen >= {MIN_SEEN}), {out.stat().st_size / 1e6:.1f} MB, {time.time() - t0:.0f} s")
+          f"-> {kept} kept (seen >= {MIN_SEEN}, object only), {out.stat().st_size / 1e6:.1f} MB, {time.time() - t0:.0f} s")
     print(f"-> {out}")
 
 

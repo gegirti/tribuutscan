@@ -92,11 +92,12 @@ is simply getting colour, IR and depth out of the scanner on Linux.
 - Merged clouds (`cloud.py`): each cube of side "point distance" (0.5/1/2 mm presets) keeps one
   averaged point, and a cube must be seen in 3 frames. The kettle recording went from 7.2M raw
   points to 149k kept (4.3 MB) at 0.5 mm, and 32k at 1 mm. With depth noise ~1 mm (estimate), the
-  count still creeps up at 0.5 mm and flattens at 1 mm. The table/turntable is removed only if a
-  plane holds 10% of the points, the object stands on the scanner's side of it, it is not seen
-  edge-on, it reaches the image edge, and it covers 80 cm2. Without those rules the kettle's lid and
-  a slice through its handle were taken for tables. Without Open3D there is no tracking, and
-  every frame is merged unmoved (smeared).
+  count still creeps up at 0.5 mm and flattens at 1 mm. Tracking's per-frame table test
+  (`isolate_mask`) takes a plane only if it holds 10% of the points, the object stands on the
+  scanner's side of it, it is not seen edge-on, it reaches the image edge, and it covers 80 cm2.
+  Without those rules the kettle's lid and a slice through its handle were taken for tables. The
+  base kept for merging and output is found differently (see "Object separation"). Without Open3D
+  there is no tracking, and every frame is merged unmoved (smeared).
 - Live scan (`livescan.py`): a spawned worker using the `.venv` Python. It merges frames
   (`cloud.Scanner`) and serves the 3D page; the viewer only sends a frame when the worker is
   free. Two pitfalls hit:
@@ -252,8 +253,8 @@ python3 -m tribuutscan.measure [cm]         # flat target: plane RMS, noise, ste
 python3 -m tribuutscan.usbdepth [s] [--all] # 14-bit USB depth throughput check (--all: + colour, IR)
                                             # TRIBUUTSCAN_DEPTH=y10 forces 10-bit V4L2 depth anywhere
 python3 -m tribuutscan.markers captures/<stamp>   # find markers in a saved frame -> markers.png
-.venv/bin/python -m tribuutscan.cloud captures/<stamp>-rec [small|medium|large]
-                                            # merged point cloud -> captures/<stamp>-scan/
+.venv/bin/python -m tribuutscan.cloud captures/<stamp>-rec [small|medium|large] [--keep-base]
+                                            # merged point cloud -> captures/<stamp>-scan/ (base removed)
 python3 -m tribuutscan.view3d captures/<stamp>-scan    # browser 3D view at http://localhost:8765
 .venv/bin/python -m tribuutscan.optimise captures/<stamp>-scan   # loop closures + pose graph + merge again
 .venv/bin/python -m tribuutscan.session merge A-scan B-scan AB-scan   # merge two scans into one
@@ -374,7 +375,7 @@ P5 (live):
 - Final against the first version: tilt 60% -> 1.1% doubled; face 13 -> 0 jumps; synthetic ATE
   1.2 / 1.3 / 0.94 mm (was 4.0 / 1.7 / 6.0).
 P6 (`optimise.py`, runs automatically after Stop; Process menu: Optimise again, Merge again at
-0.5/1/2 mm, Make mesh):
+0.5/1/2 mm, Make mesh, and since 2026-11-01 Remove base / Keep base):
 - Loop candidates come from shared markers, ORB matches or nearby poses, at most 3 per keyframe and
   at least 10 keyframes apart. Each is checked with `track.solve`. Then an Open3D pose graph
   (preference_loop_closure 2.0 kept a true loop and pruned a 30 mm false one; 1.0 pruned both),
@@ -443,16 +444,55 @@ plane fitted to the ring around the dot is flat to about 0.3 mm.
 
 captures/reference/part/mesh.ply is CrealityScan's final mesh of the marker test part (Android app,
 4 scans merged, 2026-10-30; mm; ~274 x 192 x 44 mm), the same part as captures/20261030-194411-scan.
-It is a scan too, not ground truth. compare.py on the marker scan:
-- our cloud covers 54% of the reference surface within 2 mm (one side; still mode); 76% of our points
-  lie on the part
-- distance to the reference: median 0.77 mm, p90 3.4 mm, growing from the middle to the rim:
-  0.24 / 0.37 / 1.25 / 2.85 mm at 0-30 / 30-60 / 60-90 / 90-120 mm from the centre
-- a free scale fits at 0.970 (ours 3% larger) but barely helps (median 0.75 mm), so it is mostly shape
-- single raw frames refit alone show the same rim error by image radius, BUT a full frame of flat taped
-  paper at 30 cm is flat to +-0.15 mm (median) from the image centre to the edge, so the camera model
-  is not bowing frames. Open: steep sides / part edges at the image edge, or the reference itself.
-  A caliper measurement of the part would settle the size question.
+It is a scan too, not ground truth.
+- First reading (2026-10-31, old code): 76% of our points on the part, median 0.77 mm, p90 3.4 mm,
+  error "growing towards the rim", a free scale fitting at 0.970.
+- CORRECTED 2026-11-01: that rim error was table points around the part's outline counted as part
+  (the table was never removed on that scan), plus an alignment pulled by background. With the base
+  found and left out, the same recording gives median 0.22 mm and p90 0.53 mm (see "Object
+  separation"). Frames are flat too: a full frame of taped paper at 30 cm is flat to +-0.15 mm from
+  the image centre to the edge. The scale question waits for the printed test box.
+- compare.py's alignment (FPFH + RANSAC from 5 seeds) varies between point sets. For before/after
+  comparisons use more seeds (`compare.SEEDS = 12`), and the same transform for clouds that share
+  tracking.
+
+## Object separation (2026-11-01)
+
+The marker scan never found its table (plane_frames 0). The part filled the view, so the table was
+only 7-9% of the points, under tracking's 10% / 80 cm2. Every frame then fell back to the per-frame
+centre piece, and the table connected the part to its surroundings.
+- `scene.py` finds the base with its own rules: share 3%, 30 cm2, up to 5 planes per frame, votes
+  over the first 300 frames.
+- `stands_on`: the centre object must come within 10 mm of the plane (a wall behind it does not),
+  and at most half the plane may lie inside the object's outline seen along the normal (the
+  object's own flat sides do).
+- Three votes must agree in world coordinates.
+- Merging takes the object and the base inside its cylinder (`Scene.masks`). The tracking model and
+  relock use object-only points (`Scanner.model_points`), so tracking's target is what it was.
+- Output (`Scanner.output_mask` / `output_cloud`, used by save, live view, download, mesh and
+  evaluate): inside the cylinder, the base left out when `remove_base` (viewer Scan panel checkbox,
+  default on; the 3D page's Process "Remove base" / "Keep base" re-saves), and only what is connected
+  to the object core over 3 mm cells.
+- With no base found, the object is the centre piece inside a ball that grows to at most 2x its start.
+- Marker recording replayed (cloud.py), scored against Creality's mesh with a stable alignment:
+
+  | | before | after, base kept | after, base removed |
+  |---|---|---|---|
+  | points on the part | 79.9% | 86.5% | 92.2% |
+  | median / p90 distance | 0.69 / 3.12 mm | 0.22 / 0.53 mm | 0.22 / 0.53 mm |
+  | Creality surface covered within 1 / 2 mm | 47 / 58% | 71 / 75% | 68 / 72% |
+
+  Base found in 577 of 581 frames (from frame 4). The remaining 7.8% are the stand the part rests on.
+  It touches the part, so geometry cannot tell it apart: a crop in the 3D view is the way (TODO).
+- evaluate.py before/after: tracking identical or better, no lost frames or jumps, synthetic ATE
+  1.19/1.29/0.94 -> 1.17/1.28/0.87 mm. The marker scan is 361 -> 234 ms per frame: merging no longer
+  repeats the per-frame object search.
+- Live: the worker returns each frame's object mask at 1/8 size (`livescan.view_mask`). The viewer's
+  depth preview dims all but the object and tints a kept base. Checked on recorded frames (base from
+  frame 4: ~4000 object and ~500 base cells of 16000). Not yet seen live, because nothing was in range.
+- `cloud.py` now saves through the Scanner (output filter, session.json "remove_base" /
+  "base_found", saved state); `--keep-base` keeps the base. Careful: it writes next to the
+  recording. Replay a scan's own -rec through a symlink elsewhere, or it overwrites that scan.
 
 ## Pitfalls already hit
 

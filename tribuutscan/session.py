@@ -57,8 +57,7 @@ def refind(scanner, xyz_cam, marker_pts, levels):
         found = scanner.marker_map.match_global(marker_pts)
         if found is not None:
             starts.append(found)
-    with scanner.cloud_lock:
-        model, _, _ = scanner.cloud.points(min_seen=2)
+    model = scanner.model_points(min_seen=2)  # the object, without its base (takes the cloud lock itself)
     found = shape_pose(xyz_cam, model)
     if found is not None:
         starts.append(found)
@@ -80,8 +79,7 @@ def merge(dir_a, dir_b, out, log=print):
         found = a.marker_map.match_global(b.marker_map.pos[np.argsort(-b.marker_map.count)])  # best first
         if found is not None:
             t = found
-    pa, _, _ = a.cloud.points(min_seen=2)
-    pb, _, _ = b.cloud.points(min_seen=2)
+    pa, pb = a.model_points(min_seen=2), b.model_points(min_seen=2)  # the objects, without their bases
     if t is None:
         t = shape_pose(pb, pa)
     if t is None:

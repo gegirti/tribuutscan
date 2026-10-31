@@ -116,3 +116,76 @@ def test_scene_keeps_the_table_once_found():
     spix = np.c_[small[:, 0] * f / small[:, 2] + w / 2, small[:, 1] * f / small[:, 2] + h / 2]
     obj = scene.object_mask(small, spix, (h, w), np.eye(4))
     assert not obj[:300].any() and obj[300:].mean() > 0.9  # the table strip is gone, the box stays
+
+
+def big_object_on_a_rim_of_table():
+    """Camera looks down +z at a box top (z = 255 mm) that fills the view but for a thin strip of table
+    (z = 300) at the left and right edges (about 5% of the points), with the box's walls reaching down."""
+    f, w, h = 1000.0, 1280, 800
+    v, u = np.mgrid[0:h:8, 0:w:8]
+    ray = np.stack([(u.ravel() - w / 2) / f, (v.ravel() - h / 2) / f, np.ones(u.size)], 1)
+    top = ray * 255.0
+    on_box = (np.abs(top[:, 0]) <= 155) & (np.abs(top[:, 1]) <= 100)
+    xyz = np.where(on_box[:, None], top, ray * 300.0)
+    yy, zz = np.meshgrid(np.arange(-100, 101, 2.0), np.arange(257, 298, 2.0))
+    walls = np.concatenate([np.c_[np.full(yy.size, sx), yy.ravel(), zz.ravel()] for sx in (-155.0, 155.0)])
+    xyz = np.concatenate([xyz, walls])
+    pix = np.c_[xyz[:, 0] * f / xyz[:, 2] + w / 2, xyz[:, 1] * f / xyz[:, 2] + h / 2]
+    return xyz, pix, (h, w)
+
+
+def test_base_is_found_under_an_object_that_fills_the_view():
+    from tribuutscan.scene import Scene
+    rng = np.random.default_rng(9)
+    xyz, pix, shape = big_object_on_a_rim_of_table()
+    table = np.abs(xyz[:, 2] - 300) < 1
+    assert 0.03 < table.mean() < 0.08  # a thin rim, like the marker part on the desk (7-9%)
+    assert cl.support_plane(xyz, rng, pix, shape) is None  # tracking's per-frame test: too little table
+    scene = Scene("still", rng)
+    for _ in range(3):
+        scene.observe(xyz, pix, shape, np.eye(4))
+    assert scene.plane is not None and abs(abs(scene.plane[1]) - 300) < 3  # the table, not the box top
+
+
+def test_a_wall_behind_the_object_is_not_its_base():
+    from tribuutscan.scene import Scene
+    rng = np.random.default_rng(10)
+    # a wall at z = 400 mm fills the view; a box floats in front of it (no table), 120 mm away
+    wall = np.c_[rng.uniform(-300, 300, (20000, 2)), np.full(20000, 400.0)]
+    box = np.c_[rng.uniform(-40, 40, (6000, 2)), np.full(6000, 250.0)]
+    side = np.c_[np.full(2000, 40.0), rng.uniform(-40, 40, 2000), rng.uniform(250, 280, 2000)]
+    xyz = np.concatenate([wall, box, side])
+    f, w, h = 1000.0, 1280, 800
+    pix = np.c_[xyz[:, 0] * f / xyz[:, 2] + w / 2, xyz[:, 1] * f / xyz[:, 2] + h / 2]
+    assert cl.support_plane(xyz, rng, pix, (h, w)) is not None  # without the contact rule: taken
+    scene = Scene("still", rng)
+    for _ in range(4):
+        scene.observe(xyz, pix, (h, w), np.eye(4))
+    assert scene.plane is None
+
+
+def test_output_leaves_out_base_background_and_floating_bits():
+    s = cl.Scanner("small", log=lambda m: None)
+    s.scene.plane, s.scene.axis = (np.array([0.0, 0.0, 1.0]), 0.0), np.zeros(3)  # world: base at z = 0
+    s.scene.radius, s.scene.top = 60.0, 100.0
+    g = np.arange(-60, 61, 1.5)
+    gx, gy = np.meshgrid(g, g)
+    disc = np.c_[gx.ravel(), gy.ravel(), np.zeros(gx.size)]
+    base = disc[np.hypot(disc[:, 0], disc[:, 1]) <= 55]  # the base under and around the object
+    t, zz = np.meshgrid(np.linspace(0, 2 * np.pi, 120), np.arange(4.0, 50.0, 1.5))
+    obj = np.c_[25 * np.cos(t.ravel()), 25 * np.sin(t.ravel()), zz.ravel()]  # a can on the base
+    fx, fy = np.meshgrid(np.arange(-3, 4, 1.5), np.arange(-3, 4, 1.5))
+    floater = np.c_[fx.ravel() + 45, fy.ravel(), np.full(fx.size, 80.0)]  # inside the region, not connected
+    table = np.c_[rng_ring := np.linspace(100, 200, 50), np.zeros(50), np.zeros(50)]  # base outside the region
+    other = np.c_[np.full(30, 150.0), np.zeros(30), np.linspace(10, 40, 30)]  # another object, outside
+    parts = {"base": base, "obj": obj, "floater": floater, "table": table, "other": other}
+    s.cloud.add(np.concatenate(list(parts.values())), np.zeros((sum(map(len, parts.values())), 3), np.uint8))
+    centre = s.cloud.xyz / s.cloud.n[:, None]
+    kind = lambda p: ("obj" if p[2] > 3 and np.hypot(p[0], p[1]) < 30 and p[2] < 60 else "floater" if p[2] > 60 else
+                      "base" if np.hypot(p[0], p[1]) <= 56 else "far")
+    kinds = np.array([kind(p) for p in centre])
+    for remove, wanted in ((True, {"obj"}), (False, {"obj", "base"})):
+        s.remove_base = remove
+        keep = s.output_mask(centre)
+        assert set(kinds[keep]) == wanted, (remove, set(kinds[keep]))
+        assert keep[kinds == "obj"].all()

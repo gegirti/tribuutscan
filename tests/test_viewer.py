@@ -29,3 +29,26 @@ def test_open_app_asks_to_retry_until_the_scanner_opens():
         assert viewer.open_app("root", ask=lambda title, text, parent: False) is None and len(tries) == 1  # gave up
     finally:
         viewer.App = real
+
+
+def test_depth_preview_dims_all_but_the_object():
+    import time
+    from tribuutscan.depth import encode_y10
+
+    class Cap:
+        width, height, bytesperline = 1280, 800, 1600
+
+    buf = encode_y10(np.full((800, 1280), 400, np.uint16))
+    as_array = lambda ppm: np.frombuffer(ppm.split(b"\n", 1)[1], np.uint8).reshape(500, 800, 3).astype(int)
+    plain = as_array(viewer.render_depth(Cap, buf)[0])
+    mask = np.zeros((100, 160), np.uint8)
+    mask[:, :80] = 2  # object on the left, base top right, the rest bottom right
+    mask[:50, 80:] = 1
+    try:
+        viewer.scan_view.update(mask=mask, t=time.monotonic(), keep_base=True)
+        shaded = as_array(viewer.render_depth(Cap, buf)[0])
+    finally:
+        viewer.scan_view.update(mask=None)
+    assert (shaded[:, :400] == plain[:, :400]).all()  # object unchanged
+    assert (shaded[300:, 450:] == plain[300:, 450:] // 4).all()  # other dimmed
+    assert (shaded[:200, 450:] == plain[:200, 450:] // 2 + viewer.BASE_TINT).all()  # kept base tinted

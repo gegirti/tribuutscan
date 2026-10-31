@@ -37,7 +37,8 @@ The limits, honestly:
   an estimate until that mode is calibrated (checked once: 50 cm read as 49.3 cm).
 - **Tracking runs at 3-7 frames per second** (Python on the CPU), so move slowly. Plain objects
   without markers lose tracking easily: a cardboard box at 27-31 cm tracked only 138 of 353 frames.
-- **Background within range gets merged** into the scan; only the table is removed.
+- **Something touching the object** (the stand it rests on, a cable) stays in the scan. The table
+  under it and everything around it are left out, and *Remove base* decides about the base.
 
 ## Quick start
 
@@ -69,10 +70,13 @@ right: Scanner, Capture, Scan, IMU and View.
 
 - **Start scan (c)**: stay 18-30 cm from the object (the guide line under the images shows it),
   move slowly, keep markers in view. **Stop scan (c)** saves `captures/<stamp>-scan/cloud.ply` and
-  runs Optimise. Tick *keep raw frames* to keep the frames the scan used, for replays.
+  runs Optimise. *Remove base* (on by default) leaves the table under the object out of the result.
+  While scanning, the depth view dims everything that is not the object. Tick *keep raw frames* to
+  keep the frames the scan used, for replays.
   *Continue last* goes on with the last saved scan.
 - **Open 3D view**: the scan in the browser. *Process* has Optimise again, merge again at
-  0.5 / 1 / 2 mm point distance, and Make mesh; *Export* downloads `cloud.ply` and `mesh.ply`.
+  0.5 / 1 / 2 mm point distance, Make mesh, and Remove base / Keep base; *Export* downloads
+  `cloud.ply` and `mesh.ply`.
 - **Save frame (s)** writes one colour + IR + depth set (and a `cloud.ply`) to `captures/<stamp>/`.
   **Record (r)** writes raw sets, about 10 a second (about 49 MB/s), plus the IMU's samples
   (`imu.csv`, 200 a second), for processing later;
@@ -243,10 +247,11 @@ The IR projector turns on by itself when the IR stream is opened.
 
 Next up:
 
-- [ ] **Object separation** (in progress): recognise the object in front once, keep a 3D box around
-      it on its base, crop every frame to it, and an option to remove the base from the result.
+- [ ] **Crop in the 3D view**: for what touches the object (a stand, a cable), which object
+      separation keeps.
 - [ ] **Speed** (measured on the marker scan: 247 ms per frame, about 4 fps):
-  - [ ] the per-frame object search (about 57 ms), which object separation replaces
+  - [x] the per-frame object search during merging (object separation: 361 -> 234 ms per frame
+        in evaluate.py on the marker scan); tracking still runs its own
   - [ ] lens-model lookups instead of per-point maths (about 20 ms)
   - [ ] fewer Open3D fit checks per frame (about 12 calls, 17 ms)
   - [ ] ORB features on every second frame (about 8 ms)
@@ -265,6 +270,9 @@ Done:
 - [x] **Depth modes** through Orbbec's command channel: close (15-33 cm) and long range (about
       20-72 cm). The scanner turned out to be active stereo with two IR cameras 75 mm apart.
 - [x] **IMU** readout (200 Hz), and **viewer v2** with folding panels.
+- [x] **Object separation**: the base found even when the object fills the view, the object kept in a
+      region on it, the base removable. On the marker part: 80% -> 92% of the points on the part,
+      median distance to Creality's scan 0.69 -> 0.22 mm.
 
 - [x] **Calibration**: depth law, both cameras, colour-to-depth registration, from a printed board.
 - [x] **Live scanning**: tracking (shape + markers + image features), merged cloud, Optimise with

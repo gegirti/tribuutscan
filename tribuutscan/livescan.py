@@ -4,11 +4,13 @@ The viewer starts it with the .venv Python when there is one (so ICP tracking wo
 to it over two queues. The worker also serves the browser 3D view of the growing cloud
 (view3d page), so cloud data never passes back through the viewer.
 
-Commands:  ("start", preset, out_dir, keep_raw, continue_from or None, depth mode name)
+Commands:  ("start", preset, out_dir, keep_raw, continue_from or None, depth mode name, remove_base)
            | ("frame", yuyv, grey, depth_buf, bytesperline, (t_colour, t_ir, t_depth))
            | ("stop",) | ("quit",)   (times: camera capture times, seconds)
-Replies:   ("ready", url) | ("log", text) | ("frame_done", merged, frames, points, tracking, cue) | ("saved", path, points)
-           cue: {"markers": used, "features": ORB start, "flat": shape alone slides}
+Replies:   ("ready", url) | ("log", text) | ("frame_done", merged, frames, points, tracking, cue, view)
+           | ("saved", path, points)
+           cue: {"markers": used, "features": ORB start, "flat": shape alone slides, "base": base found}
+           view: what the frame was, at 1/VIEW_STEP of its size (uint8: 0 other, 1 base, 2 object), or None
 
 With keep_raw, the frames the worker processed are also written to out_dir/<stamp>-rec/ (the
 viewer's recording format), so a scan can be replayed offline with cloud.py for debugging.
@@ -33,6 +35,20 @@ from .depth import decode_depth
 
 PAYLOAD_EVERY_S = 0.5  # rebuild the page's cloud at most this often
 LIVE_MIN_SEEN = 1  # the page shows every cube while scanning; the saved cloud uses cloud.MIN_SEEN
+VIEW_STEP = 8  # the frame's object mask goes back to the viewer at 1/8 of its size (160 x 100)
+
+
+def view_mask(view, step=VIEW_STEP):
+    """What a frame's pixels were, from Scanner.last_view: uint8 at 1/step size, 0 other (background,
+    or not seen), 1 base, 2 object; None if the frame was not tracked."""
+    if view is None:
+        return None
+    pix, obj, base, shape = view
+    out = np.zeros((shape[0] // step, shape[1] // step), np.uint8)
+    for value, mask in ((1, base), (2, obj)):
+        p = pix[mask] // step
+        out[np.minimum(p[:, 1], out.shape[0] - 1), np.minimum(p[:, 0], out.shape[1] - 1)] = value
+    return out
 
 
 class LiveSource:
@@ -52,8 +68,7 @@ class LiveSource:
             key = (self.scan_id, s.stats["merged"], s.stats["tracking"], s.cue.get("flat"), self.phase,
                    id(s.cloud), s.cloud.point_mm)
             if key != self.built_key and time.time() - self.built_at >= PAYLOAD_EVERY_S:
-                with s.cloud_lock:
-                    xyz, rgb, seen = s.cloud.points(LIVE_MIN_SEEN)
+                xyz, rgb, seen = s.output_cloud(connect=False).points(LIVE_MIN_SEEN)  # region, base as chosen
                 payload = view3d.pack_arrays(xyz @ cl.FLIP.T / 1000, rgb, seen)
                 info = {"name": self.name, "points": len(xyz), "phase": self.phase,
                         "mesh": bool(self.out_dir and (self.out_dir / "mesh.ply").exists()), "session": {
@@ -90,8 +105,7 @@ class LiveSource:
             s = self.scanner
             if s is None:
                 return None
-            with s.cloud_lock:
-                xyz, rgb, normals, seen, _ = cl.ply_arrays(s.cloud, list(s.poses))
+            xyz, rgb, normals, seen, _ = cl.ply_arrays(s.output_cloud(), list(s.poses))
         buf = io.BytesIO()
         pc.write_ply(buf, xyz, rgb, normals=normals, seen=seen)
         return buf.getvalue()
@@ -135,16 +149,17 @@ def run(commands, replies, port=view3d.PORT):
         timing["wait"] += time.perf_counter() - t_wait
         if kind == "start":
             timing = {k: 0 for k in timing}
-            _, preset, out_dir, keep_raw, continue_from, depth_mode = cmd
+            _, preset, out_dir, keep_raw, continue_from, depth_mode, remove_base = cmd
             calib.use_mode(depth_mode)  # the law of the scanner's mode, before any frame is turned into points
             recorder = None
             log = lambda m: replies.put(("log", m))
             with source.lock:
                 if continue_from:  # go on with a saved scan: it re-finds its place, then merges into it
                     source.scanner = cl.Scanner.continue_from(continue_from, log=log)
+                    source.scanner.remove_base = remove_base
                     log(f"continuing {Path(continue_from).name}: show the scanner a part it has seen")
                 else:
-                    source.scanner = cl.Scanner(preset, log=log)
+                    source.scanner = cl.Scanner(preset, log=log, remove_base=remove_base)
                 source.scan_id += 1
                 source.name = f"live: {out_dir.name}"
                 source.phase, source.out_dir = "scanning", out_dir
@@ -168,7 +183,8 @@ def run(commands, replies, port=view3d.PORT):
             timing["decode"] += t2 - t1
             timing["feed"] += time.perf_counter() - t2
             timing["frames"] += 1
-            replies.put(("frame_done", s.stats["merged"], s.stats["frames"], points, s.stats["tracking"], dict(s.cue)))
+            replies.put(("frame_done", s.stats["merged"], s.stats["frames"], points, s.stats["tracking"],
+                         dict(s.cue, base=s.scene.plane is not None), view_mask(s.last_view)))
         elif kind == "frame":
             replies.put(("frame_done", 0, 0, 0))
         elif kind == "stop" and source.scanner is not None:

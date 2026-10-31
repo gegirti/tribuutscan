@@ -2,8 +2,9 @@
 
 Modes:
   still      the object stands still on a table and the scanner moves (default, like Creality's
-             handheld mode). The table plane is found once (it must agree in 3 of the first 5
-             frames) and kept in WORLD coordinates; each frame re-fits it near its kept place.
+             handheld mode). The base (table) plane is found once and kept in WORLD coordinates (3
+             frames must agree, looked for during the first VOTE_LIMIT frames, and the object at the
+             image centre must stand on it); each frame re-fits it near its kept place.
   turntable  the scanner stays still and the object turns (turntable or by hand on the table).
              The plane is found once and kept in CAMERA coordinates; only the object is tracked.
   free       no support plane assumed (an object held in the hand): each frame keeps the piece at
@@ -12,14 +13,26 @@ Modes:
 The object is everything more than OBJECT_ABOVE_MM above the plane that lies inside a cylinder
 around the object (its starting footprint + REGION_MARGIN_MM) or is connected to what does. The
 cylinder grows as new parts of the object come into view, but only by REGION_GROW_MM per frame, so
-a neighbouring object touching it is not swallowed at once.
+a neighbouring object touching it is not swallowed at once. The base is the plane's points inside the
+cylinder: merged too, so "remove base" can be decided when the cloud is saved (cloud.Scanner).
+
+Until a base is found (or never, e.g. an object held in the hand) the object is each frame's centre
+piece inside a ball around the first one, which grows slowly and at most to BALL_MAX times its start.
 """
 import numpy as np
 
 from . import cloud as cl
 
 MODES = ("still", "turntable", "free")
-VOTE_FRAMES, VOTES_NEEDED = 5, 3  # the plane must be found in 3 of the first 5 frames
+VOTE_FRAMES, VOTES_NEEDED = 5, 3  # 3 votes must agree; found after VOTE_FRAMES frames counts as late
+VOTE_LIMIT = 300  # frames to keep looking for the base
+# The base may be a thin rim around an object that fills the view: on the marker part the table was
+# 7-9% of the points and 55-151 cm2, under the 10% / 80 cm2 that tracking's per-frame plane test uses.
+# Votes must agree in world coordinates, which a slice through a curved surface does not do.
+BASE_MIN_SHARE, BASE_MIN_CM2, BASE_TRIES = 0.03, 30.0, 5
+CONTACT_MM = 10.0  # the object at the image centre must come this close to a plane for it to be its base
+FOOTPRINT_CELL_MM, MAX_UNDER = 5.0, 0.5  # ...and at most half the plane may lie inside the object's outline
+BALL_MAX = 2.0
 SAME_PLANE_DEG, SAME_PLANE_MM = 5.0, 5.0
 OBJECT_ABOVE_MM = 3.0
 REGION_MARGIN_MM, REGION_GROW_MM = 20.0, 15.0
@@ -41,6 +54,27 @@ def mm_transform(pose):
     return out
 
 
+def stands_on(xyz, pix, shape, n, c):
+    """Does the object at the image centre stand on plane (n, c)? Its centre piece above the plane must
+    come within CONTACT_MM of it (a table under the object does, a wall behind it does not), and the
+    plane's points must lie AROUND the object's outline seen along the normal, not inside it: under the
+    object a table is hidden, while one of the object's own flat sides lies within its outline."""
+    h = xyz @ n + c
+    idx = np.nonzero(h > OBJECT_ABOVE_MM)[0]
+    if len(idx) < 50:
+        return False
+    piece = cl.centre_piece(xyz[idx], pix[idx], shape)
+    if not piece.any() or h[idx][piece].min() >= CONTACT_MM:
+        return False
+    a = np.cross(n, [1.0, 0, 0] if abs(n[0]) < 0.9 else [0, 1.0, 0])
+    a /= np.linalg.norm(a)
+    cells = lambda p: np.unique(np.floor(np.c_[p @ a, p @ np.cross(n, a)] / FOOTPRINT_CELL_MM).astype(np.int64)
+                                @ np.array([1, 1_000_003], np.int64))
+    outline = cells(xyz[idx][piece])
+    on = cells(xyz[np.abs(h) < cl.PLANE_TOL_MM])
+    return bool(len(on) and np.isin(on, outline).mean() <= MAX_UNDER)
+
+
 class Scene:
     """Keeps the support plane and the object's region for one scan."""
 
@@ -51,14 +85,16 @@ class Scene:
         self.plane = None  # (n, c): n points up out of the table, in the region frame
         self.votes, self.seen_frames = [], 0
         self.axis, self.radius, self.top = None, None, None  # object cylinder, region frame (mm)
+        self.ball = None  # (centre, radius, start radius) while no base is known, region frame (mm)
         self.late_plane = False  # the plane was settled after objects had been merged
 
     def observe(self, xyz_cam, pix, shape, cam_to_region):
         """Vote for a support plane during the first frames. cam_to_region: 4x4, mm."""
-        if self.mode == "free" or self.plane is not None or self.seen_frames >= VOTE_FRAMES + 20:
+        if self.mode == "free" or self.plane is not None or self.seen_frames >= VOTE_LIMIT:
             return
         self.seen_frames += 1
-        found = cl.support_plane(xyz_cam, self.rng, pix, shape)
+        found = cl.support_plane(xyz_cam, self.rng, pix, shape, tries=BASE_TRIES, min_share=BASE_MIN_SHARE,
+                                 min_cm2=BASE_MIN_CM2, accept=lambda n, c: stands_on(xyz_cam, pix, shape, n, c))
         if found is None:
             return
         self.votes.append(plane_to(found, cam_to_region))
@@ -93,15 +129,22 @@ class Scene:
         return n, c
 
     def object_mask(self, xyz_cam, pix, shape, cam_to_region):
-        """Which points (camera coordinates) are the object. Without a plane: the piece at the centre."""
+        """Which points (camera coordinates) are the object (see `masks`)."""
+        return self.masks(xyz_cam, pix, shape, cam_to_region)[0]
+
+    def masks(self, xyz_cam, pix, shape, cam_to_region):
+        """(object, base) masks of the points (camera coordinates). The base is the plane's points
+        inside the object's cylinder; empty while no plane is known (then the object is the centre
+        piece inside the ball)."""
+        mask = np.zeros(len(xyz_cam), bool)
         if self.plane is None:
-            return cl.isolate_mask(xyz_cam, pix, shape, self.rng)[0]
+            return self._ball_mask(xyz_cam, pix, shape, cam_to_region), mask.copy()
         n, c = self.plane_in_camera(xyz_cam, cam_to_region)
         h = xyz_cam @ n + c
         above = h > OBJECT_ABOVE_MM
-        mask = np.zeros(len(xyz_cam), bool)
+        base = np.zeros(len(xyz_cam), bool)
         if not above.any():
-            return mask
+            return mask, base
         idx = np.nonzero(above)[0]
         pts = xyz_cam[idx]
         to_cam = np.linalg.inv(cam_to_region)
@@ -119,19 +162,46 @@ class Scene:
             self.radius = min(max(self.radius, reach), self.radius + REGION_GROW_MM)
             self.top = min(max(self.top, h[idx][piece].max() + REGION_MARGIN_MM), self.top + REGION_GROW_MM)
         mask[idx[piece]] = True
-        return mask
+        near = np.nonzero((h > -cl.PLANE_TOL_MM) & ~above)[0]  # the base under and around the object
+        flat_near = xyz_cam[near] - np.outer((xyz_cam[near] - axis) @ n, n)
+        base[near[np.linalg.norm(flat_near - axis, axis=1) <= self.radius]] = True
+        return mask, base
+
+    def _ball_mask(self, xyz_cam, pix, shape, cam_to_region):
+        """No base known: the frame's centre piece (cl.isolate_mask), kept inside a ball around the
+        first one; the ball grows by REGION_GROW_MM per frame toward what is kept, up to BALL_MAX."""
+        keep = cl.isolate_mask(xyz_cam, pix, shape, self.rng)[0]
+        if self.mode != "still" or not keep.any():
+            return keep
+        idx = np.nonzero(keep)[0]
+        world = xyz_cam[idx] @ cam_to_region[:3, :3].T + cam_to_region[:3, 3]
+        if self.ball is None:
+            centre = world.mean(0)
+            r0 = float(np.linalg.norm(world - centre, axis=1).max()) + REGION_MARGIN_MM
+            self.ball = (centre, r0, r0)
+        centre, radius, r0 = self.ball
+        d = np.linalg.norm(world - centre, axis=1)
+        inside = d <= radius
+        if inside.any():
+            grown = min(max(radius, d[inside].max() + REGION_MARGIN_MM), radius + REGION_GROW_MM, BALL_MAX * r0)
+            self.ball = (centre, grown, r0)
+        keep[idx[~inside]] = False
+        return keep
 
     def state(self):
         """The kept plane and region, as plain JSON values."""
         listed = lambda v: None if v is None else np.asarray(v).tolist()
         return {"mode": self.mode, "plane": None if self.plane is None else [listed(self.plane[0]), self.plane[1]],
-                "axis": listed(self.axis), "radius": self.radius, "top": self.top}
+                "axis": listed(self.axis), "radius": self.radius, "top": self.top,
+                "ball": None if self.ball is None else [listed(self.ball[0]), self.ball[1], self.ball[2]]}
 
     def load(self, state):
         if state.get("plane"):
             self.plane = (np.array(state["plane"][0]), float(state["plane"][1]))
         if state.get("axis") is not None:
             self.axis, self.radius, self.top = np.array(state["axis"]), state["radius"], state["top"]
+        if state.get("ball") is not None:
+            self.ball = (np.array(state["ball"][0]), state["ball"][1], state["ball"][2])
 
     def height(self, xyz_region):
         n, c = self.plane

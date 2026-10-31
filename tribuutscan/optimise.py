@@ -139,7 +139,7 @@ def make_mesh(scanner, directory, depth=9):
     cloud.ply). Low-density vertices (surface guessed far from any point) are dropped. Returns the
     triangle count. (A TSDF mesh needs the depth images; the merged frames keep only points.)"""
     from . import cloud as cl
-    xyz, rgb, _, nrm = scanner.cloud.points(cl.MIN_SEEN, with_normals=True)
+    xyz, rgb, _, nrm = scanner.output_cloud().points(cl.MIN_SEEN, with_normals=True)  # as saved (base or not)
     ok = np.linalg.norm(nrm, axis=1) > 0.5
     if ok.sum() < 100:
         return 0
@@ -157,7 +157,8 @@ def make_mesh(scanner, directory, depth=9):
 
 def process(scanner, directory, action, log=print):
     """A Process-menu action on a finished scan: "optimise", "small"/"medium"/"large" (merge again at
-    that point distance) or "mesh". Saves the result into `directory`; returns a short message."""
+    that point distance), "mesh", or "base-off"/"base-on" (save the cloud without / with the base it
+    stands on). Saves the result into `directory`; returns a short message."""
     from . import cloud as cl
     directory = Path(directory)
     if action == "optimise":
@@ -173,6 +174,12 @@ def process(scanner, directory, action, log=print):
         return f"merged again at {cl.PRESETS_MM[action]} mm: {kept:,} points"
     if action == "mesh":
         return f"mesh: {make_mesh(scanner, directory):,} triangles -> mesh.ply"
+    if action in ("base-off", "base-on"):
+        if scanner.scene.plane is None:
+            return "no base was found in this scan: nothing to remove"
+        scanner.remove_base = action == "base-off"
+        _, kept = scanner.save(directory)
+        return f"base {'removed' if scanner.remove_base else 'kept'}: {kept:,} points (make the mesh again)"
     raise ValueError(f"unknown action {action}")
 
 

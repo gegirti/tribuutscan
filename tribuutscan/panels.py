@@ -98,7 +98,10 @@ class ScanPanel(Panel):
         row.pack(fill="x")
         tk.Button(row, text="Continue last", command=self.app.continue_scan).pack(side="left", expand=True, fill="x")
         tk.Button(row, text="Open 3D view", command=self.app.open_view).pack(side="left", expand=True, fill="x")
-        tk.Checkbutton(body, text="keep raw frames", variable=self.app.keep_raw).pack(anchor="w")
+        row = tk.Frame(body)
+        row.pack(fill="x")
+        tk.Checkbutton(row, text="Remove base", variable=self.app.remove_base).pack(side="left")
+        tk.Checkbutton(row, text="keep raw frames", variable=self.app.keep_raw).pack(side="left")
 
     def refresh(self):
         text, state = self.STATES[self.app.scan_state]

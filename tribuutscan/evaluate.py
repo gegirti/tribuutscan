@@ -118,7 +118,7 @@ def _run(name, tracker, preset, live_markers, optimise_after):
         from . import optimise
         opt_report = optimise.optimise(scanner, log=lambda m: None)
     scanner.trim_table()
-    xyz, rgb, seen, normals = scanner.cloud.points(cl.MIN_SEEN, with_normals=True)
+    xyz, rgb, seen, normals = scanner.output_cloud().points(cl.MIN_SEEN, with_normals=True)  # as saved
     tracked = [(i, p) for i, s, p in scanner.track_log if p is not None]
     centre = xyz.mean(0) if len(xyz) else np.zeros(3)
     gap = metrics.loop_gap(tracked, centre)
