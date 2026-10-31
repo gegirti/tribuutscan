@@ -32,8 +32,9 @@ We are open to testing more devices and to improvements from anyone. See
 
 The limits, honestly:
 
-- **Depth only exists between about 15 and 33 cm.** That is the scanner's own near mode, not our
-  choice; Creality's app switches modes, and we have not decoded how yet.
+- **Depth exists between about 15 and 33 cm in close range, and about 20 and 72 cm in long range.**
+  Both are the scanner's own modes; the viewer's *Range* menu switches them. Long-range distances are
+  an estimate until that mode is calibrated (checked once: 50 cm read as 49.3 cm).
 - **Tracking runs at 3-7 frames per second** (Python on the CPU), so move slowly. Plain objects
   without markers lose tracking easily: a cardboard box at 27-31 cm tracked only 138 of 353 frames.
 - **Background within range gets merged** into the scan; only the table is removed.
@@ -75,6 +76,8 @@ In the viewer:
   **Record (r)** writes raw sets, about 10 a second (about 49 MB/s), for processing later;
   **Mesh last recording (m)** makes a rough mesh from the latest one.
 - Sliders set colour and IR brightness; *Auto IR* finds an IR exposure without clipping.
+- **Range** switches between close (15-33 cm) and long range (about 20-72 cm, an estimate until
+  calibrated); the images pause for about 7 s while the scanner switches.
 
 Only one program can use the scanner at a time. The scanner also resets its USB connection a few
 seconds after a program stops streaming, so give it about 5 s before starting the next one.
@@ -177,9 +180,13 @@ The IR projector turns on by itself when the IR stream is opened.
   On a flat sheet of paper the gain is small: the surface's spread from a plane drops 3-4% (0.144 ->
   0.138 mm at 20 cm, 0.356 -> 0.345 mm at 30 cm), because the sensor's own unevenness is larger than
   the 10-bit rounding. 14-bit removes the rounding, which matters most on smooth sloped surfaces.
-- **Depth range**: the 10-bit scale spans about 15 cm (1023) to 33 cm (1), and beyond 33 cm there
-  is no depth at all. So this is a near mode of the scanner. Creality's app offers size modes
-  (150-250, 250-500 and 500-2000 mm), presumably switched through the vendor interface.
+- **Depth modes**: the scanner holds 8 named depth modes and reports them over Orbbec's command
+  channel (a UVC extension unit on the depth camera; `tribuutscan/vendor.py`): close and long range,
+  each also as "Interleave" and "Narrow_View", plus two calibration modes. It starts in
+  `Close_range_mode Default`, where the depth scale spans about 15 cm (1023) to 33 cm (1).
+  `Long_range_mode Default` spans about 20-72 cm. Switching writes the chosen entry of the scanner's
+  own list, as Orbbec's SDK does, while nothing streams; a power cycle returns it to close range.
+  Careful: reading structure 1044 hung the firmware until the scanner was replugged.
 - **Depth law**: distance z = a / (raw + b), settled by the board calibration (the a/z^2 form fits
   ten times worse). On our unit a = 289570 mm, b = 873.4. Earlier hand-held readings (590, 251 and
   66 at 20, 25 and 30 cm) agree with it within their +-1 cm.

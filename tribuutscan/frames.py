@@ -3,7 +3,8 @@
 Colour is requested at 1280x800 so it shares the depth map's pixel grid. Whether the two are truly
 registered (different cameras, different baselines) is not verified; identity is assumed.
 Depth is 14-bit over USB (usbdepth.py) when allowed, else 10-bit over V4L2; decoded depth is on the
-Y10 scale either way, and recordings note which one they hold (depth_bytesperline).
+Y10 scale either way, and recordings note which one they hold (depth_bytesperline). They also note the
+scanner's depth mode (close / long range), whose law calib.CAMERA then uses when they are read.
 """
 import json
 import os
@@ -13,7 +14,7 @@ from pathlib import Path
 
 import numpy as np
 
-from . import usbdepth, v4l2
+from . import calib, usbdepth, v4l2, vendor
 from .depth import decode_depth
 from .image import depth_to_rgb, write_png, yuyv_to_rgb
 
@@ -29,18 +30,37 @@ def decode(color_buf, ir_buf, depth_buf, depth_bytesperline):
     }
 
 
+def depth_mode(nodes, log=print):
+    """The scanner's active depth mode (read only, over vendor.py), or close range if it can't be read."""
+    try:
+        ch = vendor.Channel(nodes["depth"])
+        try:
+            return vendor.mode_name(ch.current_mode())
+        finally:
+            ch.close()
+    except (OSError, vendor.VendorError) as e:
+        log(f"depth mode not readable ({e}); assuming {calib.CLOSE}")
+        return calib.CLOSE
+
+
 def open_depth(nodes, log=print):
     """The depth capture: 14-bit over USB when the udev rule allows it, else V4L2 10-bit (also when
-    TRIBUUTSCAN_DEPTH=y10). Call v4l2.discover() first: the USB capture takes /dev/video0 away."""
+    TRIBUUTSCAN_DEPTH=y10). Reads the depth mode first and switches calib.CAMERA to it (the capture's
+    `depth_mode`). Call v4l2.discover() first: the USB capture takes /dev/video0 away."""
+    mode = depth_mode(nodes, log)
+    calib.use_mode(mode)
+    cap = None
     if os.environ.get("TRIBUUTSCAN_DEPTH", "").lower() != "y10":
         if usbdepth.available():
             try:
-                return usbdepth.DepthCapture("Y14")
+                cap = usbdepth.DepthCapture("Y14")
             except OSError as e:
                 log(f"14-bit depth over USB failed ({e.strerror or e}); using 10-bit V4L2 depth")
         else:
             log("14-bit depth needs udev/70-tribuutscan.rules (see README); using 10-bit V4L2 depth")
-    return v4l2.Capture(nodes["depth"], "Y10", W, H)
+    cap = cap or v4l2.Capture(nodes["depth"], "Y10", W, H)
+    cap.depth_mode = mode
+    return cap
 
 
 def grab(warmup=10):
@@ -95,6 +115,7 @@ def save(frames, root=CAPTURES, extra=None):
         "depth_valid_fraction": round(float((frames["depth"] > 0).mean()), 4),
         "depth_median": float(np.median(valid)) if valid.size else None,
         "note": "ir is flipped horizontally to match colour/depth (sensor output is mirrored); depth is raw, on the Y10 scale",
+        "depth_mode": calib.CAMERA.mode,
         **(extra or {}),
     }, indent=2))
     return out
@@ -117,6 +138,7 @@ class Recorder:
         self.frame_bytes = {**FRAME_BYTES, "depth": depth_bytesperline * H}
         (self.dir / "info.json").write_text(json.dumps({
             "size": [W, H], "depth_bytesperline": depth_bytesperline, "frame_bytes": self.frame_bytes,
+            "depth_mode": calib.CAMERA.mode,
             "note": "raw sensor buffers; ir is NOT flipped here (read_recording flips it)",
             **(extra or {}),
         }, indent=2))
@@ -145,10 +167,11 @@ def read_recording(directory):
     """Yield decoded frame sets (as from `decode`) from a Recorder directory.
 
     Each set also carries "t" (depth timestamp, s) and "skew_ms" (colour minus depth time) when the
-    recording has stamps.csv.
+    recording has stamps.csv. Switches calib.CAMERA to the recording's depth mode (close if not noted).
     """
     directory = Path(directory)
     info = json.loads((directory / "info.json").read_text())
+    calib.use_mode(info.get("depth_mode", calib.CLOSE))
     sizes = {**FRAME_BYTES, **info.get("frame_bytes", {})}
     data = {k: np.memmap(directory / f"{k}.raw", np.uint8, "r") for k in STREAMS}
     stamps_file = directory / "stamps.csv"

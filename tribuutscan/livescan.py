@@ -4,7 +4,7 @@ The viewer starts it with the .venv Python when there is one (so ICP tracking wo
 to it over two queues. The worker also serves the browser 3D view of the growing cloud
 (view3d page), so cloud data never passes back through the viewer.
 
-Commands:  ("start", preset, out_dir, keep_raw, continue_from or None)
+Commands:  ("start", preset, out_dir, keep_raw, continue_from or None, depth mode name)
            | ("frame", yuyv, grey, depth_buf, bytesperline, (t_colour, t_ir, t_depth))
            | ("stop",) | ("quit",)   (times: camera capture times, seconds)
 Replies:   ("ready", url) | ("log", text) | ("frame_done", merged, frames, points, tracking, cue) | ("saved", path, points)
@@ -24,6 +24,7 @@ import time
 
 import numpy as np
 
+from . import calib
 from . import cloud as cl
 from . import frames as fr
 from . import pointcloud as pc
@@ -134,7 +135,8 @@ def run(commands, replies, port=view3d.PORT):
         timing["wait"] += time.perf_counter() - t_wait
         if kind == "start":
             timing = {k: 0 for k in timing}
-            _, preset, out_dir, keep_raw, continue_from = cmd
+            _, preset, out_dir, keep_raw, continue_from, depth_mode = cmd
+            calib.use_mode(depth_mode)  # the law of the scanner's mode, before any frame is turned into points
             recorder = None
             log = lambda m: replies.put(("log", m))
             with source.lock:

@@ -39,3 +39,23 @@ def test_record_roundtrip_y14():
         sets = list(fr.read_recording(rec.dir))
     assert len(sets) == 2
     assert np.array_equal(sets[1]["depth"], (y14.astype(np.float32) - 8) / 16)
+
+
+def test_recording_carries_the_depth_mode():
+    from tribuutscan import calib
+    bufs = {"color": bytes(fr.FRAME_BYTES["color"]), "ir": bytes(fr.FRAME_BYTES["ir"]),
+            "depth": encode_y10(np.zeros((fr.H, fr.W), np.uint16))}
+    try:
+        calib.use_mode(calib.LONG)
+        with tempfile.TemporaryDirectory() as tmp:
+            rec = fr.Recorder(fr.W * 10 // 8, root=tmp)
+            rec.write(bufs, {k: 0.0 for k in fr.STREAMS})
+            rec.close()
+            calib.use_mode(calib.CLOSE)
+            next(fr.read_recording(rec.dir))
+            assert calib.CAMERA.mode == calib.LONG  # reading it switched the law
+            (rec.dir / "info.json").write_text((rec.dir / "info.json").read_text().replace('"depth_mode"', '"x"'))
+            next(fr.read_recording(rec.dir))
+            assert calib.CAMERA.mode == calib.CLOSE  # not noted: an old recording, close range
+    finally:
+        calib.use_mode(calib.CLOSE)

@@ -213,6 +213,9 @@ def solve(directory, square_mm=SQUARE_MM, out=None, log=print):
     """Calibrate from captured views; write calibration.json (default captures/calibration.json)."""
     brd = board(square_mm)
     views = load_views(directory)
+    modes = {str(v.get("depth_mode", calib.CLOSE)) for v in views}
+    if modes != {calib.CLOSE}:  # the solve writes the close-range law; a long-range one needs its own block
+        raise RuntimeError(f"views taken in {sorted(modes)}: only {calib.CLOSE} can be solved for now")
     size = (fr.W, fr.H)
     col, irs, both = [], [], []
     for n, v in enumerate(views):
@@ -352,7 +355,7 @@ def capture(square_mm=SQUARE_MM, out=None):
             state["note"] = "IR could not place the board here: come a little closer or tilt less"
             return
         n = len(list(out.glob("view_*.npz")))
-        np.savez_compressed(out / f"view_{n:03d}.npz", **frame)
+        np.savez_compressed(out / f"view_{n:03d}.npz", **frame, depth_mode=calib.CAMERA.mode)
         state["kept"].append(col)
         state["places"].append(place)
         state["flash"], state["note"] = time.monotonic() + 0.6, ""

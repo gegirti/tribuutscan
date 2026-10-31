@@ -2,6 +2,9 @@
 
 Loads captures/calibration.json (to be written by calibrate.py) when it exists. Otherwise it uses the
 ESTIMATES below and `CAMERA.estimate` is True, so output can say the numbers are estimates.
+The depth law and window depend on the scanner's depth mode (vendor.py): `use_mode` picks them. The
+top-level law is close range; other modes come from a "modes" block, else from the estimate below
+(`CAMERA.law_estimate` is True then).
 """
 import json
 from pathlib import Path
@@ -10,6 +13,11 @@ import numpy as np
 
 CALIBRATION = Path(__file__).resolve().parent.parent / "captures" / "calibration.json"
 DEFAULT_Z_MM = 250.0  # distance assumed for colour <-> depth pixels when it is not known
+CLOSE, LONG = "Close_range_mode Default", "Long_range_mode Default"
+# Long range until calibrated: the close law with b shifted. One flat surface read 93.4 in close mode and
+# 564.7 in long mode (2026-10-31): with a unchanged that is b - 471.3, and a hand-measured 50 cm then
+# read 175.7 where this predicts 177. The window is what raw 1023..1 then spans (~20-72 cm).
+LONG_B_SHIFT = -471.3
 ESTIMATES = {
     "estimate": True,
     "size": [1280, 800],
@@ -57,14 +65,29 @@ class Camera:
             self.fx = self.fy = (self.width / 2) / np.tan(np.radians(d["hfov_deg"]) / 2)
             self.cx, self.cy = self.width / 2, self.height / 2
         self.dist = np.array(d.get("dist", []), float)
-        self.a, self.b = spec["law"]["a_mm"], spec["law"]["b"]
-        self.window_mm = tuple(spec["window_mm"])
+        self.base_law = (spec["law"]["a_mm"], spec["law"]["b"], tuple(spec["window_mm"]))  # close range
+        self.set_mode(CLOSE)
         self.reg = spec["colour_from_depth"]
         colour = spec.get("colour")
         self.colour = None if colour is None else {
             "K": np.array(colour["K"], float), "dist": np.array(colour["dist"], float),
             "R": np.array(colour["R"], float), "T": np.array(colour["T_mm"], float)}
         self._grid = None  # undistorted normalised coordinates of every depth pixel (when distorted)
+
+    def set_mode(self, name):
+        """Use the depth law and window of the scanner's depth mode `name`."""
+        a, b, window = self.base_law
+        own = self.spec.get("modes", {}).get(name)
+        if own:
+            a, b, window = own["law"]["a_mm"], own["law"]["b"], tuple(own["window_mm"])
+            estimate = bool(own.get("estimate", False))
+        elif name.startswith("Long_range"):
+            b += LONG_B_SHIFT
+            window = (a / (1023 + b), a / (1 + b))
+            estimate = True
+        else:
+            estimate = self.estimate or name != CLOSE  # Interleave / Narrow_View: same law, unverified
+        self.mode, self.a, self.b, self.window_mm, self.law_estimate = name, a, b, window, estimate
 
     def depth_mm(self, raw):
         """Distance along the camera axis (mm) for raw depth values (nearer = larger)."""
@@ -124,6 +147,11 @@ def use(spec):
     """Switch the shared camera model in place (every module holds this same CAMERA object). Synthetic
     data is made and read with ESTIMATES, a pinhole camera, whatever is calibrated."""
     CAMERA.__init__(spec)
+
+
+def use_mode(name):
+    """Switch the shared camera model to the law and window of depth mode `name`."""
+    CAMERA.set_mode(name)
 
 
 def load(path=CALIBRATION):

@@ -8,15 +8,20 @@ calibration when captures/calibration.json exists, otherwise ESTIMATES (hand-mea
 guessed field of view, colour registration eyeballed from one frame). Not a calibration until then.
 Output units are millimetres, x right, y up, z away from the scanner.
 """
+import json
 import sys
 from pathlib import Path
 
 import numpy as np
 
+from . import calib
 from . import frames as fr
 from .calib import CAMERA
 
-WINDOW_CM = tuple(z / 10 for z in CAMERA.window_mm)  # beyond it depth is 0 (estimate until calibrated)
+
+def window_cm():
+    """The active depth mode's window (cm): beyond it depth is 0."""
+    return tuple(z / 10 for z in CAMERA.window_mm)
 
 
 def color_source(u, v, w, h, z_mm=None):
@@ -78,6 +83,8 @@ def main():
         directory = Path(sys.argv[1])
         data = np.load(directory / "frames.npz")
         frames = {k: data[k] for k in data.files}
+        info = directory / "info.json"
+        calib.use_mode(json.loads(info.read_text()).get("depth_mode", calib.CLOSE) if info.exists() else calib.CLOSE)
     else:
         frames = fr.grab()
         directory = fr.save(frames)

@@ -4,7 +4,9 @@ Press `s` or click Save to write the current frame set to captures/<timestamp>/.
 Press `r` or click Record to start/stop recording raw frame sets to captures/<timestamp>-rec/.
 Sliders set IR exposure/gain and colour brightness live. IR exposure and gain are controls on the
 depth function: they change the IR sensor that depth is computed from. Depth is 14-bit over USB
-(usbdepth.py, which then also owns those two controls) when allowed, else 10-bit V4L2. Auto IR steps them until the IR
+(usbdepth.py, which then also owns those two controls) when allowed, else 10-bit V4L2.
+Range switches the scanner between close range (15-33 cm) and long range (~20-72 cm, an estimate until
+calibrated); the streams pause for about 10 s while it switches (vendor.py). Auto IR steps them until the IR
 image has little clipping (clipping costs depth; see CLAUDE.md).
 The distance line reads the centre of the depth image; distances and the window are estimates.
 Press `m` or click Mesh to fuse the latest recording into mesh.ply (runs fuse.py in the Open3D .venv).
@@ -28,7 +30,7 @@ from pathlib import Path
 import numpy as np
 
 from . import frames as fr
-from . import cloud, livescan, markers, pointcloud, usbdepth, v4l2
+from . import calib, cloud, livescan, markers, pointcloud, usbdepth, v4l2, vendor
 from .depth import decode_depth
 from .image import depth_to_rgb, ppm, yuyv_pixels, yuyv_to_rgb
 
@@ -78,6 +80,7 @@ class Stream(threading.Thread):
     def __init__(self, cap, render):
         super().__init__(daemon=True)
         self.cap = cap
+        self.resumed, self.idle = threading.Event(), threading.Event()  # pause() / resume(cap)
         self.render = render
         self.latest = None
         self.version = 0  # bumped with each new preview (the window redraws only on change)
@@ -88,6 +91,17 @@ class Stream(threading.Thread):
         self.fps = 0.0
 
     def run(self):
+        while True:
+            try:
+                self._stream()
+            except OSError:  # the device went away mid-stream: wait for resume() like after pause()
+                pass
+            self.idle.set()
+            self.resumed.wait()
+            self.resumed.clear()
+            self.idle.clear()
+
+    def _stream(self):
         n, t0, rendered = 0, time.time(), 0.0
         for buf in self.cap.frames():
             if len(buf) < self.cap.sizeimage:  # truncated USB transfer
@@ -110,6 +124,18 @@ class Stream(threading.Thread):
             return self.raw, self.stamp
         stamp, raw = min(recent, key=lambda sr: abs(sr[0] - t))
         return raw, stamp
+
+    def pause(self, timeout=8.0):
+        """Close the capture and wait until this thread has let go of it (a pending read ends within 5 s),
+        so a new capture can't be read through the old one's file descriptor."""
+        self.cap.close()
+        self.idle.wait(timeout)
+        self.fps = 0.0
+
+    def resume(self, cap):
+        self.cap = cap
+        self.recent.clear()
+        self.resumed.set()
 
     def stop(self):
         self.cap.close()
@@ -165,17 +191,38 @@ def render_depth(cap, buf):
 
 
 def distance_hint(stats):
-    """(text, colour) for the guide line, from the depth centre stats."""
-    near, far = pointcloud.WINDOW_CM
+    """(text, colour) for the guide line, from the depth centre stats (the active depth mode's window)."""
+    near, far = pointcloud.window_cm()
     cm = stats.get("centre_cm")
     if cm is None or stats["centre_valid"] < 0.2:
         return f"Centre: no depth. Too close or too far; aim for {near + 3:.0f}-{far - 4:.0f} cm", BAD
-    text = f"Centre: ~{cm:.1f} cm (estimate)"
+    text = f"Centre: ~{cm:.1f} cm" + (" (estimate)" if calib.CAMERA.law_estimate else "")
     if cm < near + 2:
         return text + " - near the close edge, move back", EDGE
     if cm > far - 3:
         return text + " - near the far edge, move closer", EDGE
     return text + " - good", GOOD
+
+
+RANGES = {"Close range 15-33 cm": calib.CLOSE, "Long range ~20-72 cm (estimate)": calib.LONG}
+SWITCH_SETTLE_S = 6.0  # the scanner may reset its USB connection a few seconds after its streams stop
+
+
+def depth_title(cap):
+    kind = "14-bit USB" if isinstance(cap, usbdepth.DepthCapture) else "10-bit"
+    return f"Depth, {kind}, {'long' if cap.depth_mode.startswith('Long') else 'close'} range (raw, near=red)"
+
+
+def wait_for_scanner(timeout=15.0):
+    """v4l2.discover() once the scanner's three nodes are back (after a stop or USB reset)."""
+    end = time.monotonic() + timeout
+    while True:
+        try:
+            return v4l2.discover()
+        except (RuntimeError, OSError):
+            if time.monotonic() > end:
+                raise RuntimeError("the scanner did not come back")
+            time.sleep(0.5)
 
 
 def node_controls(target):
@@ -202,15 +249,16 @@ def main():
     streams = {
         "Colour": Stream(v4l2.Capture(nodes["color"], "YUYV", fr.W, fr.H), render_color),
         "IR (flipped)": Stream(v4l2.Capture(nodes["ir"], "GREY", fr.W, fr.H), render_ir),
-        f"Depth, {'14-bit USB' if on_usb else '10-bit'} (raw, near=red)": Stream(depth_cap, render_depth),
+        "Depth": Stream(depth_cap, render_depth),
     }
     color, ir, depth = streams.values()
 
     root = tk.Tk()
     root.title("triBUUTSCAN (Ferret Pro)")
-    labels = {}
+    labels, titles = {}, {}
     for col, name in enumerate(streams):
-        tk.Label(root, text=name).grid(row=0, column=col)
+        titles[name] = tk.Label(root, text=depth_title(depth_cap) if name == "Depth" else name)
+        titles[name].grid(row=0, column=col)
         labels[name] = tk.Label(root)
         labels[name].grid(row=1, column=col)
     guide = tk.Label(root, anchor="center", font=("TkDefaultFont", 14, "bold"))
@@ -236,36 +284,37 @@ def main():
     columns = [tk.Frame(root) for _ in streams]
     for col, frame in enumerate(columns):
         frame.grid(row=5, column=col, sticky="n")
-    controls = {}  # label -> (node path, control id, info, scale)
+    controls = {}  # label -> (node name, control id, info, scale); targets[node] is looked up at use
     for label, node, cid, col in SLIDERS:
         info = next((c for c in node_controls(targets[node]).values() if c["id"] == cid), None)
         if info is None:
             continue
 
-        def set_value(value, dev=targets[node], cid=cid, label=label):
+        def set_value(value, node=node, cid=cid, label=label):
             try:
-                set_control(dev, cid, int(float(value)))
-            except OSError as e:
-                log(f"{label}: {e.strerror}")
+                set_control(targets[node], cid, int(float(value)))
+            except (OSError, AttributeError) as e:
+                log(f"{label}: {getattr(e, 'strerror', None) or e}")
 
         scale = tk.Scale(columns[col], label=label, orient="horizontal", length=PANE_W - 40, from_=info["min"],
                          to=info["max"], resolution=info["step"] or 1, command=set_value)
         scale.set(info["value"])
         scale.pack(padx=10)
-        controls[label] = (targets[node], cid, info, scale)
+        controls[label] = (node, cid, info, scale)
 
     def reset():
         for _, _, info, scale in controls.values():
             scale.set(info["default"])  # triggers set_value
 
     def control_values():
-        return {label: get_control(dev, cid) for label, (dev, cid, _, _) in controls.items()}
+        return {label: get_control(targets[node], cid) for label, (node, cid, _, _) in controls.items()}
 
     buttons = tk.Frame(columns[2])
     buttons.pack(pady=10)
     tk.Button(buttons, text="Reset defaults", command=reset).pack(fill="x")
 
-    auto = {"steps": 0}
+    auto = {"steps": 0, "running": False}
+    switching = {"busy": False, "done": None}  # a range switch in progress / finished (set by its thread)
 
     def auto_step():
         """One Auto IR step: darken while clipping, brighten while dim, else stop."""
@@ -275,6 +324,7 @@ def main():
         auto["steps"] += 1
         if clipped is None or auto["steps"] > AUTO_MAX_STEPS:
             log("Auto IR: gave up")
+            auto["running"] = False
             return
         if clipped > CLIP_HI and g > gain[2]["min"]:
             gain[3].set(max(gain[2]["min"], g * 0.7))
@@ -286,18 +336,22 @@ def main():
             gain[3].set(min(GAIN_CAP, g * 1.3))
         else:
             log(f"Auto IR: done (exposure {e}, gain {g})")
+            auto["running"] = False
             return
         message["text"] = f"Auto IR: step {auto['steps']}"
         root.after(AUTO_STEP_MS, auto_step)
 
     def start_auto():
-        if "IR exposure" in controls and "IR gain" in controls:
-            auto["steps"] = 0
+        if "IR exposure" in controls and "IR gain" in controls and not switching["busy"]:
+            auto["steps"], auto["running"] = 0, True
             auto_step()
 
     tk.Button(buttons, text="Auto IR", command=start_auto).pack(fill="x")
 
     def save(_event=None):
+        if switching["busy"]:
+            log("switching the range: save when the streams are back")
+            return
         if not (color.raw and ir.raw and depth.raw):
             log("nothing to save yet")
             return
@@ -410,7 +464,7 @@ def main():
             start_worker()
         out = fr.CAPTURES / (time.strftime("%Y%m%d-%H%M%S") + "-scan")
         live.update(scanning=True, inflight=0)
-        live["commands"].put(("start", preset.get(), out, keep_raw.get(), continue_from))
+        live["commands"].put(("start", preset.get(), out, keep_raw.get(), continue_from, calib.CAMERA.mode))
         scan_button.configure(text="Stop scan (c)")
         log(f"scan started: {out.name} ({preset.get()}, point distance {cloud.PRESETS_MM[preset.get()]} mm)"
             + (f", continuing {continue_from.name}" if continue_from else ""))
@@ -483,6 +537,66 @@ def main():
     tk.Checkbutton(scan_box, text="keep raw frames", variable=keep_raw).pack(side="left")
     root.bind("c", toggle_scan)
 
+    range_names = {mode: label for label, mode in RANGES.items()}
+    range_var = tk.StringVar(value=range_names.get(calib.CAMERA.mode, calib.CAMERA.mode))
+
+    def reopen():
+        """Open all three streams again (node paths can change after the scanner re-enumerates)."""
+        try:
+            nodes.update(wait_for_scanner())
+            color.resume(v4l2.Capture(nodes["color"], "YUYV", fr.W, fr.H))
+            ir.resume(v4l2.Capture(nodes["ir"], "GREY", fr.W, fr.H))
+            cap = fr.open_depth(nodes, log)
+            targets.update(nodes, depth=cap if isinstance(cap, usbdepth.DepthCapture) else nodes["depth"])
+            depth.resume(cap)
+        except Exception as e:  # noqa: BLE001 - shown to the user; the viewer stays up
+            log(f"could not restart the streams ({e}): close the viewer and start it again")
+
+    def switch_range(mode):
+        """Background thread: pause the streams, switch the scanner's depth mode, start them again."""
+        try:
+            for s in streams.values():
+                s.pause()
+            time.sleep(SWITCH_SETTLE_S)
+            for attempt in range(2):
+                try:
+                    found = wait_for_scanner()
+                    if vendor.camera_users():
+                        raise RuntimeError("another program has the scanner open")
+                    ch = vendor.Channel(found["depth"])
+                    try:
+                        ch.switch_depth_mode(mode)
+                    finally:
+                        ch.close()
+                    break
+                except OSError:  # it re-enumerated under us: once more
+                    if attempt:
+                        raise
+                    time.sleep(3)
+            log(f"depth range switched to {mode}")
+        except Exception as e:  # noqa: BLE001 - shown to the user
+            log(f"range switch failed: {e}")
+        finally:
+            reopen()
+            switching["done"] = True
+
+    def choose_range(label):
+        mode = RANGES[label]
+        busy = rec["recorder"] or live["scanning"] or auto["running"] or switching["busy"]
+        if mode == calib.CAMERA.mode or busy:
+            if busy:
+                log("stop recording, scanning and Auto IR before switching the range")
+            range_var.set(range_names.get(calib.CAMERA.mode, calib.CAMERA.mode))
+            return
+        switching["busy"] = True
+        log(f"switching to {label}: the streams pause for about 10 s")
+        threading.Thread(target=switch_range, args=(mode,), daemon=True).start()
+
+    range_box = tk.Frame(columns[2])
+    range_box.pack(pady=4)
+    tk.Label(range_box, text="Range").pack(side="left")
+    tk.OptionMenu(range_box, range_var, *RANGES, command=choose_range).pack(side="left")
+
     show = tk.BooleanVar(value=True)
     tk.Checkbutton(columns[0], text="Find markers", variable=show,
                    command=lambda: found_markers.update(on=show.get())).pack()
@@ -495,6 +609,15 @@ def main():
     shown = {}
 
     def tick():
+        if switching["done"]:  # back in the Tk thread after a range switch
+            switching.update(done=None, busy=False)
+            titles["Depth"].configure(text=depth_title(depth.cap))
+            range_var.set(range_names.get(calib.CAMERA.mode, calib.CAMERA.mode))
+            for label, (node, cid, _, scale) in controls.items():  # the scanner may have reset them
+                try:
+                    set_control(targets[node], cid, int(scale.get()))
+                except (OSError, AttributeError) as e:
+                    log(f"{label}: {getattr(e, 'strerror', None) or e}")
         for name, s in streams.items():
             if s.latest is not None and shown.get(name) != s.version:  # redraw only a changed preview
                 shown[name] = s.version
@@ -531,7 +654,8 @@ def main():
         root.destroy()
 
     root.protocol("WM_DELETE_WINDOW", close)
-    log(f"viewer started (pid {os.getpid()}, depth {'14-bit over USB' if on_usb else '10-bit V4L2'})")
+    log(f"viewer started (pid {os.getpid()}, depth {'14-bit over USB' if on_usb else '10-bit V4L2'}, "
+        f"{calib.CAMERA.mode}{', distances are estimates' if calib.CAMERA.law_estimate else ''})")
     tick()
     root.mainloop()
 

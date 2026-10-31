@@ -150,8 +150,19 @@ is simply getting colour, IR and depth out of the scanner on Linux.
     ~203-718 mm (raw 1023..1). Tested at a hand-measured 50 cm: centre raw 175.7 (predicted 177), i.e.
     501 mm. So long mode is z = 289570 / (v + 402.1), ~20-72 cm: still an estimate (one hand distance).
     Close mode at that 50 cm: 0% valid.
-    While in long mode the calibration law, prep's window and the viewer's distance guide are WRONG
-    (they are close-mode). Back: `python3 -m tribuutscan.vendor switch "Close_range_mode Default"`.
+  - The toolkit knows the modes (2026-10-31): `frames.open_depth` reads the active mode and calls
+    `calib.use_mode`; `calib.Camera.set_mode` takes a "modes" block from calibration.json if present,
+    else long range = close law with b + LONG_B_SHIFT (-471.3), window raw 1023..1, `law_estimate`
+    True. Recordings, saved frames and session.json note "depth_mode"; `read_recording` switches the
+    law from it (close when missing); the live worker gets it in its start command. calibrate.py tags
+    views and refuses to solve non-close views until a long-mode block exists.
+  - The viewer's Range menu switches Close <-> Long: streams pause (`Stream.pause/resume`), 6 s for the
+    scanner's USB reset, `switch_depth_mode`, reopen. Checked: 6.4 s per switch, all streams back at
+    30 fps, IR exposure control works on the new capture, long-mode centre read 49.3 cm at the user's
+    50 cm. Synthetic evaluation unchanged (identical numbers before/after).
+  - The mode is NOT kept across a full USB reset: killing a program that held the scanner caused a
+    "USB disconnect" and the scanner came back in Close_range_mode Default. Ordinary stream stops and
+    restarts kept the mode. Safe, since the mode is read at every open.
   - PITFALL: GET_STRUCTURE 1044 got no reply (GET_CUR selector 1 timed out, -110), and ~30 s later
     the scanner dropped off USB ("device not accepting address", error -71) until it was
     physically replugged. vendor.py refuses 1044 and stops on any timeout.
@@ -169,6 +180,8 @@ is simply getting colour, IR and depth out of the scanner on Linux.
 ```
 tribuutscan-viewer                          # launcher in ~/.local/bin, copy of tribuutscan-viewer.sh
 python3 -m tribuutscan.viewer               # live colour + IR + depth; `s` saves captures/<stamp>/
+                                            # Range menu: close 15-33 cm / long ~20-72 cm (estimate)
+python3 -m tribuutscan.vendor [modes|scan|switch "<mode>"]   # scanner's depth modes (switch WRITES)
                                             # `r` records raw sets to captures/<stamp>-rec/ (~49 MB/s),
                                             # Auto IR button, distance guide (estimate),
                                             # `m` meshes the latest recording via .venv fuse.py;

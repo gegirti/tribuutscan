@@ -54,3 +54,27 @@ def test_ir_corners_through_projector_dots():
     assert found is not None and len(found[2]) >= 60
     err = np.linalg.norm(found[1] - truth[found[2]], axis=1)  # the dots leave about 0.3 px per corner
     assert np.median(err) < 0.4 and err.max() < 1.0
+
+
+def test_depth_modes_switch_law_and_window():
+    cam = calib.Camera({**calib.ESTIMATES, "estimate": False})
+    a, b, window = cam.base_law
+    assert cam.mode == calib.CLOSE and (cam.a, cam.b, cam.window_mm) == (a, b, window) and not cam.law_estimate
+    cam.set_mode(calib.LONG)
+    assert cam.b == b + calib.LONG_B_SHIFT and cam.law_estimate
+    assert np.allclose(cam.window_mm, (cam.depth_mm(1023), cam.depth_mm(1)))
+    cam.set_mode(calib.CLOSE)
+    assert (cam.a, cam.b, cam.window_mm) == (a, b, window)
+
+
+def test_a_calibrated_mode_wins_over_the_estimate():
+    spec = {**calib.ESTIMATES, "modes": {calib.LONG: {"law": {"a_mm": 300000.0, "b": 400.0}, "window_mm": [210, 700]}}}
+    cam = calib.Camera(spec)
+    cam.set_mode(calib.LONG)
+    assert (cam.a, cam.b, cam.window_mm, cam.law_estimate) == (300000.0, 400.0, (210, 700), False)
+
+
+def test_long_estimate_matches_the_50cm_check():
+    cam = calib.Camera({**calib.ESTIMATES, "law": {"a_mm": 289570.18, "b": 873.42}})
+    cam.set_mode(calib.LONG)
+    assert abs(cam.depth_mm(175.7) - 501) < 2  # hand-measured 50 cm read 175.7 (2026-10-31)

@@ -834,6 +834,7 @@ def save(directory, cloud, poses, stats, preset, min_seen=MIN_SEEN):
     (directory / "session.json").write_text(json.dumps({
         "preset": preset, "point_distance_mm": cloud.point_mm, "min_seen": min_seen, "mode": stats.get("mode"),
         "raw_points": cloud.raw_points, "cubes": len(cloud), "points_kept": len(xyz), **stats,
+        "depth_mode": CAMERA.mode,
         "note": "distances rest on the estimated depth law and field of view",
     }, indent=2))
     return out, len(xyz)
