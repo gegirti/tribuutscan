@@ -1,4 +1,4 @@
-"""Orbbec vendor commands over the depth function's UVC extension unit. READ-ONLY for now.
+"""Orbbec vendor commands over the depth function's UVC extension unit. Reads, plus one write.
 
 The depth function's extension unit 4 (GUID a55751a1-f3c5-4a5e-8d5a-6854b8fa2716) is Orbbec's
 command channel, the same one OpenCV's cap_obsensor and OrbbecSDK_v2 (Protocol.hpp, MIT) use:
@@ -8,9 +8,12 @@ command channel, the same one OpenCV's cap_obsensor and OrbbecSDK_v2 (Protocol.h
   GET_CUR from the selector that fits the expected reply length
 Goes through uvcvideo (UVCIOC_CTRL_QUERY on the depth node), so it needs /dev/video0, i.e. depth on
 V4L2, not the USB capture. Only the read opcodes below can be sent: `request` refuses the others.
+The one write is `switch_depth_mode`: it puts an entry of the scanner's own mode list into the current
+depth mode (1043), as OrbbecSDK_v2's depth work mode manager does, with no stream running.
 
     python3 -m tribuutscan.vendor            # known properties and structures
     python3 -m tribuutscan.vendor modes      # the depth modes the scanner offers (list 4034)
+    python3 -m tribuutscan.vendor switch "Long_range_mode Default"   # WRITES the current depth mode
     python3 -m tribuutscan.vendor scan       # also try every property id 0-299 and structure 1000-1043
 Careful: a read of structure 1044 hung the scanner's firmware until it was replugged. Any timeout
 ends the run (TimeoutError is not caught).
@@ -21,6 +24,7 @@ import os
 import struct
 import sys
 import time
+from pathlib import Path
 
 from . import v4l2
 from .usbdepth import address
@@ -36,6 +40,8 @@ INIT_READ_RAW, READ_RAW, FINISH_READ_RAW = 17, 18, 19
 GET_CMD_VERSION, GET_STRUCTURE_V11 = 26, 27
 INIT_READ_LIST, READ_LIST, FINISH_READ_LIST = 29, 30, 31
 GET_PROTOCOL_VERSION = 0xFE
+SET_STRUCTURE_V11 = 28  # used only by switch_depth_mode
+CURRENT_DEPTH_MODE = 1043
 READ_OPCODES = {GET_PROPERTY, GET_STRUCTURE, INIT_READ_RAW, READ_RAW, FINISH_READ_RAW, GET_CMD_VERSION,
                 GET_STRUCTURE_V11, INIT_READ_LIST, READ_LIST, FINISH_READ_LIST, GET_PROTOCOL_VERSION}
 ERRORS = {1: "invalid request", 2: "unsupported", 3: "busy", 4: "forbidden", 5: "error command",
@@ -85,6 +91,9 @@ class Channel:
             raise VendorError(f"opcode {opcode} is not a read: refused")
         if opcode in (GET_STRUCTURE, GET_STRUCTURE_V11) and struct.unpack_from("<I", payload)[0] in HANGS:
             raise VendorError("known to hang the firmware: refused")
+        return self._exchange(opcode, payload, reply_len)
+
+    def _exchange(self, opcode, payload, reply_len):
         self.request_id = (self.request_id + 1) & 0xFFFF
         req = struct.pack("<HHHH", REQUEST_MAGIC, len(payload) // 2, opcode, self.request_id) + payload
         send_sel = 2 if len(req) <= 64 else 1 if len(req) <= 512 else 3
@@ -127,15 +136,52 @@ class Channel:
             self.request(FINISH_READ_LIST, struct.pack("<I", pid), 1024)
         return bytes(out)
 
-    def depth_modes(self):
-        """[(name, option code, checksum hex)] from the mode list; entries are OBDepthWorkMode_Internal."""
+    def mode_entries(self):
+        """The raw 52-byte entries of the mode list (OBDepthWorkMode_Internal: checksum, name, option)."""
         data = self.read_list(DEPTH_MODE_LIST)
-        return [(data[i + 16:i + 48].split(b"\0")[0].decode(errors="replace"),
-                 struct.unpack_from("<I", data, i + 48)[0], data[i:i + 16].hex())
-                for i in range(0, len(data) - 51, 52)]
+        return [data[i:i + 52] for i in range(0, len(data) - 51, 52)]
+
+    def depth_modes(self):
+        """[(name, option code, checksum hex)] from the mode list."""
+        return [(mode_name(e), struct.unpack_from("<I", e, 48)[0], e[:16].hex()) for e in self.mode_entries()]
+
+    def current_mode(self):
+        ver, entry = struct.unpack_from("<H", r := self.request(GET_STRUCTURE_V11, struct.pack("<I", CURRENT_DEPTH_MODE)))[0], r[2:]
+        if ver != 0:
+            raise VendorError(f"current depth mode: command version {ver}, expected 0")
+        return entry
+
+    def switch_depth_mode(self, name):
+        """THE WRITE: make `name`, an entry of the scanner's own list, the current depth mode
+        (SET_STRUCTURE_V1_1 of 1043, command version 0, the entry's bytes unchanged). Returns False if
+        it already was. No stream may run (the SDK refuses too); callers check that."""
+        entry = next((e for e in self.mode_entries() if mode_name(e) == name), None)
+        if entry is None:
+            raise VendorError(f"{name!r} is not in the scanner's mode list")
+        if self.current_mode() == entry:
+            return False
+        self._exchange(SET_STRUCTURE_V11, struct.pack("<IH", CURRENT_DEPTH_MODE, 0) + entry, 64)
+        return True
 
     def close(self):
         os.close(self.fd)
+
+
+def mode_name(entry):
+    return entry[16:48].split(b"\0")[0].decode(errors="replace")
+
+
+def camera_users():
+    """PIDs (other than ours) holding any of the scanner's video nodes open."""
+    nodes = {os.path.realpath(p) for p in v4l2.discover().values()}
+    users = set()
+    for fd_dir in Path("/proc").glob("[0-9]*/fd"):
+        try:
+            if any(os.path.realpath(f) in nodes for f in fd_dir.iterdir()):
+                users.add(int(fd_dir.parent.name))
+        except OSError:
+            continue
+    return users - {os.getpid()}
 
 
 def show(data):
@@ -144,6 +190,17 @@ def show(data):
 
 
 def main():
+    if sys.argv[1:2] == ["switch"]:
+        if camera_users():
+            sys.exit(f"close the programs using the scanner first (pids {sorted(camera_users())})")
+        ch = Channel()
+        try:
+            before = mode_name(ch.current_mode())
+            changed = ch.switch_depth_mode(sys.argv[2])
+            print(f"{before} -> {mode_name(ch.current_mode())}" if changed else f"already {before}")
+        finally:
+            ch.close()
+        return
     ch = Channel()
     try:
         if "modes" in sys.argv:

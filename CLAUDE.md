@@ -142,7 +142,14 @@ is simply getting colour, IR and depth out of the scanner on Linux.
     Close_range_mode Default (0x8, ACTIVE), Long_range_mode Default (0x8), Close/Long_range_mode
     Interleave (0x18), Close/Long_range_mode Narrow_View (0x18), Grid_of_Dots Calibration (0xe),
     In_scene Calibration (0xa). The SDK switches by SET_STRUCTURE_V1_1 of 1043 with the chosen entry,
-    only while nothing streams, then resets the device. Not tried yet.
+    only while nothing streams, then resets the device.
+  - SWITCHED 2026-10-31 (`vendor.py switch "Long_range_mode Default"`): accepted, the scanner stayed on
+    USB, the mode reads back and survives stream start/stop. Depth formats unchanged (Y14/Y10, no RLE).
+    Same flat surface (close mode raw 93.4 = 299.5 mm): long mode raw 564.7; areas that were beyond
+    the close window now have depth. IF long mode keeps a = 289570, b_long = 402.1 and the window is
+    ~203-718 mm (raw 1023..1): an UNVERIFIED estimate; a second known distance tests it (50 cm -> 177).
+    While in long mode the calibration law, prep's window and the viewer's distance guide are WRONG
+    (they are close-mode). Back: `python3 -m tribuutscan.vendor switch "Close_range_mode Default"`.
   - PITFALL: GET_STRUCTURE 1044 got no reply (GET_CUR selector 1 timed out, -110), and ~30 s later
     the scanner dropped off USB ("device not accepting address", error -71) until it was
     physically replugged. vendor.py refuses 1044 and stops on any timeout.
