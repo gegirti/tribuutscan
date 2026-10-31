@@ -116,7 +116,27 @@ is simply getting colour, IR and depth out of the scanner on Linux.
   - With "keep raw frames" a live scan can be replayed exactly with cloud.py.
   - A spawned worker re-runs the starting script, so test drivers need an
     `if __name__ == "__main__"` guard.
-- The vendor control interface is `/dev/hidraw*` (root only); its protocol is unknown.
+- USB interface 6 (HID, `/dev/hidraw*`, root only) names itself "CR-Scan FerretIMU": a motion sensor,
+  not the control channel (corrected 2026-10-31). Not read yet.
+- Vendor commands go through UVC extension units (read 2026-10-31 with UVCIOC_CTRL_QUERY, GET only):
+  - depth unit 4, GUID a55751a1-f3c5-4a5e-8d5a-6854b8fa2716 (Orbbec's common command XU; OpenCV's
+    cap_obsensor uses the same GUID): selectors 1 / 2 / 3 = 512 / 64 / 1024 bytes, get+set, all
+    zeros at rest; selectors 4-17 answer ENOENT although bmControls advertises 17.
+  - IR unit 8 (GUID "ORBB...01"): 3 four-byte controls (1 reads 1, set allowed on 1 and 3).
+  - colour unit 12 (GUID "ORBB...02"): advertises none.
+  Protocol per OpenCV (not yet tried here): request = magic 47 4d, u16 size in half-words, u16
+  opcode (1 get property, 2 set property, 3 get structure), u16 request id, then property id and
+  value; sent with SET_CUR on selector 2, reply read from selector 2 (or 1 for big structures);
+  reply bytes 8-9 = status (0 ok), data from byte 10. Candidate ids from OrbbecSDK_v2 Property.h:
+  LDP 2, laser 3, min/max depth 22/23, depth precision level 75, current depth alg mode 1043.
+- CrealityScan (Windows, run under Bottles) ships a custom Orbbec SDK (OrbbecSDK.dll) with a
+  `FerretUvcDevice` class: `switchDepthAlgMode`, `initDepthProcessParam`, and depth work modes whose
+  names and checksums the SDK reads from the device. Its embedded config asks for depth 1280x800 in
+  a format named "RLE" (not in our descriptors; maybe only after a mode switch), colour 1280x720
+  MJPG, IR 1280x800 Y8, for both Ferret and Ferret Pro. Its algo.obconfig holds data for a stereo
+  line-laser model, not the Ferret. Project files (resources.obscan) are SQLite with packed records
+  (32-byte header, payload starting 40 a2; the app also ships aes256.dll): not decoded, on purpose.
+  Under Wine the app never opened the scanner (its SDK logs show no device), so they hold no protocol.
 
 ## Commands
 

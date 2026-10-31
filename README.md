@@ -157,7 +157,8 @@ USB `2bc5:069c` (Orbbec vendor ID, strings "Creality" / "CR-Scan Ferret", also o
 | `/dev/video2` | 1.2 | IR, 1280x800, dot pattern visible | GREY / MJPG |
 | `/dev/video4` | 1.4 | colour, up to 1920x1080 (we use 1280x800) | YUYV / MJPG |
 
-Odd nodes (1, 3, 5) are metadata. `/dev/hidraw*` is a vendor control interface (root only).
+Odd nodes (1, 3, 5) are metadata. `/dev/hidraw*` is the scanner's motion sensor ("CR-Scan FerretIMU").
+Vendor commands go through a UVC extension unit on the depth camera (Orbbec's command channel).
 The IR projector turns on by itself when the IR stream is opened.
 
 ## Findings
