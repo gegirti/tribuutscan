@@ -83,7 +83,9 @@ right: Scanner, Capture, Scan, IMU and View.
 - **IMU** shows the scanner's tilt (a small horizon) and how fast it turns, from its built-in
   accelerometer and gyroscope (`tribuutscan/imu.py`; needs the udev rule).
 
-Only one program can use the scanner at a time. The scanner also resets its USB connection a few
+If the scanner is unplugged, the viewer asks you to plug it in and press Retry. If it goes away while
+the viewer runs, the bar under the depth view turns red, it retries every 10 s, and *Retry now* tries at
+once. Only one program can use the scanner at a time. The scanner also resets its USB connection a few
 seconds after a program stops streaming, so give it about 5 s before starting the next one.
 
 ## Calibrating your scanner

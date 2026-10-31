@@ -194,6 +194,14 @@ is simply getting colour, IR and depth out of the scanner on Linux.
     simulated loss: back in 4 s. A real reset was not forced.
   - The close crashed on a vanished device (STREAMOFF -> ENODEV), so it took three clicks. Now
     `v4l2.Capture.close` ignores that.
+  - Retry (user's request):
+    - At start, while the scanner can't be opened, `open_app` asks with Retry/Cancel
+      (`scanner_problem` says whether it is unplugged or busy). App closes what it already opened,
+      so a retry finds the scanner free.
+    - While running, a lost scanner turns the distance bar red with a countdown and shows Retry now
+      (`retry_now`).
+    - The start path was checked with the scanner really unplugged. The running path has a unit
+      test, but its scanner test could not run then (unplugged).
   - PITFALL: GET_STRUCTURE 1044 got no reply (GET_CUR selector 1 timed out, -110), and ~30 s later
     the scanner dropped off USB ("device not accepting address", error -71) until it was
     physically replugged. vendor.py refuses 1044 and stops on any timeout.

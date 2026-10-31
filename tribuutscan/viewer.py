@@ -274,13 +274,20 @@ class App:
         self.root, self.message = root, ""
         self.nodes = v4l2.discover()
         ir_exposure_by_hand(self.nodes, self.log)
-        cap = fr.open_depth(self.nodes, self.log)
+        opened = []  # closed again if a later one fails, so a retry finds the scanner free
+        try:
+            for open_one in (lambda: fr.open_depth(self.nodes, self.log),
+                             lambda: v4l2.Capture(self.nodes["color"], "YUYV", fr.W, fr.H),
+                             lambda: v4l2.Capture(self.nodes["ir"], "GREY", fr.W, fr.H)):
+                opened.append(open_one())
+        except BaseException:
+            for c in opened:
+                c.close()
+            raise
+        cap, color, ir = opened
         self.targets = {**self.nodes, "depth": cap if isinstance(cap, usbdepth.DepthCapture) else self.nodes["depth"]}
-        self.streams = {
-            "Colour": Stream(v4l2.Capture(self.nodes["color"], "YUYV", fr.W, fr.H), render_color),
-            "IR (flipped)": Stream(v4l2.Capture(self.nodes["ir"], "GREY", fr.W, fr.H), render_ir),
-            "Depth": Stream(cap, render_depth),
-        }
+        self.streams = {"Colour": Stream(color, render_color), "IR (flipped)": Stream(ir, render_ir),
+                        "Depth": Stream(cap, render_depth)}
         self.color, self.ir, self.depth = self.streams.values()
         self.controls = {}  # label -> (node name, control id, info, scale); targets[node] is looked up at use
         self.auto = {"steps": 0, "running": False}
@@ -292,6 +299,7 @@ class App:
         self.scan_state = "idle"  # idle | scanning | saving | optimising
         self.imu, self.imu_note, self.imu_want = None, "", usbdepth.available()
         self.retry_at = 0.0  # time.monotonic() before which a lost scanner is not reconnected again
+        self.lost = False  # a stream lost its device and the scanner is not back yet
         self.ranges, self.sliders = RANGES, SLIDERS  # for the Scanner panel
         self.range_names = {mode: label for label, mode in RANGES.items()}
         self.range_var = tk.StringVar(value=self.range_name())
@@ -316,8 +324,11 @@ class App:
             image = tk.Label(parent, image=blank, bg="black", bd=0)
             image.pack()
             if name == "Depth":
-                self.guide = tk.Label(parent, anchor="center", font=("TkDefaultFont", 14, "bold"))
-                self.guide.pack(fill="x", pady=(4, 0))
+                bar = tk.Frame(parent)
+                bar.pack(fill="x", pady=(4, 0))
+                self.guide = tk.Label(bar, anchor="center", font=("TkDefaultFont", 14, "bold"))
+                self.guide.pack(side="left", fill="x", expand=True)
+                self.retry = tk.Button(bar, text="Retry now", font=panels.BOLD, command=self.retry_now)  # shown while lost
             stats = tk.Label(parent, anchor="w", font=("TkFixedFont", 9))
             stats.pack(fill="x", pady=(0, 6))
             self.views[name] = (title, image, stats)
@@ -359,8 +370,8 @@ class App:
     def tick(self):
         if not self.switching["busy"] and time.monotonic() > self.retry_at \
                 and any(s.idle.is_set() for s in self.streams.values()):  # a stream lost its device
-            self.switching["busy"] = True
-            self.log("lost the scanner (it resets its USB connection now and then): reconnecting ...")
+            self.switching["busy"], self.lost = True, True
+            self.log("lost the scanner (unplugged, or it reset its USB connection): reconnecting ...")
             threading.Thread(target=self.reconnect, daemon=True).start()
         if self.switching["done"]:  # back in the Tk thread after a range switch or a reconnect
             self.switching.update(done=None, busy=False)
@@ -379,9 +390,18 @@ class App:
                 self.images[name] = tk.PhotoImage(data=s.latest, format="PPM")
                 image.configure(image=self.images[name])
             stats.configure(text=f"{s.fps:4.1f} fps   {s.stats.get('text', '')}")
-        if self.depth.stats:
+        if self.lost:
+            wait = self.retry_at - time.monotonic()
+            self.guide.configure(fg=BAD, text="Reconnecting to the scanner ..." if self.switching["busy"] or wait <= 0 else
+                                 f"Scanner disconnected: plug it in or replug it. Next try in {wait:.0f} s")
+        elif self.depth.stats:
             text, colour = distance_hint(self.depth.stats)
             self.guide.configure(text=text, fg=colour)
+        retry_shown = self.retry.winfo_ismapped()
+        if self.lost and not self.switching["busy"] and not retry_shown:
+            self.retry.pack(side="right", padx=(6, 0))
+        elif retry_shown and (not self.lost or self.switching["busy"]):
+            self.retry.pack_forget()
         self.check_mesh()
         self.check_scan()
         recorder = self.rec["recorder"]
@@ -532,6 +552,7 @@ class App:
             for s in self.streams.values():
                 s.pause()
             if self.reopen():
+                self.lost = False
                 self.log(f"scanner back ({calib.CAMERA.mode})")
                 if self.imu_want:
                     self.imu_on()
@@ -539,6 +560,11 @@ class App:
                 self.retry_at = time.monotonic() + RETRY_S
         finally:
             self.switching["done"] = True
+
+    def retry_now(self):
+        """The Retry now button: reconnect at the next tick instead of waiting for the timer."""
+        self.retry_at = 0.0
+        self.log("retrying now ...")
 
     def reopen(self):
         """Open all three streams again (node paths can change after the scanner re-enumerates).
@@ -796,6 +822,25 @@ def refuse(text):
     root.destroy()
 
 
+def scanner_problem(error):
+    """What to tell the user when the scanner can't be opened at start."""
+    if usbdepth.find() is None:
+        return "The scanner is not connected.\n\nPlug it in (or replug it), wait a few seconds, then press Retry."
+    return (f"The scanner is connected but could not be opened:\n{error}\n\nClose other programs that use it "
+            "(CrealityScan, a measure or calibrate run), or replug it, wait a few seconds, then press Retry.")
+
+
+def open_app(root, ask=tkinter.messagebox.askretrycancel):
+    """The App, or None if the user gives up: while the scanner can't be opened, say why and offer Retry."""
+    while True:
+        try:
+            return App(root)
+        except (RuntimeError, OSError) as e:
+            print(f"scanner not available: {e}", flush=True)
+            if not ask("triBUUTSCAN", scanner_problem(e), parent=root):
+                return None
+
+
 def main():
     LOCK.parent.mkdir(exist_ok=True)
     lock = open(LOCK, "w")
@@ -805,12 +850,12 @@ def main():
         refuse("The viewer is already running: use that window, or close it first.")
         return
     root = tk.Tk()
-    try:
-        app = App(root)
-    except (RuntimeError, OSError) as e:
+    root.withdraw()  # only the Retry question until the scanner opens
+    app = open_app(root)
+    if app is None:
         root.destroy()
-        refuse(f"Could not open the scanner: {e}\n\nIs it plugged in, and is no other program using it?")
         return
+    root.deiconify()
     app.build_window()
     app.start()
     root.mainloop()
