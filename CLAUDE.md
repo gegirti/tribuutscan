@@ -172,6 +172,16 @@ is simply getting colour, IR and depth out of the scanner on Linux.
   - The mode is NOT kept across a full USB reset: killing a program that held the scanner caused a
     "USB disconnect" and the scanner came back in Close_range_mode Default. Ordinary stream stops and
     restarts kept the mode. Safe, since the mode is read at every open.
+- Viewer v2 (2026-10-31): `viewer.App` holds state and actions; `panels.py` has one class per right-hand
+  panel (`PANELS` in viewer.py lists them; each has build/refresh). Previews are index-resampled to
+  SIDE_W 400 / DEPTH_W 800. Window 1486 x 969 with every panel open (fits 1920 x 1080 at Tk scaling
+  1.33). The IMU is on while the viewer runs (if the udev rule allows): its vendor commands go through
+  the USB depth capture (`vendor.Channel(usb=...)`, control transfers to interface 0 / unit 4), it is
+  switched off before a range switch and on close, and back on after the switch. Checked on the
+  scanner: 30 fps on all streams, IMU 199-201 Hz, a 5 s recording held 51 sets and 1002 IMU rows,
+  range switches ~10 s each with the IMU back, and after close the IMU switches read 0 and hidraw
+  returned. Recordings: imu.csv (host_t monotonic at arrival, device_us, accel g, gyro deg/s, temp),
+  `frames.read_imu`; info.json "imu" has the rates and ranges.
   - PITFALL: GET_STRUCTURE 1044 got no reply (GET_CUR selector 1 timed out, -110), and ~30 s later
     the scanner dropped off USB ("device not accepting address", error -71) until it was
     physically replugged. vendor.py refuses 1044 and stops on any timeout.
@@ -188,15 +198,17 @@ is simply getting colour, IR and depth out of the scanner on Linux.
 
 ```
 tribuutscan-viewer                          # launcher in ~/.local/bin, copy of tribuutscan-viewer.sh
-python3 -m tribuutscan.viewer               # live colour + IR + depth; `s` saves captures/<stamp>/
-                                            # Range menu: close 15-33 cm / long ~20-72 cm (estimate)
+python3 -m tribuutscan.viewer               # depth (middle), colour + IR (left), panels (right, fold):
+                                            # Scanner: Range close 15-33 / long ~20-72 cm (estimate),
+                                            #   IR exposure/gain, colour brightness, Auto IR
+                                            # Capture: `s` saves captures/<stamp>/, `r` records raw sets
+                                            #   + imu.csv to captures/<stamp>-rec/ (~49 MB/s), `m` meshes
+                                            #   the latest recording via .venv fuse.py
+                                            # Scan: `c` live scan (worker process), Open 3D view
+                                            # IMU: tilt horizon, turn rate; View: Find markers
+                                            # events: message line, console, captures/viewer.log
 python3 -m tribuutscan.vendor [modes|scan|switch "<mode>"]   # scanner's depth modes (switch WRITES)
 python3 -m tribuutscan.imu [seconds]         # switch the IMU on, read it, switch it off
-                                            # `r` records raw sets to captures/<stamp>-rec/ (~49 MB/s),
-                                            # Auto IR button, distance guide (estimate),
-                                            # `m` meshes the latest recording via .venv fuse.py;
-                                            # events print to the console and captures/viewer.log
-                                            # `c` live scan (merged cloud, worker process), Open 3D view
 python3 -m tribuutscan.pointcloud [dir]     # .ply from a saved set, or grab a live one
 python3 -m tribuutscan.measure [cm]         # flat target: plane RMS, noise, step -> captures/measure.csv
 python3 -m tribuutscan.usbdepth [s] [--all] # 14-bit USB depth throughput check (--all: + colour, IR)

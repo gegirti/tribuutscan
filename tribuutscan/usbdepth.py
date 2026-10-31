@@ -197,7 +197,7 @@ class DepthCapture:
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
-    def _control(self, request_type, request, value, index, data_or_len, timeout_ms=1000):
+    def control(self, request_type, request, value, index, data_or_len, timeout_ms=1000):
         """One control transfer on endpoint 0; data_or_len is the data to send or the length to read."""
         buf = bytearray(data_or_len)
         ct = bytearray(struct.pack("<BBHHHI4xQ", request_type, request, value, index, len(buf), timeout_ms,
@@ -227,9 +227,9 @@ class DepthCapture:
         struct.pack_into("<HBBI", probe, 0, 1, index, FRAME_INDEX, INTERVAL)
         if payload:
             struct.pack_into("<I", probe, 22, payload)
-        self._control(0x21, SET_CUR, PROBE << 8, VS, probe)
-        got = self._control(0xA1, GET_CUR, PROBE << 8, VS, 34)
-        self._control(0x21, SET_CUR, COMMIT << 8, VS, got)
+        self.control(0x21, SET_CUR, PROBE << 8, VS, probe)
+        got = self.control(0xA1, GET_CUR, PROBE << 8, VS, 34)
+        self.control(0x21, SET_CUR, COMMIT << 8, VS, got)
         self.probe = got
         return struct.unpack_from("<I", got, 22)[0]
 
@@ -289,18 +289,18 @@ class DepthCapture:
     def controls(self):
         out = {}
         for cid, (name, unit, sel, size) in CONTROLS.items():
-            get = lambda req: int.from_bytes(self._control(0xA1, req, sel << 8, unit << 8 | VC, size), "little")
+            get = lambda req: int.from_bytes(self.control(0xA1, req, sel << 8, unit << 8 | VC, size), "little")
             out[name] = dict(id=cid, min=get(GET_MIN), max=get(GET_MAX), step=get(GET_RES),
                              default=get(GET_DEF), value=get(GET_CUR))
         return out
 
     def get_control(self, cid):
         _, unit, sel, size = CONTROLS[cid]
-        return int.from_bytes(self._control(0xA1, GET_CUR, sel << 8, unit << 8 | VC, size), "little")
+        return int.from_bytes(self.control(0xA1, GET_CUR, sel << 8, unit << 8 | VC, size), "little")
 
     def set_control(self, cid, value):
         _, unit, sel, size = CONTROLS[cid]
-        self._control(0x21, SET_CUR, sel << 8, unit << 8 | VC, int(value).to_bytes(size, "little"))
+        self.control(0x21, SET_CUR, sel << 8, unit << 8 | VC, int(value).to_bytes(size, "little"))
 
     def _release(self):
         for i in self._claimed:

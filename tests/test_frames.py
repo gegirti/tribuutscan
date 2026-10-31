@@ -59,3 +59,17 @@ def test_recording_carries_the_depth_mode():
             assert calib.CAMERA.mode == calib.CLOSE  # not noted: an old recording, close range
     finally:
         calib.use_mode(calib.CLOSE)
+
+
+def test_recording_keeps_imu_samples():
+    rows = np.array([[10.5 + k / 200, 1_000_000 + 5000 * k, 0, -1, 0, 0.5, -0.2, 0.1, 30.25, k] for k in range(7)])
+    with tempfile.TemporaryDirectory() as tmp:
+        rec = fr.Recorder(fr.W * 10 // 8, root=tmp)
+        rec.write_imu(rows[:3])
+        rec.write_imu(rows[3:])
+        rec.close()
+        rec.write_imu(rows)  # after close: ignored
+        imu = fr.read_imu(rec.dir)
+        assert fr.read_imu(tmp) is None
+    assert rec.imu_rows == 7 and len(imu["host_t"]) == 7
+    assert np.allclose(imu["device_us"], rows[:, 1]) and np.allclose(imu["ay_g"], -1) and np.allclose(imu["temp_c"], 30.25)

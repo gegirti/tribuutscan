@@ -8,6 +8,10 @@ ImuStreamer.hpp (MIT): an 8-byte header (report id, sample rate, group length, g
 then groups of int16 group id, accel xyz, gyro xyz, temperature and a 64-bit device timestamp.
 
     python3 -m tribuutscan.imu [seconds]     # switch the IMU on, print what it sends, switch it off
+
+`switch_on(channel)` returns a running ImuStream (latest values, a few seconds of history, tilt and turn
+rate, an optional listener such as a Recorder); `switch_off(channel, stream)` undoes it. The axes are
+the IMU's own until its calibration (raw data 4036) is read; at rest upright, gravity is on -y.
 """
 import collections
 import ctypes
@@ -150,33 +154,98 @@ class ImuReader:
         self.close()
 
 
+STILL_DPS, STILL_G = 2.0, 0.05  # "still": |gyro| under 2 deg/s (the bias is ~0.9) and |a| within 0.05 g of 1
+
+
+class ImuStream(threading.Thread):
+    """Reads an ImuReader in the background. `history` holds rows of host time (time.monotonic() at
+    arrival) followed by parse()'s columns; `listener(rows)`, when set, gets every new block."""
+
+    def __init__(self, reader, accel_g, gyro_dps, settings=None, keep_s=5.0):
+        super().__init__(daemon=True)
+        self.reader, self.accel_g, self.gyro_dps = reader, accel_g, gyro_dps
+        self.settings = settings or {}
+        self.history = collections.deque(maxlen=int(keep_s * 1000))
+        self.listener, self.rate, self.running = None, 0.0, True
+
+    def run(self):
+        count, t0 = 0, time.monotonic()
+        while self.running and self.reader.error is None:
+            time.sleep(0.02)
+            blocks = [np.c_[np.full(len(p), t), p] for t, r in self.reader.reports() if len(p := parse(r, self.accel_g, self.gyro_dps))]
+            if blocks:
+                rows = np.concatenate(blocks)
+                self.history.extend(rows)
+                count += len(rows)
+                listener = self.listener
+                if listener is not None:
+                    listener(rows)
+            if time.monotonic() - t0 >= 1:
+                self.rate, count, t0 = count / (time.monotonic() - t0), 0, time.monotonic()
+
+    def state(self, window_s=0.1):
+        """For display: tilt from upright (pitch, roll, degrees, IMU axes), turn rate (deg/s), still,
+        rate (Hz), temperature (C), |a| (g); None before data or after the device went away."""
+        recent = list(self.history)[-max(1, int(window_s * 200)):]
+        if not recent or self.reader.error is not None:
+            return None
+        r = np.array(recent)
+        a, g = r[:, 2:5].mean(0), r[:, 5:8].mean(0)
+        turn, norm = float(np.linalg.norm(g)), float(np.linalg.norm(a))
+        return {"pitch": float(np.degrees(np.arctan2(a[2], -a[1]))), "roll": float(np.degrees(np.arctan2(a[0], -a[1]))),
+                "turn": turn, "still": turn < STILL_DPS and abs(norm - 1) < STILL_G, "rate": self.rate,
+                "temp": float(r[-1, 8]), "g": norm}
+
+    def stop(self):
+        self.running = False
+        self.join(timeout=1)
+        self.reader.close()
+
+
+def switch_on(ch):
+    """Switch the IMU on over vendor channel `ch` and start reading it; returns the running ImuStream."""
+    s = {pid: ch.get_property(pid)[0] for pid in (GYRO_RATE, ACCEL_RATE, GYRO_RANGE, ACCEL_RANGE)}
+    settings = {"gyro_hz": RATE_HZ.get(s[GYRO_RATE]), "gyro_dps": GYRO_DPS[s[GYRO_RANGE]],
+                "accel_hz": RATE_HZ.get(s[ACCEL_RATE]), "accel_g": ACCEL_G[s[ACCEL_RANGE]]}
+    ch.set_property(GYRO_ON, 1)
+    ch.set_property(ACCEL_ON, 1)
+    try:
+        reader = ImuReader()
+    except OSError:
+        switch_off(ch)
+        raise
+    stream = ImuStream(reader, settings["accel_g"], settings["gyro_dps"], settings)
+    stream.start()
+    return stream
+
+
+def switch_off(ch, stream=None):
+    """Stop reading (interface 6 goes back to usbhid) and switch the IMU off."""
+    if stream is not None:
+        stream.stop()
+    ch.set_property(GYRO_ON, 0)
+    ch.set_property(ACCEL_ON, 0)
+
+
 def main():
     seconds = float(sys.argv[1]) if len(sys.argv) > 1 else 5.0
     ch = vendor.Channel()
     try:
-        settings = {pid: ch.get_property(pid)[0] for pid in (GYRO_RATE, ACCEL_RATE, GYRO_RANGE, ACCEL_RANGE)}
-        accel_g, gyro_dps = ACCEL_G[settings[ACCEL_RANGE]], GYRO_DPS[settings[GYRO_RANGE]]
-        print(f"gyro {RATE_HZ.get(settings[GYRO_RATE], '?')} Hz, +-{gyro_dps} deg/s; "
-              f"accel {RATE_HZ.get(settings[ACCEL_RATE], '?')} Hz, +-{accel_g} g")
-        ch.set_property(GYRO_ON, 1)
-        ch.set_property(ACCEL_ON, 1)
+        stream = switch_on(ch)
         try:
-            with ImuReader() as imu:
-                time.sleep(seconds)
-                reports = imu.reports()
+            print(", ".join(f"{k} {v}" for k, v in stream.settings.items()))
+            time.sleep(seconds)
+            rows = np.array(list(stream.history))
         finally:
-            ch.set_property(GYRO_ON, 0)
-            ch.set_property(ACCEL_ON, 0)
+            switch_off(ch, stream)
     finally:
         ch.close()
-    if not reports:
-        sys.exit("no IMU reports")
-    heads = {r[:4].hex(" ") for _, r in reports}
-    s = np.concatenate([parse(r, accel_g, gyro_dps) for _, r in reports])
+    if not len(rows):
+        sys.exit("no IMU samples")
+    s = rows[:, 1:]
     dt = np.diff(s[:, 0])
-    print(f"{len(reports)} reports ({len(reports) / seconds:.0f}/s), {len(s)} samples ({len(s) / seconds:.0f}/s); "
-          f"header bytes {sorted(heads)[:3]}")
-    print(f"device time step: median {np.median(dt):.0f}, min {dt.min():.0f}, max {dt.max():.0f} (units as sent)")
+    print(f"{len(s)} samples ({len(s) / seconds:.0f}/s)")
+    print(f"device time step: median {np.median(dt):.0f}, min {dt.min():.0f}, max {dt.max():.0f} (us)")
     acc, gyr = s[:, 1:4], s[:, 4:7]
     print(f"accel mean {acc.mean(0).round(3)} g, |a| {np.linalg.norm(acc, axis=1).mean():.3f} g, "
           f"std {acc.std(0).round(4)}")

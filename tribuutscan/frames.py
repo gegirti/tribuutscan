@@ -9,6 +9,7 @@ scanner's depth mode (close / long range), whose law calib.CAMERA then uses when
 import json
 import os
 import select
+import threading
 import time
 from pathlib import Path
 
@@ -145,6 +146,7 @@ class Recorder:
         self.files = {k: open(self.dir / f"{k}.raw", "wb") for k in STREAMS}
         self.stamps = open(self.dir / "stamps.csv", "w")
         self.stamps.write("index,color_t,ir_t,depth_t\n")
+        self.imu, self.imu_rows, self.lock = None, 0, threading.Lock()
         self.count = 0
 
     def write(self, bufs, stamps):
@@ -158,9 +160,37 @@ class Recorder:
     def megabytes(self):
         return self.count * sum(self.frame_bytes.values()) / 1e6
 
+    def write_imu(self, rows):
+        """Append IMU samples (imu.ImuStream rows) to imu.csv; called from the IMU thread."""
+        with self.lock:
+            if self.stamps.closed:
+                return
+            if self.imu is None:
+                self.imu = open(self.dir / "imu.csv", "w")
+                self.imu.write(IMU_HEADER + "\n")
+            np.savetxt(self.imu, np.asarray(rows)[:, :9], fmt=IMU_FORMAT, delimiter=",")
+            self.imu_rows += len(rows)
+
     def close(self):
+        with self.lock:
+            if self.imu is not None:
+                self.imu.close()
         for f in (*self.files.values(), self.stamps):
             f.close()
+
+
+IMU_HEADER = "host_t,device_us,ax_g,ay_g,az_g,gx_dps,gy_dps,gz_dps,temp_c"
+IMU_FORMAT = ["%.5f", "%d"] + ["%.5f"] * 6 + ["%.2f"]
+
+
+def read_imu(directory):
+    """{column: array} from a recording's imu.csv (see IMU_HEADER), or None if it has none.
+    host_t is time.monotonic() at arrival, like the frame stamps; device_us is the IMU's own clock."""
+    path = Path(directory) / "imu.csv"
+    if not path.exists():
+        return None
+    data = np.loadtxt(path, delimiter=",", skiprows=1, ndmin=2)
+    return {name: data[:, i] for i, name in enumerate(IMU_HEADER.split(","))}
 
 
 def read_recording(directory):

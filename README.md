@@ -64,7 +64,8 @@ python3 -m venv --system-site-packages .venv
 .venv/bin/pip install "numpy<2" open3d==0.20.0 opencv-python-headless==4.10.0.84
 ```
 
-In the viewer:
+The viewer shows depth large in the middle, colour and IR on the left, and folding panels on the
+right: Scanner, Capture, Scan, IMU and View.
 
 - **Start scan (c)**: stay 18-30 cm from the object (the guide line under the images shows it),
   move slowly, keep markers in view. **Stop scan (c)** saves `captures/<stamp>-scan/cloud.ply` and
@@ -73,11 +74,14 @@ In the viewer:
 - **Open 3D view**: the scan in the browser. *Process* has Optimise again, merge again at
   0.5 / 1 / 2 mm point distance, and Make mesh; *Export* downloads `cloud.ply` and `mesh.ply`.
 - **Save frame (s)** writes one colour + IR + depth set (and a `cloud.ply`) to `captures/<stamp>/`.
-  **Record (r)** writes raw sets, about 10 a second (about 49 MB/s), for processing later;
+  **Record (r)** writes raw sets, about 10 a second (about 49 MB/s), plus the IMU's samples
+  (`imu.csv`, 200 a second), for processing later;
   **Mesh last recording (m)** makes a rough mesh from the latest one.
 - Sliders set colour and IR brightness; *Auto IR* finds an IR exposure without clipping.
 - **Range** switches between close (15-33 cm) and long range (about 20-72 cm, an estimate until
-  calibrated); the images pause for about 7 s while the scanner switches.
+  calibrated); the images pause for about 10 s while the scanner switches.
+- **IMU** shows the scanner's tilt (a small horizon) and how fast it turns, from its built-in
+  accelerometer and gyroscope (`tribuutscan/imu.py`; needs the udev rule).
 
 Only one program can use the scanner at a time. The scanner also resets its USB connection a few
 seconds after a program stops streaming, so give it about 5 s before starting the next one.
@@ -214,9 +218,10 @@ The IR projector turns on by itself when the IR stream is opened.
 ## Layout
 
 - Capture: `v4l2.py` (V4L2 capture, node discovery, timestamps), `usbdepth.py` (14-bit depth over
-  USB), `depth.py` (depth decode),
-  `frames.py` (frame sets, recordings, pairing by time), `image.py`
-- Viewer: `viewer.py` (the window), `livescan.py` (the scan worker process), `view3d.py` + `web/`
+  USB), `depth.py` (depth decode), `vendor.py` (Orbbec commands: depth modes, IMU switches),
+  `imu.py` (the IMU over USB), `frames.py` (frame sets, recordings, pairing by time), `image.py`
+- Viewer: `viewer.py` (the window and its actions), `panels.py` (the right-hand panels),
+  `livescan.py` (the scan worker process), `view3d.py` + `web/`
   (browser 3D view; three.js r160 is vendored so it works offline)
 - Scanning: `cloud.py` (voxel cloud, the scanner), `track.py` (the joint solve), `features.py` (ORB),
   `markers.py` + `markermap.py`, `scene.py` (table plane, object region), `prep.py` (depth cleanup),

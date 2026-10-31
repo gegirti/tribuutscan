@@ -6,8 +6,8 @@ command channel, the same one OpenCV's cap_obsensor and OrbbecSDK_v2 (Protocol.h
   sent with SET_CUR on selector 2 / 1 / 3 (64 / 512 / 1024 bytes, chosen by request length)
 - the reply (u16 magic 0x4252, size, opcode, request id, error code, then data) is read with
   GET_CUR from the selector that fits the expected reply length
-Goes through uvcvideo (UVCIOC_CTRL_QUERY on the depth node), so it needs /dev/video0, i.e. depth on
-V4L2, not the USB capture. Only the read opcodes below can be sent: `request` refuses the others.
+Goes through uvcvideo (UVCIOC_CTRL_QUERY on the depth node), or, while usbdepth.DepthCapture owns the
+depth function (14-bit depth streaming, /dev/video0 gone), as usbfs control transfers through it. Only the read opcodes below can be sent: `request` refuses the others.
 The writes: `switch_depth_mode` puts an entry of the scanner's own mode list into the current depth
 mode (1043), as OrbbecSDK_v2's depth work mode manager does, with no stream running; `set_property`
 sets only the properties in SETTABLE (the IMU's on/off switches, as the SDK's IMU sensors do).
@@ -24,10 +24,11 @@ import fcntl
 import os
 import struct
 import sys
+import threading
 import time
 from pathlib import Path
 
-from . import v4l2
+from . import usbdepth, v4l2
 from .usbdepth import address
 
 UVCIOC_CTRL_QUERY = 0xC0107521
@@ -69,13 +70,24 @@ class VendorError(Exception):
 
 
 class Channel:
-    """The command channel on an open depth node (uvcvideo must own the depth function)."""
+    """The command channel: through uvcvideo on the depth node (`dev`), or through `usb`, a
+    usbdepth.DepthCapture that owns the depth function. One request/reply at a time (a lock)."""
 
-    def __init__(self, dev=None):
-        self.fd = os.open(dev or v4l2.discover()["depth"], os.O_RDWR)
+    def __init__(self, dev=None, usb=None):
+        self.usb = usb
+        self.fd = None if usb else os.open(dev or v4l2.discover()["depth"], os.O_RDWR)
         self.request_id = int(time.time()) & 0x7FFF
+        self.lock = threading.Lock()
 
     def _xu(self, query, selector, buf):
+        if self.usb is not None:  # class request to unit 4 on interface 0 (the depth function's VC)
+            index = UNIT << 8 | usbdepth.VC
+            if query == SET_CUR:
+                self.usb.control(0x21, SET_CUR, selector << 8, index, bytes(buf))
+            else:
+                data = self.usb.control(0xA1, query, selector << 8, index, len(buf))
+                buf[:len(data)] = data
+            return buf
         arg = bytearray(struct.pack("<BBBxH2xQ", UNIT, selector, query, len(buf), address(buf)))
         for _ in range(5):
             try:
@@ -97,6 +109,10 @@ class Channel:
         return self._exchange(opcode, payload, reply_len)
 
     def _exchange(self, opcode, payload, reply_len):
+        with self.lock:
+            return self._exchange_locked(opcode, payload, reply_len)
+
+    def _exchange_locked(self, opcode, payload, reply_len):
         self.request_id = (self.request_id + 1) & 0xFFFF
         req = struct.pack("<HHHH", REQUEST_MAGIC, len(payload) // 2, opcode, self.request_id) + payload
         send_sel = 2 if len(req) <= 64 else 1 if len(req) <= 512 else 3
@@ -173,7 +189,8 @@ class Channel:
         return True
 
     def close(self):
-        os.close(self.fd)
+        if self.fd is not None:
+            os.close(self.fd)
 
 
 def mode_name(entry):
