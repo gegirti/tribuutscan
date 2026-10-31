@@ -218,6 +218,7 @@ The IR projector turns on by itself when the IR stream is opened.
 - Camera: `calib.py` (the camera model), `calibrate.py` (board calibration)
 - Measuring: `evaluate.py` + `metrics.py` (tracking scores on saved and synthetic recordings),
   `synth.py` (synthetic scans with known motion), `measure.py` (depth flatness and noise),
+  `compare.py` (a scan against a reference mesh of the same part),
   `pointcloud.py` (single-frame export)
 - `tribuutscan-viewer.sh` launcher (copy to `~/.local/bin/tribuutscan-viewer`)
 - `udev/70-tribuutscan.rules` USB access for 14-bit depth

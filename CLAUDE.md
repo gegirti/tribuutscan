@@ -164,6 +164,8 @@ python3 -m tribuutscan.view3d captures/<stamp>-scan    # browser 3D view at http
                                             # tracking metrics on saved + synthetic recordings
 .venv/bin/python -m tribuutscan.synth [out] [frames] [every] [hard]   # synthetic box scan, ground truth
 .venv/bin/python -m tribuutscan.fuse captures/<stamp>-rec   # ROUGH mesh.ply from a recording (Open3D)
+.venv/bin/python -m tribuutscan.compare captures/<stamp>-scan [ref.ply]  # score against a reference mesh
+                                            # (default captures/reference/part/mesh.ply) -> compare.json/.ply
 ```
 
 Beware `pkill -f ...tribuutscan.viewer` inside a shell command: the pattern matches the shell
@@ -337,6 +339,21 @@ Calibration result (captures/calib/20261030-184110, 28 views, 19-33 cm, tilts to
 - Estimate mode is unchanged (same evaluation numbers).
 Markers: the retroreflective dot usually has depth on this scanner (about 90% of its pixels), and a
 plane fitted to the ring around the dot is flat to about 0.3 mm.
+
+## Reference part (2026-10-31)
+
+captures/reference/part/mesh.ply is CrealityScan's final mesh of the marker test part (Android app,
+4 scans merged, 2026-10-30; mm; ~274 x 192 x 44 mm), the same part as captures/20261030-194411-scan.
+It is a scan too, not ground truth. compare.py on the marker scan:
+- our cloud covers 54% of the reference surface within 2 mm (one side; still mode); 76% of our points
+  lie on the part
+- distance to the reference: median 0.77 mm, p90 3.4 mm, growing from the middle to the rim:
+  0.24 / 0.37 / 1.25 / 2.85 mm at 0-30 / 30-60 / 60-90 / 90-120 mm from the centre
+- a free scale fits at 0.970 (ours 3% larger) but barely helps (median 0.75 mm), so it is mostly shape
+- single raw frames refit alone show the same rim error by image radius, BUT a full frame of flat taped
+  paper at 30 cm is flat to +-0.15 mm (median) from the image centre to the edge, so the camera model
+  is not bowing frames. Open: steep sides / part edges at the image edge, or the reference itself.
+  A caliper measurement of the part would settle the size question.
 
 ## Pitfalls already hit
 
