@@ -77,6 +77,7 @@ is simply getting colour, IR and depth out of the scanner on Linux.
   node's auto exposure is 2: on 2026-10-31 it was 0, the exposure read back drifted (968-985) and
   setting it changed nothing, on both paths. With 2: exposure 500/1500/3000/6000 gave IR mean
   9.5/28.8/54.6/95.7, identical over USB and V4L2.
+  The viewer now sets the IR node's auto exposure to 2 at start and after a range switch (verified 0 -> 2).
 - One test with light boxes at about 25 cm in a dark room: depth stayed at about 72% valid from exposure
   800 to 3000. Clipping cost depth: gain 8000 gave 33% clipped pixels and only 47% valid. The
   projector lights the scene on its own. So the rule is to avoid IR clipping, not to make the image

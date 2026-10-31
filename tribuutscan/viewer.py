@@ -204,6 +204,17 @@ def distance_hint(stats):
     return text + " - good", GOOD
 
 
+IR_EXPOSURE_MODE = 2  # IR node's auto exposure menu: 2 lets the depth function's IR exposure and gain act;
+# in 0 (auto, seen after a power-up on 2026-10-31) the sliders and Auto IR changed nothing
+
+
+def ir_exposure_by_hand(nodes, log):
+    try:
+        v4l2.set_control(nodes["ir"], v4l2.CID_EXPOSURE_AUTO, IR_EXPOSURE_MODE)
+    except OSError as e:
+        log(f"IR exposure mode not set ({e.strerror}): the IR sliders may do nothing")
+
+
 RANGES = {"Close range 15-33 cm": calib.CLOSE, "Long range ~20-72 cm (estimate)": calib.LONG}
 SWITCH_SETTLE_S = 6.0  # the scanner may reset its USB connection a few seconds after its streams stop
 
@@ -243,6 +254,7 @@ def set_control(target, cid, value):
 
 def main():
     nodes = v4l2.discover()
+    ir_exposure_by_hand(nodes, print)
     depth_cap = fr.open_depth(nodes)
     on_usb = isinstance(depth_cap, usbdepth.DepthCapture)
     targets = {**nodes, "depth": depth_cap if on_usb else nodes["depth"]}  # where each slider's control lives
@@ -544,6 +556,7 @@ def main():
         """Open all three streams again (node paths can change after the scanner re-enumerates)."""
         try:
             nodes.update(wait_for_scanner())
+            ir_exposure_by_hand(nodes, log)  # a USB reset puts it back to auto
             color.resume(v4l2.Capture(nodes["color"], "YUYV", fr.W, fr.H))
             ir.resume(v4l2.Capture(nodes["ir"], "GREY", fr.W, fr.H))
             cap = fr.open_depth(nodes, log)
