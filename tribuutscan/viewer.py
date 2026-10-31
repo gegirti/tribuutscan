@@ -462,6 +462,8 @@ class App:
         return {label: get_control(self.targets[node], cid) for label, (node, cid, _, _) in self.controls.items()}
 
     def start_auto(self):
+        if self.auto["running"]:  # a second click would start a second chain of steps beside the first
+            return
         if "IR exposure" in self.controls and "IR gain" in self.controls and not self.switching["busy"]:
             self.auto["steps"], self.auto["running"] = 0, True
             self.auto_step()
