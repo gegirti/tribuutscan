@@ -470,10 +470,9 @@ It is a scan too, not ground truth. compare.py on the marker scan:
 
 ## Roadmap
 
-See the README. Next: USB capture of Creality's app traffic (usbmon, needs sudo, run under Wine/
-Bottles or Android) to find the commands that may widen the depth window and where calibration
-lives; then proper calibration, multi-view fusion (Open3D in a separate venv), geometry, markers,
-texturing, and a better interface (planned in VS Code).
+See the README TODO. Priority since 2026-11-01: object separation and background removal (the user's
+call); speed, accuracy (printed test box, long-range calibration) and IMU-in-tracking are queued there.
+The USB-capture idea is no longer needed: vendor.py reads and switches the depth modes directly.
 
 ## The person you are working with
 

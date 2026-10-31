@@ -243,12 +243,28 @@ The IR projector turns on by itself when the IR stream is opened.
 
 Next up:
 
-- [ ] **USB capture**: record the traffic between Creality's app and the scanner (usbmon, under
-      Wine/Bottles or Android) while it switches size modes, to reach beyond 33 cm.
-- [ ] **Speed**: tracking at 3-7 fps on the CPU; move the heavy parts to native or GPU code.
-- [ ] **Object isolation**: keep the background out (a crop box in the 3D view, smarter cut-out).
+- [ ] **Object separation** (in progress): recognise the object in front once, keep a 3D box around
+      it on its base, crop every frame to it, and an option to remove the base from the result.
+- [ ] **Speed** (measured on the marker scan: 247 ms per frame, about 4 fps):
+  - [ ] the per-frame object search (about 57 ms), which object separation replaces
+  - [ ] lens-model lookups instead of per-point maths (about 20 ms)
+  - [ ] fewer Open3D fit checks per frame (about 12 calls, 17 ms)
+  - [ ] ORB features on every second frame (about 8 ms)
+  - [ ] independent steps in parallel (11 of 12 CPU threads idle)
+  - [ ] GPU last, if still needed: Intel Arc A750, so OpenCL or Vulkan, not CUDA
+- [ ] **Accuracy**:
+  - [ ] a printed test box with known dimensions and small details
+  - [ ] a long-range board calibration
+  - [ ] the up-to-3 mm rim error against Creality's scan of the same part
+- [ ] **IMU in tracking**: read the scanner's IMU calibration, check its clock against the depth
+      frames, use the gyro as the rotation guess.
 
 Done:
+
+- [x] **14-bit depth** over USB: 16x finer steps than V4L2's 10-bit.
+- [x] **Depth modes** through Orbbec's command channel: close (15-33 cm) and long range (about
+      20-72 cm). The scanner turned out to be active stereo with two IR cameras 75 mm apart.
+- [x] **IMU** readout (200 Hz), and **viewer v2** with folding panels.
 
 - [x] **Calibration**: depth law, both cameras, colour-to-depth registration, from a printed board.
 - [x] **Live scanning**: tracking (shape + markers + image features), merged cloud, Optimise with
@@ -260,7 +276,7 @@ Later:
 
 - [ ] **Geometry**: cleanup and better meshing (today's mesh is a rough Poisson surface).
 - [ ] **Texturing** from the colour camera.
-- [ ] **A better interface**, to be built in VS Code (the viewer is a plain tkinter window).
+- [ ] **Interface polish** (viewer v2 is in place; a VS Code based interface is still an idea).
 - [ ] Packaging.
 
 Open for everyone:
