@@ -8,8 +8,9 @@ command channel, the same one OpenCV's cap_obsensor and OrbbecSDK_v2 (Protocol.h
   GET_CUR from the selector that fits the expected reply length
 Goes through uvcvideo (UVCIOC_CTRL_QUERY on the depth node), so it needs /dev/video0, i.e. depth on
 V4L2, not the USB capture. Only the read opcodes below can be sent: `request` refuses the others.
-The one write is `switch_depth_mode`: it puts an entry of the scanner's own mode list into the current
-depth mode (1043), as OrbbecSDK_v2's depth work mode manager does, with no stream running.
+The writes: `switch_depth_mode` puts an entry of the scanner's own mode list into the current depth
+mode (1043), as OrbbecSDK_v2's depth work mode manager does, with no stream running; `set_property`
+sets only the properties in SETTABLE (the IMU's on/off switches, as the SDK's IMU sensors do).
 
     python3 -m tribuutscan.vendor            # known properties and structures
     python3 -m tribuutscan.vendor modes      # the depth modes the scanner offers (list 4034)
@@ -40,7 +41,9 @@ INIT_READ_RAW, READ_RAW, FINISH_READ_RAW = 17, 18, 19
 GET_CMD_VERSION, GET_STRUCTURE_V11 = 26, 27
 INIT_READ_LIST, READ_LIST, FINISH_READ_LIST = 29, 30, 31
 GET_PROTOCOL_VERSION = 0xFE
+SET_PROPERTY = 2  # used only by set_property, for SETTABLE
 SET_STRUCTURE_V11 = 28  # used only by switch_depth_mode
+SETTABLE = {2019: "GYRO_SWITCH", 2020: "ACCEL_SWITCH"}  # OrbbecSDK_v2 InternalProperty.hpp
 CURRENT_DEPTH_MODE = 1043
 READ_OPCODES = {GET_PROPERTY, GET_STRUCTURE, INIT_READ_RAW, READ_RAW, FINISH_READ_RAW, GET_CMD_VERSION,
                 GET_STRUCTURE_V11, INIT_READ_LIST, READ_LIST, FINISH_READ_LIST, GET_PROTOCOL_VERSION}
@@ -117,6 +120,12 @@ class Channel:
     def get_property(self, pid):
         """(cur, max, min, def, step)"""
         return struct.unpack("<5i", self.request(GET_PROPERTY, struct.pack("<I", pid))[:20])
+
+    def set_property(self, pid, value):
+        """Set an integer property; only the ids in SETTABLE are allowed."""
+        if pid not in SETTABLE:
+            raise VendorError(f"property {pid} is not settable here: refused")
+        self._exchange(SET_PROPERTY, struct.pack("<Ii", pid, int(value)), 64)
 
     def get_structure(self, sid, reply_len=512):
         return self.request(GET_STRUCTURE, struct.pack("<I", sid), reply_len)

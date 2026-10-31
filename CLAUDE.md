@@ -117,8 +117,16 @@ is simply getting colour, IR and depth out of the scanner on Linux.
   - With "keep raw frames" a live scan can be replayed exactly with cloud.py.
   - A spawned worker re-runs the starting script, so test drivers need an
     `if __name__ == "__main__"` guard.
-- USB interface 6 (HID, `/dev/hidraw*`, root only) names itself "CR-Scan FerretIMU": a motion sensor,
-  not the control channel (corrected 2026-10-31). Not read yet.
+- USB interface 6 (HID, `/dev/hidraw*`, root only) names itself "CR-Scan FerretIMU": the ICM-40608
+  IMU, not the control channel. `imu.py` reads it over usbfs (same udev rule; usbhid is unbound from
+  interface 6 only and rebound after). It sends only while switched on over the command channel
+  (properties 2019 gyro / 2020 accel = 1; `vendor.set_property` allows only these two). Read on
+  2026-10-31: 100 reports/s of 248 bytes, each 2 samples (200 Hz); header 01 07 18 02; groups of
+  int16 id, accel xyz, gyro xyz, temperature + u64 device time, ~4992 units per sample (so us).
+  Settings: gyro 200 Hz +-1000 deg/s, accel 200 Hz +-4 g (offered rates 100/200/500/1000 Hz).
+  At rest: |a| 0.995 g, gravity on -y; gyro mean (-0.17, -0.89, -0.17) deg/s, i.e. a bias to calibrate
+  (IMU calibration raw data 4036 not read yet). While the viewer streams 14-bit depth, /dev/video0 is
+  gone, so commands must go through the viewer's own usbfs handle (interface 0) instead.
 - Vendor commands go through UVC extension units (read 2026-10-31 with UVCIOC_CTRL_QUERY, GET only):
   - depth unit 4, GUID a55751a1-f3c5-4a5e-8d5a-6854b8fa2716 (Orbbec's common command XU; OpenCV's
     cap_obsensor uses the same GUID): selectors 1 / 2 / 3 = 512 / 64 / 1024 bytes, get+set, all
@@ -183,6 +191,7 @@ tribuutscan-viewer                          # launcher in ~/.local/bin, copy of 
 python3 -m tribuutscan.viewer               # live colour + IR + depth; `s` saves captures/<stamp>/
                                             # Range menu: close 15-33 cm / long ~20-72 cm (estimate)
 python3 -m tribuutscan.vendor [modes|scan|switch "<mode>"]   # scanner's depth modes (switch WRITES)
+python3 -m tribuutscan.imu [seconds]         # switch the IMU on, read it, switch it off
                                             # `r` records raw sets to captures/<stamp>-rec/ (~49 MB/s),
                                             # Auto IR button, distance guide (estimate),
                                             # `m` meshes the latest recording via .venv fuse.py;
