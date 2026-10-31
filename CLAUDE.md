@@ -200,8 +200,10 @@ is simply getting colour, IR and depth out of the scanner on Linux.
       so a retry finds the scanner free.
     - While running, a lost scanner turns the distance bar red with a countdown and shows Retry now
       (`retry_now`).
-    - The start path was checked with the scanner really unplugged. The running path has a unit
-      test, but its scanner test could not run then (unplugged).
+    - The start path was checked with the scanner really unplugged. The user then used it for real:
+      5 Retries while unplugged, plugged in at 23:40:43, viewer open at 23:40:47 with the IMU on.
+    - The running path (a real unplug) has a unit test and the reconnect logic, but has not been
+      tried by hand yet.
   - PITFALL: GET_STRUCTURE 1044 got no reply (GET_CUR selector 1 timed out, -110), and ~30 s later
     the scanner dropped off USB ("device not accepting address", error -71) until it was
     physically replugged. vendor.py refuses 1044 and stops on any timeout.
