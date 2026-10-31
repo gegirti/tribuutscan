@@ -1,0 +1,146 @@
+"""Orbbec vendor commands over the depth function's UVC extension unit. READ-ONLY for now.
+
+The depth function's extension unit 4 (GUID a55751a1-f3c5-4a5e-8d5a-6854b8fa2716) is Orbbec's
+command channel, the same one OpenCV's cap_obsensor and OrbbecSDK_v2 (Protocol.hpp, MIT) use:
+- a request is a header (u16 magic 0x4d47, size in half-words, opcode, request id) and a payload,
+  sent with SET_CUR on selector 2 / 1 / 3 (64 / 512 / 1024 bytes, chosen by request length)
+- the reply (u16 magic 0x4252, size, opcode, request id, error code, then data) is read with
+  GET_CUR from the selector that fits the expected reply length
+Goes through uvcvideo (UVCIOC_CTRL_QUERY on the depth node), so it needs /dev/video0, i.e. depth on
+V4L2, not the USB capture. Only the read opcodes below can be sent: `request` refuses the others.
+
+    python3 -m tribuutscan.vendor            # known properties and structures
+    python3 -m tribuutscan.vendor scan       # also try every property id 0-299 and structure 1000-1043
+Careful: a read of structure 1044 hung the scanner's firmware until it was replugged. Any timeout
+ends the run (TimeoutError is not caught).
+"""
+import errno
+import fcntl
+import os
+import struct
+import sys
+import time
+
+from . import v4l2
+from .usbdepth import address
+
+UVCIOC_CTRL_QUERY = 0xC0107521
+UNIT = 4
+SET_CUR, GET_CUR = 0x01, 0x81
+SELECTOR_SIZE = {2: 64, 1: 512, 3: 1024}
+REQUEST_MAGIC, RESPONSE_MAGIC = 0x4D47, 0x4252
+
+GET_PROPERTY, GET_STRUCTURE = 1, 3
+INIT_READ_RAW, READ_RAW, FINISH_READ_RAW = 17, 18, 19
+GET_CMD_VERSION, GET_STRUCTURE_V11 = 26, 27
+INIT_READ_LIST, READ_LIST, FINISH_READ_LIST = 29, 30, 31
+GET_PROTOCOL_VERSION = 0xFE
+READ_OPCODES = {GET_PROPERTY, GET_STRUCTURE, INIT_READ_RAW, READ_RAW, FINISH_READ_RAW, GET_CMD_VERSION,
+                GET_STRUCTURE_V11, INIT_READ_LIST, READ_LIST, FINISH_READ_LIST, GET_PROTOCOL_VERSION}
+ERRORS = {1: "invalid request", 2: "unsupported", 3: "busy", 4: "forbidden", 5: "error command",
+          6: "not found", 0xFFFF: "unknown error"}
+
+# OrbbecSDK_v2 include/libobsensor/h/Property.h
+PROPERTIES = {2: "LDP", 3: "LASER", 4: "LASER_PULSE_WIDTH", 14: "DEPTH_MIRROR", 18: "IR_MIRROR",
+              22: "MIN_DEPTH", 23: "MAX_DEPTH", 32: "LDP_STATUS", 75: "DEPTH_PRECISION_LEVEL", 79: "LASER_MODE",
+              95: "DEVICE_WORK_MODE", 98: "SWITCH_IR_MODE", 99: "LASER_POWER_LEVEL", 100: "LDP_MEASURE_DISTANCE",
+              119: "LASER_POWER_ACTUAL_LEVEL", 182: "LASER_CONTROL", 184: "IR_BRIGHTNESS"}
+STRUCTURES = {1002: "BASELINE_CALIBRATION_PARAM", 1003: "DEVICE_TEMPERATURE", 1035: "DEVICE_SERIAL_NUMBER",
+              1043: "CURRENT_DEPTH_ALG_MODE", 1045: "DEPTH_PRECISION_SUPPORT_LIST",
+              1069: "PRESET_RESOLUTION_CONFIG"}
+PRIVATE = {1035, 1063}  # serial numbers: never printed
+HANGS = {1044}  # GET_STRUCTURE 1044 hung the firmware (2026-10-31): no reply, then the scanner left USB
+
+
+class VendorError(Exception):
+    pass
+
+
+class Channel:
+    """The command channel on an open depth node (uvcvideo must own the depth function)."""
+
+    def __init__(self, dev=None):
+        self.fd = os.open(dev or v4l2.discover()["depth"], os.O_RDWR)
+        self.request_id = int(time.time()) & 0x7FFF
+
+    def _xu(self, query, selector, buf):
+        arg = bytearray(struct.pack("<BBBxH2xQ", UNIT, selector, query, len(buf), address(buf)))
+        for _ in range(5):
+            try:
+                fcntl.ioctl(self.fd, UVCIOC_CTRL_QUERY, arg)
+                return buf
+            except OSError as e:
+                if e.errno not in (errno.EAGAIN, errno.EBUSY):
+                    raise
+                time.sleep(0.01)
+        raise VendorError("extension unit busy")
+
+    def request(self, opcode, payload=b"", reply_len=64):
+        """Send one READ request; returns the reply data (bytes after the 10-byte header).
+        A timeout is raised as TimeoutError: callers must stop then, not try the next id."""
+        if opcode not in READ_OPCODES:
+            raise VendorError(f"opcode {opcode} is not a read: refused")
+        if opcode in (GET_STRUCTURE, GET_STRUCTURE_V11) and struct.unpack_from("<I", payload)[0] in HANGS:
+            raise VendorError("known to hang the firmware: refused")
+        self.request_id = (self.request_id + 1) & 0xFFFF
+        req = struct.pack("<HHHH", REQUEST_MAGIC, len(payload) // 2, opcode, self.request_id) + payload
+        send_sel = 2 if len(req) <= 64 else 1 if len(req) <= 512 else 3
+        self._xu(SET_CUR, send_sel, bytearray(req.ljust(SELECTOR_SIZE[send_sel], b"\0")))
+        recv_sel = 2 if reply_len <= 64 else 1 if reply_len <= 512 else 3
+        for _ in range(3):
+            resp = bytes(self._xu(GET_CUR, recv_sel, bytearray(SELECTOR_SIZE[recv_sel])))
+            magic, half_words, op, rid, err = struct.unpack_from("<HHHHH", resp)
+            if magic != RESPONSE_MAGIC or rid != self.request_id:
+                raise VendorError(f"bad reply: magic {magic:#06x}, id {rid} (sent {self.request_id})")
+            if err != 3:  # 3 = busy: read again
+                break
+            time.sleep(0.02)
+        if err:
+            raise VendorError(ERRORS.get(err, f"error {err:#06x}"))
+        size = half_words * 2 - 2  # the size counts the error code too
+        if 10 + size > len(resp):
+            raise VendorError(f"reply of {size} bytes does not fit selector {recv_sel}")
+        return resp[10:10 + size]
+
+    def get_property(self, pid):
+        """(cur, max, min, def, step)"""
+        return struct.unpack("<5i", self.request(GET_PROPERTY, struct.pack("<I", pid))[:20])
+
+    def get_structure(self, sid, reply_len=512):
+        return self.request(GET_STRUCTURE, struct.pack("<I", sid), reply_len)
+
+    def close(self):
+        os.close(self.fd)
+
+
+def show(data):
+    text = bytes(c if 32 <= c < 127 else 46 for c in data).decode()
+    return f"{len(data)} bytes  {data[:48].hex(' ')}{' ...' if len(data) > 48 else ''}  |{text[:48]}|"
+
+
+def main():
+    ch = Channel()
+    try:
+        print("properties (cur, max, min, def, step):")
+        ids = range(300) if "scan" in sys.argv else PROPERTIES
+        for pid in ids:
+            try:
+                print(f"  {pid:4} {PROPERTIES.get(pid, ''):26} {ch.get_property(pid)}")
+            except VendorError as e:
+                if "scan" not in sys.argv:
+                    print(f"  {pid:4} {PROPERTIES.get(pid, ''):26} -- {e}")
+        print("structures:")
+        ids = range(1000, 1043) if "scan" in sys.argv else STRUCTURES  # 1044 hung the firmware; nothing past it yet
+        for sid in ids:
+            try:
+                data = ch.get_structure(sid)
+                print(f"  {sid:4} {STRUCTURES.get(sid, ''):26} " + (f"{len(data)} bytes (private)" if sid in PRIVATE else show(data)))
+            except VendorError as e:
+                if "scan" not in sys.argv:
+                    print(f"  {sid:4} {STRUCTURES.get(sid, ''):26} -- {e}")
+    finally:
+        ch.close()
+
+
+if __name__ == "__main__":
+    main()

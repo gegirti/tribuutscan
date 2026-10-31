@@ -129,6 +129,17 @@ is simply getting colour, IR and depth out of the scanner on Linux.
   value; sent with SET_CUR on selector 2, reply read from selector 2 (or 1 for big structures);
   reply bytes 8-9 = status (0 ok), data from byte 10. Candidate ids from OrbbecSDK_v2 Property.h:
   LDP 2, laser 3, min/max depth 22/23, depth precision level 75, current depth alg mode 1043.
+- Read over that channel on 2026-10-31 (`vendor.py`, read opcodes only; replies valid, magic 0x4252):
+  - current depth mode (structure 1043): "Close_range_mode Default" (16-byte checksum, 32-byte name,
+    4 more bytes). So the near window is a named mode and others presumably exist.
+  - sensors (1042): OV02K10 (colour), OV9282 (IR, global shutter), ICM-40608 (IMU); versions (1000)
+    "1.2.6", "0.1", "1.0.2"; temperatures (1003) ~24 C; baseline structure (1002) floats 130.0, 7.5
+  - properties: LDP 2 (0/1), laser 3 (0 while idle), 4 = 1627 of 100-6800 (default 2200, same range
+    as IR exposure), depth precision level 75 = 1 of 0-1, LDP distance 100 = 0 of 0-3000; MIN/MAX
+    DEPTH 22/23 unsupported; ~40 more ids answer (scan output not interpreted yet)
+  - PITFALL: GET_STRUCTURE 1044 got no reply (GET_CUR selector 1 timed out, -110), and ~30 s later
+    the scanner dropped off USB ("device not accepting address", error -71) until it was
+    physically replugged. vendor.py refuses 1044 and stops on any timeout.
 - CrealityScan (Windows, run under Bottles) ships a custom Orbbec SDK (OrbbecSDK.dll) with a
   `FerretUvcDevice` class: `switchDepthAlgMode`, `initDepthProcessParam`, and depth work modes whose
   names and checksums the SDK reads from the device. Its embedded config asks for depth 1280x800 in
