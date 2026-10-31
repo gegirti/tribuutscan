@@ -204,6 +204,22 @@ is simply getting colour, IR and depth out of the scanner on Linux.
       5 Retries while unplugged, plugged in at 23:40:43, viewer open at 23:40:47 with the IMU on.
     - The running path (a real unplug) has a unit test and the reconnect logic, but has not been
       tried by hand yet.
+  - WHY THE MODES (2026-10-31): the scanner is active stereo. Two IR cameras 75 mm apart (structure
+    1002 reads 130.0, 7.5; the 7.5 is cm) see a projected dot pattern.
+    - The calibrated law is raw = 4 x disparity - b: a / (fx x 75 mm) = 4.007, so a raw unit is a
+      quarter pixel and a Y14 unit 1/64 px.
+    - Each depth mode is the same 256-px disparity window (10 bits of quarter pixels) at another
+      offset: close 218-474 px = 152-331 mm, long 100-356 px = 203-719 mm.
+    - One side of the depth image has a blind strip as wide as the disparity: 241 px predicted at
+      300 mm, 246 seen.
+    - Specs (retail and review pages): working distance 150-700 mm; capture 820 x 560 mm at 700 mm
+      (our model: 855 x 582); accuracy 0.1 mm; point distance 0.16 mm; 30 fps; object size 15 cm - 2 m.
+      The 2 m is the object you walk around, not a distance: 2 m would need 36 px of disparity, and no
+      mode goes below 100.
+    - Depth step per raw unit grows with z^2: Y10 0.22 / 0.86 / 1.69 mm at 25 / 50 / 70 cm, Y14 / 16.
+    - The depth function's 8-bit format (3, Y8) streamed all zeros in close mode (scene probably out
+      of range): not a second IR image. The second camera is likely only exposed in a calibration
+      mode (option bit 2 = right IR through the depth channel); not tried, since it is a write.
   - PITFALL: GET_STRUCTURE 1044 got no reply (GET_CUR selector 1 timed out, -110), and ~30 s later
     the scanner dropped off USB ("device not accepting address", error -71) until it was
     physically replugged. vendor.py refuses 1044 and stops on any timeout.
