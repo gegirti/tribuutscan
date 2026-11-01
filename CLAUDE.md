@@ -224,6 +224,32 @@ is simply getting colour, IR and depth out of the scanner on Linux.
   - PITFALL: GET_STRUCTURE 1044 got no reply (GET_CUR selector 1 timed out, -110), and ~30 s later
     the scanner dropped off USB ("device not accepting address", error -71) until it was
     physically replugged. vendor.py refuses 1044 and stops on any timeout.
+- FACTORY CALIBRATION (read 2026-11-01 with the list opcodes 29/30/31, as OrbbecSDK_v2's
+  G2AlgParamManager does; layouts from its InternalTypes.hpp, packed; raw bytes and factory.json in
+  captures/factory/; the scanner stayed on USB). Lead from github.com/ssjrocks/ubuntu-ferret-scanner.
+  - 4026 (OBDepthCalibrationParam, command version 1, 28 bytes): baseline 150.284 x unit 0.5 =
+    75.14 mm, focalPix 960.51, dispOffset 218 (close mode; ssjrocks' unit reads 100 in long mode, not
+    read on ours), z0 662.16 (the far end in 0.5 mm). On the Y10 scale z = 4 unit baseline focal /
+    (v + 4 dispOffset) = 288700 / (v + 872). Ours 289570 / (v + 873.4): 0.34-0.46 mm apart over the
+    whole close window. Lateral scale a / fx 300.57 against ours 300.53.
+  - 4027 (OBCameraParam_Internal_V0, 2 x 152 bytes; the 2nd is labelled 800x600, cy - 100): depth
+    fx = fy 960.51, cx 646.30, cy 398.94, no distortion (rectified); colour fx 842.05 / 842.36,
+    cx 637.13, cy 395.39, rational k1-k6 + p1 p2; colour = R depth + t (the SDK's convention,
+    CoordinateUtil.cpp), t = (19.55, -0.03, -0.77) mm.
+  - 4024 (OBD2CProfile, 22 bytes each): colour 1280x720, 1920x1080 (x1.5) and 640x360 (x0.5) use
+    record 0 with 40 / 60 / 20 rows cropped top and bottom; colour 1280x800 has no record (255). So
+    the colour model is 1280x720 inside a 1280x800 frame, and our 1280x800 colour stream is that
+    image stretched by 10/9: y800 = (y_rec - 40 + 0.5) 10/9 - 0.5.
+  - The factory frame is our depth AND colour streams mirrored horizontally (the IR stream's own
+    orientation; rafik24's SDK fork turns on DEPTH_MIRROR 14 and COLOR_MIRROR 81, which explains its
+    "vendor commands"). Tested on the 23 usable board views (797 corners): colour on depth 0.88 px
+    median, p90 1.24, with both mirrored and R p + t; the 7 other combinations 16-360 px. Ours on the
+    same views 0.34 px, but ours was fitted on them. A 24.00 mm square: factory 24.06 mm, ours 24.01.
+  - So a scanner without calibration.json could start from its factory values instead of ESTIMATES
+    (not done yet). Per-unit values differ: other units read depth fx 956.8 / 956.6, cx 645.6 / 638.9
+    (ssjrocks, rafik24; both firmware 1.2.2, ours 1.2.6).
+  - Not read: IMU calibration 4036. The SDK reads it with the raw opcodes 17/18/19, and that sequence
+    on 4027 knocked ssjrocks' unit off USB until a replug.
 - CrealityScan (Windows, run under Bottles) ships a custom Orbbec SDK (OrbbecSDK.dll) with a
   `FerretUvcDevice` class: `switchDepthAlgMode`, `initDepthProcessParam`, and depth work modes whose
   names and checksums the SDK reads from the device. Its embedded config asks for depth 1280x800 in

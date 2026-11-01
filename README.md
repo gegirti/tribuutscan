@@ -1,7 +1,8 @@
 # triBUUTSCAN
 
-*3BUUTscan* — a 3D scanning toolkit for Linux, starting with the Creality CR-Scan Ferret Pro used
-directly over USB, with no Creality software.
+*3BUUTscan* — open-source Linux software for the **Creality CR-Scan Ferret 3D scanner** (tested on
+the Ferret Pro): live 3D scanning over USB into point clouds and meshes, with no CrealityScan,
+Windows or Wine. Python, tested on Ubuntu.
 
 Made in 3BUUT. Free for everyone, see [License](#license).
 
@@ -207,6 +208,13 @@ The IR projector turns on by itself when the IR stream is opened.
   camera, so the colour pixel that matches a depth pixel moves with distance (parallax); the
   calibrated model handles it. A fixed colour-to-depth offset is only right at one distance: ours
   was 18 px off at 25 cm.
+- **Factory calibration**: the scanner carries its own, readable over the same command channel
+  (lists 4026 depth law, 4027 camera models, 4024 which colour/depth sizes each model is for), the
+  way Orbbec's SDK reads it. It is written for horizontally mirrored depth and colour images. Read
+  that way, on our unit it agrees with the board calibration: depth law within 0.5 mm across the
+  close range, colour on depth within 0.9 px, a 24.00 mm square measures 24.06 mm. Its colour model
+  is for 1280x720; the 1280x800 colour mode is that image stretched by 10/9. Not used by the
+  toolkit yet.
 - **IR is mirrored** horizontally relative to colour and depth. It shows the scene only through the
   projector's dots, which break up printed codes, so the calibration finds the board in colour and
   aligns IR to it.
@@ -261,6 +269,8 @@ Next up:
   - [ ] a printed test box with known dimensions and small details
   - [ ] a long-range board calibration
   - [ ] the up-to-3 mm rim error against Creality's scan of the same part
+- [ ] **Factory calibration as the default**: use the scanner's own calibration when there is no
+      board calibration (today: rough estimates, clouds 13% too narrow).
 - [ ] **IMU in tracking**: read the scanner's IMU calibration, check its clock against the depth
       frames, use the gyro as the rotation guess.
 
@@ -308,9 +318,11 @@ Want to help? Plug your scanner in and send the output of `lsusb` and
 
 ## Alternatives
 
-As of October 2026 we found no other Linux support for this scanner: Creality ships no Linux
-scanning software, and the Orbbec SDK we tried (`pyorbbecsdk2` 2.9.3) does not recognise it. If you
-know of one, please open an issue. This project now scans to calibrated point clouds and rough
+Creality ships no Linux scanning software, and the Orbbec SDK we tried (`pyorbbecsdk2` 2.9.3) does
+not recognise the scanner. Others are working on it too (found November 2026):
+[ubuntu-ferret-scanner](https://github.com/ssjrocks/ubuntu-ferret-scanner), a Linux app (GPL-3.0),
+and [OrbbecSDK_v2_WIN](https://github.com/rafik24/OrbbecSDK_v2_WIN), a Windows fork of Orbbec's SDK
+that needs a patched Orbbec library. If you know of more, please open an issue. This project now scans to calibrated point clouds and rough
 meshes, but it is early: for finished scans, Creality's Android app or CrealityScan under
 Wine/Bottles is still the practical choice.
 
