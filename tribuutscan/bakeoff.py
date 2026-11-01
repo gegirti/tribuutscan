@@ -1,12 +1,15 @@
 """GPU engine bake-off (Phase 2): the same frames through each engine, timed and checked.
 
     .venv/bin/python -m tribuutscan.bakeoff dump captures/<stamp>-scan <frames.npz>
-    .venv/bin/python -m tribuutscan.bakeoff run <frames.npz> [wgpu-gpu wgpu-cpu opencl-gpu opencl-cpu] [--frames N] [--out report.json]
+    .venv/bin/python -m tribuutscan.bakeoff run <frames.npz> [wgpu-gpu wgpu-cpu] [--frames N] [--out report.json]
     .venv/bin/python -m tribuutscan.bakeoff slice captures/<stamp>-scan [--seconds S] [--capacity BRICKS] [--cpu] [--out report.json]
 
 `slice` runs the winner's whole slice (WebGPU) on a saved scan, as fusion does it: frames read from the
 recording, prepared and fused on the GPU, each ray cast from its pose with one ICP pass against it, then
 the mesh; again and again for --seconds (stability), with a small --capacity to fill the brick pool.
+
+The OpenCL engine it was measured against (gpu_cl.py) was removed after the decision; it is in commit
+401cdf9 (git show 401cdf9:tribuutscan/gpu_cl.py), its numbers in CLAUDE.md.
 
 `dump` prepares a scan's merged frames once, exactly as fusion.fuse does (cleaned, masked, colour per
 pixel, lens taken out), with their poses. `run` fuses them in each engine and per frame ray casts the
@@ -26,7 +29,7 @@ import numpy as np
 from . import gpu
 
 WARM = 5
-ENGINES = ("wgpu-gpu", "wgpu-cpu", "opencl-gpu", "opencl-cpu")
+ENGINES = ("wgpu-gpu", "wgpu-cpu")
 
 
 def dump(scan_dir, out):
@@ -68,12 +71,8 @@ class Frames:
 
 
 def open_engine(name, layout, K, size, far_mm):
-    lib, kind = name.split("-")
-    if lib == "wgpu":  # Open3D's pixel rule, to compare with it
-        from . import gpu_wgpu
-        return gpu_wgpu.Engine(layout, K, size, kind, far_mm, nearest=False)
-    from . import gpu_cl
-    return gpu_cl.Engine(layout, K, size, kind, far_mm)
+    from . import gpu_wgpu
+    return gpu_wgpu.Engine(layout, K, size, name.split("-")[1], far_mm, nearest=False)  # Open3D's pixel rule
 
 
 def open3d_volume(frames, n):

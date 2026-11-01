@@ -1,4 +1,5 @@
-"""Shared parts of the GPU volume engines (gpu_wgpu.py, gpu_cl.py): layout, inputs, numpy references.
+"""Shared parts of the GPU volume engine (gpu_wgpu.py; an OpenCL one was measured against it, bakeoff.py):
+layout, inputs, numpy references.
 
 Layout, the same in every engine: the scan volume is a dense grid of bricks (BRICK^3 voxels of
 voxel_mm; brick (0, 0, 0) starts at `origin`), each with a u32 in `index`: EMPTY until a frame touches

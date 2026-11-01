@@ -748,7 +748,8 @@ cubes on the GPU; the CPU keeps the 6x6 solve, markers, base votes, pose graph, 
 - PHASE 2 DONE (2026-11-01 night, the user away): ENGINE = WEBGPU (wgpu-py 0.32, `gpu_wgpu.py`). Shared layout,
   inputs and numpy references in `gpu.py`; the bake-off harness `bakeoff.py` (dump / run / slice); a
   no-scanner self-check for testers `gpucheck.py`. Installed into .venv: wgpu (+ cffi, rendercanvas,
-  pycparser); pyopencl + pocl-binary-distribution only for the bake-off.
+  pycparser). The OpenCL engine (gpu_cl.py; pyopencl + pocl-binary-distribution) was removed after
+  the decision, code in commit 401cdf9, packages uninstalled.
   - Layout (both engines, the portability rules): dense u32 brick index over the scan's box -> pool of
     65536 bricks of 8^3 voxels; voxel = u32 TSDF int16 (normalised by the truncation) | weight uint16
     << 16, plus u32 RGB8; 32-bit integer atomics only (CAS allocation, visible-brick list); ICP sums
