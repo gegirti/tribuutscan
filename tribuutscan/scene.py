@@ -10,11 +10,13 @@ Modes:
   free       no support plane assumed (an object held in the hand): each frame keeps the piece at
              the image centre, as the first version did.
 
-The object is everything more than OBJECT_ABOVE_MM above the plane that lies inside a cylinder
-around the object (its starting footprint + REGION_MARGIN_MM) or is connected to what does. The
-cylinder grows as new parts of the object come into view, but only by REGION_GROW_MM per frame, so
-a neighbouring object touching it is not swallowed at once. The base is the plane's points inside the
-cylinder: merged too, so "remove base" can be decided when the cloud is saved (cloud.Scanner).
+The object is kept in a cylinder standing on the plane (its starting footprint + REGION_MARGIN_MM).
+In each frame it is the piece more than OBJECT_ABOVE_MM above the plane that the middle of the view
+hits (the piece tracking uses), if that piece reaches the cylinder's core; otherwise whatever is
+connected to the core. The cylinder grows toward what is seen in the middle of the view, by at most
+REGION_GROW_MM per frame, so a neighbour at the edge of the view does not pull it out (on the marker
+scan it grew to 317 mm while it followed everything connected). The base is the plane's points inside
+the cylinder: merged too, so "remove base" can be decided when the cloud is saved (cloud.Scanner).
 
 Until a base is found (or never, e.g. an object held in the hand) the object is each frame's centre
 piece inside a ball around the first one, which grows slowly and at most to BALL_MAX times its start.
@@ -36,7 +38,10 @@ BALL_MAX = 2.0
 SAME_PLANE_DEG, SAME_PLANE_MM = 5.0, 5.0
 OBJECT_ABOVE_MM = 3.0
 REGION_MARGIN_MM, REGION_GROW_MM = 20.0, 15.0
-REFIT_BAND_MM = 10.0  # the kept plane is re-fitted to the frame's points within this band
+GROW_WINDOW = 0.5  # the region grows only toward what is seen in the middle of the view (this share of
+                   # its width and height): what the scanner is aimed at, not a neighbour at the edge
+REFIT_BAND_MM = 10.0  # the kept plane is re-fitted to the frame's points within this band...
+REFIT_MAX_DEG, REFIT_MAX_MM = 3.0, 5.0  # ...and a re-fit that turns or moves it more is not taken
 
 
 def plane_to(plane, transform_mm):
@@ -87,6 +92,7 @@ class Scene:
         self.axis, self.radius, self.top = None, None, None  # object cylinder, region frame (mm)
         self.ball = None  # (centre, radius, start radius) while no base is known, region frame (mm)
         self.late_plane = False  # the plane was settled after objects had been merged
+        self.off_centre = 0  # frames whose view centre missed the object (masks fell back to the core)
 
     def observe(self, xyz_cam, pix, shape, cam_to_region):
         """Vote for a support plane during the first frames. cam_to_region: 4x4, mm."""
@@ -114,17 +120,33 @@ class Scene:
         The kept plane, moved with a (possibly predicted) pose, is only a prior: points within
         REFIT_BAND_MM of it are fitted again (least squares, then once more without outliers), so a
         few mm of pose error cannot let the table leak into the object or cut the object's base.
+        Once the object's region is known, only points outside its footprint take part: the lower
+        edge of an object standing up, or a face of it lying low, is near the table too, and on the
+        marker scan such re-fits tipped the plane 20-64 degrees in 276 of 581 frames. A re-fit that
+        still turns the plane more than REFIT_MAX_DEG or moves it more than REFIT_MAX_MM (at the
+        object, or at the view's centre before the region is known) is not taken.
         """
-        prior = plane_to(self.plane, np.linalg.inv(cam_to_region))
+        to_cam = np.linalg.inv(cam_to_region)
+        prior = plane_to(self.plane, to_cam)
+        pts_all, where = xyz_cam, None
+        if self.axis is not None:
+            where = to_cam[:3, :3] @ self.axis + to_cam[:3, 3]
+            n0 = prior[0]
+            flat = xyz_cam - np.outer((xyz_cam - where) @ n0, n0)
+            pts_all = xyz_cam[np.linalg.norm(flat - where, axis=1) > self.radius - REGION_MARGIN_MM]
         n, c = prior
         for band in (REFIT_BAND_MM, cl.PLANE_TOL_MM):
-            near = np.abs(xyz_cam @ n + c) < band
+            near = np.abs(pts_all @ n + c) < band
             if near.sum() < 50:
                 return prior if band == REFIT_BAND_MM else (n, c)
-            pts = xyz_cam[near]
+            pts = pts_all[near]
             centre = pts.mean(0)
             n_fit = np.linalg.svd(pts - centre, full_matrices=False)[2][2]
             n_fit = n_fit if n_fit @ prior[0] > 0 else -n_fit
+            at = where if where is not None else centre
+            if (np.degrees(np.arccos(np.clip(n_fit @ prior[0], -1, 1))) > REFIT_MAX_DEG
+                    or abs(n_fit @ (at - centre) - (prior[0] @ at + prior[1])) > REFIT_MAX_MM):
+                return prior
             n, c = n_fit, -n_fit @ centre
         return n, c
 
@@ -156,11 +178,19 @@ class Scene:
         flat = pts - np.outer((pts - axis) @ n, n)  # projected onto the table
         r = np.linalg.norm(flat - axis, axis=1)
         inside = (r <= self.radius) & (h[idx] <= self.top)
-        piece = cl.connected_piece(pts, inside) if inside.any() else inside
-        if piece.any():  # grow the region toward what is connected, a little per frame
-            reach = r[piece].max() + REGION_MARGIN_MM
+        core = inside & (r <= self.radius - REGION_MARGIN_MM) & (h[idx] <= self.top - REGION_MARGIN_MM)
+        piece = cl.centre_piece(pts, pix[idx], shape)  # what the middle of the view hits...
+        if not (piece & core).any():  # ...unless that is not the object: then whatever is in its core
+            self.off_centre += 1
+            piece = cl.connected_piece(pts, core) if core.any() else core
+        hh, ww = shape
+        u, v = pix[idx, 0], pix[idx, 1]
+        aimed = piece & (np.abs(u - ww / 2) <= GROW_WINDOW * ww / 2) & (np.abs(v - hh / 2) <= GROW_WINDOW * hh / 2)
+        if aimed.any():  # grow the region toward what the middle of the view sees, a little per frame
+            reach = r[aimed].max() + REGION_MARGIN_MM
             self.radius = min(max(self.radius, reach), self.radius + REGION_GROW_MM)
-            self.top = min(max(self.top, h[idx][piece].max() + REGION_MARGIN_MM), self.top + REGION_GROW_MM)
+            self.top = min(max(self.top, h[idx][aimed].max() + REGION_MARGIN_MM), self.top + REGION_GROW_MM)
+        piece &= (r <= self.radius) & (h[idx] <= self.top)
         mask[idx[piece]] = True
         near = np.nonzero((h > -cl.PLANE_TOL_MM) & ~above)[0]  # the base under and around the object
         flat_near = xyz_cam[near] - np.outer((xyz_cam[near] - axis) @ n, n)

@@ -5,9 +5,24 @@ V4L2 offers only 'Y10 ' (bytesperline = width * 10 / 8): an MSB-first 10-bit bit
 has a 14-bit format that uvcvideo does not know; usbdepth.py streams it: the same MSB-first
 bitstream, 4 pixels per 7 bytes, and Y10 is Y14 with the low 4 bits cut off. Nearer = larger, 0 =
 invalid. decode_depth picks the format by bytesperline and returns values on the Y10 scale, so the
-calibrated depth law works for both.
+calibrated depth law works for both, and clears the rows the scanner garbled (garbled_rows).
 """
 import numpy as np
+
+# Garbled rows (seen 2026-11-01 in Y10 over V4L2 and Y14 over USB): now and then the scanner fills a run
+# of 1-27 rows with values that are not depth, in frames of the right size; far more often when the
+# host is slow to take the data (usbdepth.NURBS). Down each column such a run counts in steps of
+# exactly 64 raw units (Y10 914, 850, 786, ...; Y14 in steps of 64 or 1024): 30-97% of the
+# row-to-row differences in a garbled row are nonzero multiples of 64, against 0-3% in real rows
+# (smooth surfaces change by less, edges by any amount). Left in, they become sheets in cloud and mesh.
+# No false hits on the synthetic sets (0 of 614 frames); every hit looked at was garbage. Next to such
+# runs the old V4L2 recording also had a few rows of another kind (a smooth ramp across the row,
+# wrapping at 1024) that this test misses, hence the wide margin. Dropping the whole frame instead
+# was measured worse: on the marker recording (3.3 fps) the 44 lost frames let tracking double the part.
+GARBLE_STEP = 64  # raw units, both formats
+GARBLE_SHARE, GARBLE_MIN = 0.15, 20  # a row is garbled when this share (and number) of its steps are such
+GARBLE_MARGIN = 8  # rows cleared above and below each garbled row
+garbled = {"frames": 0, "rows": 0}  # what decode_depth cleared (for the viewer's log)
 
 
 def decode_y10(buf, width, height, bytesperline):
@@ -73,8 +88,28 @@ def decode_y14(buf, width, height, bytesperline):
     return y10_scale(unpack_y14(buf, width, height, bytesperline))
 
 
-def decode_depth(buf, width, height, bytesperline):
-    """Decode either format, told apart by bytesperline (Y10: width * 10 / 8, Y14: width * 14 / 8)."""
-    if bytesperline >= width * 14 // 8:
-        return decode_y14(buf, width, height, bytesperline)
-    return decode_y10(buf, width, height, bytesperline)
+def garbled_rows(raw):
+    """Bool per row: rows the scanner filled with garbage (see GARBLE_STEP), except the first of each
+    run. `raw` holds the raw integer values (Y10, or Y14 before y10_scale); judged on every 2nd
+    column, over the pixels that have depth in both rows."""
+    s = raw[:, ::2].astype(np.int32)
+    ok = (s[1:] > 0) & (s[:-1] > 0)
+    step = s[1:] - s[:-1]
+    hits = (ok & (step != 0) & (step % GARBLE_STEP == 0)).sum(1)
+    hit = np.zeros(len(raw), bool)
+    hit[1:] = (hits >= GARBLE_MIN) & (hits >= GARBLE_SHARE * ok.sum(1))
+    return hit
+
+
+def decode_depth(buf, width, height, bytesperline, clean=True):
+    """Decode either format, told apart by bytesperline (Y10: width * 10 / 8, Y14: width * 14 / 8).
+    Garbled rows and GARBLE_MARGIN rows around them come back with no depth (0) unless clean is False."""
+    y14 = bytesperline >= width * 14 // 8
+    raw = unpack_y14(buf, width, height, bytesperline) if y14 else decode_y10(buf, width, height, bytesperline)
+    rows = garbled_rows(raw) if clean else None
+    if rows is not None and rows.any():
+        rows = np.convolve(rows, np.ones(2 * GARBLE_MARGIN + 1), "same") > 0
+        raw[rows] = 0
+        garbled["frames"] += 1
+        garbled["rows"] += int(rows.sum())
+    return y10_scale(raw) if y14 else raw

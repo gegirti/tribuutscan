@@ -245,6 +245,12 @@ The IR projector turns on by itself when the IR stream is opened.
 - ffmpeg/GStreamer/OBS-style apps can't negotiate the depth format, and camera apps may pick that
   node and show black. `tribuutscan/v4l2.py` talks to V4L2 directly (raw ioctl + mmap, 64-bit offsets).
 - Some depth frames arrive truncated; drop any frame shorter than `sizeimage`.
+- **Garbled rows**: when the computer is slow to take the depth data, the scanner fills a run of rows
+  of an otherwise normal frame with values that are not depth (down each column they step by exactly
+  64 raw units). Seen over both V4L2 and USB. With a CPU-heavy job running beside it, 1 frame in 6
+  had them when 8 USB transfers were kept waiting, and 0-1 in 1800 with 64. So `usbdepth.py` keeps
+  64, and the decoder clears such rows (and 8 rows around them). Left in, they became sheets in the
+  cloud and mesh.
 - The Orbbec SDK (`pyorbbecsdk2` 2.9.3) does not enumerate the device ("No matched usb device
   found"), although its udev rules list `2bc5:069c`.
 - **Markers** (white dot in a black ring, 6 or 10 mm, placed irregularly) are found in the colour
@@ -255,16 +261,16 @@ The IR projector turns on by itself when the IR stream is opened.
 
   | | median | 90% within | Creality's surface covered within 1 mm |
   |---|---|---|---|
-  | point cloud (after Optimise) | 0.23 mm | 0.56 mm | 66.5% |
+  | point cloud (after Optimise) | 0.24 mm | 0.58 mm | 66.5% |
   | mesh | 0.09 mm | 0.34 mm | 66.1% |
 
   The mesh misses a thin band where the scanned area ends (a fused surface stops about a voxel
-  before the last points); otherwise it covers the same. Only the keyframes are fused (the frames
-  Optimise corrects): with every frame the 90% figure was 0.53 mm. Fusing the marker scan's 179
-  keyframes takes about a minute on the CPU. Pieces of the surroundings that the object region took in
-  (they are in the point cloud too, as loose points) show up as separate sheets around the part. On synthetic scans with known
-  motion the fused surface lies 0.02-0.03 mm (median) from the true one, and a 1.8 mm plate seen from
-  both sides keeps both faces (the truncation is kept under the plate's thickness for that).
+  before the last points); otherwise it covers the same. 95% of its area lies on the part; the rest
+  is the stand the part leans on, which touches it. Only the keyframes are fused (the frames
+  Optimise corrects): with every frame the 90% figure was 0.53 mm. Fusing the marker scan's 206
+  keyframes takes under a minute on the CPU. On synthetic scans with known motion the fused surface
+  lies 0.02-0.03 mm (median) from the true one, and a 1.8 mm plate seen from both sides keeps both
+  faces (the truncation is kept under the plate's thickness for that).
 
 ## Layout
 
@@ -321,7 +327,9 @@ Done:
 - [x] **IMU** readout (200 Hz), and **viewer v2** with folding panels.
 - [x] **Object separation**: the base found even when the object fills the view, the object kept in a
       region on it, the base removable. On the marker part: 80% -> 92% of the points on the part,
-      median distance to Creality's scan 0.69 -> 0.22 mm.
+      median distance to Creality's scan 0.69 -> 0.22 mm. Then the leaks closed (garbled depth rows,
+      the base re-fitted onto the part's own face, the region spreading to neighbours): 98.6% of the
+      cloud and 95% of the mesh on the part (were 92.4% and 77%), no frames without an object.
 
 - [x] **Calibration**: depth law, both cameras, colour-to-depth registration, from a printed board.
 - [x] **Factory calibration** read from the scanner and used when there is no board calibration; it

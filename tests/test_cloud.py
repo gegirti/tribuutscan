@@ -164,6 +164,79 @@ def test_a_wall_behind_the_object_is_not_its_base():
     assert scene.plane is None
 
 
+def sloped_face_on_a_table(rng):
+    """Camera looks down +z at a rim of table (z = 300 mm, kept plane known; 100-140 mm from the
+    axis) and an object's face rising gently from it (6 degrees, within 80 mm): near the table, the
+    face outnumbers the table 30 to 1, as on the marker scan."""
+    from tribuutscan.scene import Scene
+    xy = rng.uniform(-140, 140, (16000, 2))
+    r = np.hypot(xy[:, 0], xy[:, 1])
+    table = np.c_[xy[(r > 100) & (r < 140)][:400], np.full(400, 300.0)]
+    fx, fy = rng.uniform(-80, 80, (2, 20000))
+    face = np.c_[fx, fy, 300 - (fy + 80) * np.tan(np.radians(6))]
+    scene = Scene("still", rng)
+    scene.plane = (np.array([0.0, 0.0, -1.0]), 300.0)  # n toward the scanner: height = 300 - z
+    return scene, table, face
+
+
+def test_the_base_is_refitted_beside_the_object_not_on_it():
+    rng = np.random.default_rng(11)
+    scene, table, face = sloped_face_on_a_table(rng)
+    xyz = np.concatenate([table, face])
+    n, c = scene.plane
+    for band in (10, 3):  # the re-fit before 2026-11-01: everything near the table, twice
+        near = xyz[np.abs(xyz @ n + c) < band]
+        n = np.linalg.svd(near - near.mean(0), full_matrices=False)[2][2]
+        n, c = n * np.sign(-n[2]), -(n * np.sign(-n[2])) @ near.mean(0)
+    assert np.degrees(np.arccos(abs(n[2]))) > 5  # it ends up on the face
+    scene.axis, scene.radius, scene.top = np.array([0.0, 0.0, 300.0]), 135.0, 100.0  # the face reaches 113 mm
+    n, c = scene.plane_in_camera(xyz, np.eye(4))
+    assert np.degrees(np.arccos(abs(n[2]))) < 0.1 and abs(abs(c) - 300) < 0.1
+
+
+def test_a_tipped_refit_falls_back_to_the_kept_plane():
+    rng = np.random.default_rng(12)
+    scene, _, face = sloped_face_on_a_table(rng)  # first view: no region yet, and no table in sight
+    n, c = scene.plane_in_camera(face, np.eye(4))
+    assert np.allclose(n, scene.plane[0]) and c == scene.plane[1]
+
+
+def test_the_region_grows_toward_what_the_scanner_is_aimed_at():
+    """A neighbour touching the object at the edge of the view does not pull the region out; the
+    same neighbour would, if growth followed everything connected (the marker scan's 317 mm region)."""
+    from tribuutscan import scene as sc
+    rng = np.random.default_rng(13)
+    f, w, h = 1000.0, 1280, 800
+    proj = lambda p: np.c_[p[:, 0] * f / p[:, 2] + w / 2, p[:, 1] * f / p[:, 2] + h / 2]
+    table = np.c_[rng.uniform(-250, 250, (20000, 2)), np.full(20000, 300.0)]
+    top = np.c_[rng.uniform(-60, 60, (8000, 2)), np.full(8000, 260.0)]
+    sides = np.concatenate([np.c_[np.full(1500, x), rng.uniform(-60, 60, 1500), rng.uniform(260, 297, 1500)]
+                            for x in (-60.0, 60.0)])
+    obj = np.concatenate([top, sides])
+    nb = np.c_[rng.uniform(60, 166, 4000), rng.uniform(-20, 20, 4000), np.full(4000, 280.0)]  # touching, low
+    nb_side = np.c_[np.full(1000, 166.0), rng.uniform(-20, 20, 1000), rng.uniform(280, 297, 1000)]
+    first = np.concatenate([table, obj])
+    later = np.concatenate([table, obj, nb, nb_side])
+    old = sc.GROW_WINDOW
+    try:
+        for window, grows in ((sc.GROW_WINDOW, False), (1.0, True)):
+            sc.GROW_WINDOW = window
+            scene = sc.Scene("still", np.random.default_rng(0))
+            for _ in range(3):
+                scene.observe(first, proj(first), (h, w), np.eye(4))
+            scene.masks(first, proj(first), (h, w), np.eye(4))
+            start = scene.radius
+            for _ in range(10):
+                mask = scene.masks(later, proj(later), (h, w), np.eye(4))[0]
+            far = later[:, 0] > start + 10
+            assert (scene.radius > start + 30) == grows, (window, start, scene.radius)
+            assert mask[len(table):len(first)].mean() > 0.95  # the object stays whole
+            if not grows:
+                assert not mask[far].any()
+    finally:
+        sc.GROW_WINDOW = old
+
+
 def test_output_leaves_out_base_background_and_floating_bits():
     s = cl.Scanner("small", log=lambda m: None)
     s.scene.plane, s.scene.axis = (np.array([0.0, 0.0, 1.0]), 0.0), np.zeros(3)  # world: base at z = 0

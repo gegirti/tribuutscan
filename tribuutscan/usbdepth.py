@@ -31,6 +31,11 @@ VC, VS, EP = 0, 1, 0x81  # depth function: control and streaming interface, bulk
 W, H, FRAME_INDEX = 1280, 800, 3  # frame index 3 is 1280x800 in both formats
 FORMATS = {"Y14": (1, 14), "Y10": (2, 10)}  # name -> (UVC format index, bits per pixel)
 INTERVAL = 333333  # 100 ns units: 30 fps
+# URBs kept in flight. The scanner garbles rows of a frame (depth.garbled_rows) or sends broken ones
+# when the host does not take its data in time. With 8 (~2 ms of data) and a CPU-heavy job beside
+# it (2026-11-01, two 60 s runs each): 169-170 garbled and 693-949 broken frames, 16-19 fps; with 64
+# (~14 ms): 0-1 garbled, 67-73 broken, 29.5 fps. 128 and 256 were no better than 64.
+NURBS = 64
 
 # usbfs ioctls (linux/usbdevice_fs.h, 64-bit layouts)
 USBDEVFS_CONTROL = 0xC0185500
@@ -170,7 +175,7 @@ class FrameAssembler:
 class DepthCapture:
     """The depth function streamed over usbfs. Same reading API as v4l2.Capture."""
 
-    def __init__(self, fmt="Y14", nbufs=4, nurbs=8, payload=None):
+    def __init__(self, fmt="Y14", nbufs=4, nurbs=NURBS, payload=None):
         path = find()
         if path is None:
             raise OSError(errno.ENODEV, "scanner not found")

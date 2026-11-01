@@ -37,7 +37,7 @@ import numpy as np
 
 from . import frames as fr
 from . import calib, cloud, imu, livescan, markers, panels, pointcloud, usbdepth, v4l2, vendor
-from .depth import decode_depth
+from .depth import decode_depth, garbled
 from .image import depth_to_rgb, ppm, yuyv_pixels
 
 SIDE_W, DEPTH_W = 400, 800  # preview widths: colour and IR on the left, depth in the middle
@@ -434,6 +434,8 @@ class App:
         self.root.after(33, self.tick)
 
     def close(self):
+        if garbled["frames"]:
+            self.log(f"{garbled['frames']} depth previews had rows garbled by the scanner ({garbled['rows']} rows cleared)")
         self.log("viewer closed")
         if self.rec["recorder"]:
             self.stop_recording()

@@ -47,9 +47,9 @@ is simply getting colour, IR and depth out of the scanner on Linux.
   same window. `usbdepth.py` streams it through usbfs (stdlib: fcntl + ctypes; the URB pointer
   ioctls go through libc because fcntl.ioctl takes only a C int). Measured: 30 fps with colour + IR on
   V4L2 at the same time, 0 bad frames, ~10% of one core, 8 URBs of 12288 bytes (the device refuses
-  whole-frame payloads). Payload headers are 12 bytes with a PTS (1 MHz); stamps from it are exactly
-  33.32 ms apart and pair like V4L2 (colour - depth -6.7 ms USB vs -6.8 ms V4L2). `decode_depth`
-  puts Y14 on the Y10 scale ((Y14 - 8) / 16, float32; < 16 -> 0), so the calibrated law and every
+  whole-frame payloads; 64 URBs since 2026-11-01, see GARBLED ROWS). Payload headers are 12 bytes
+  with a PTS (1 MHz); stamps from it are exactly 33.32 ms apart and pair like V4L2 (colour - depth
+  -6.7 ms USB vs -6.8 ms V4L2). `decode_depth` puts Y14 on the Y10 scale ((Y14 - 8) / 16, float32; < 16 -> 0), so the calibrated law and every
   consumer are unchanged; recordings tell the formats apart by `depth_bytesperline` (1600 / 2240).
   Needs udev/70-tribuutscan.rules; otherwise, or with TRIBUUTSCAN_DEPTH=y10, depth is 10-bit V4L2.
   After a kill -9 the scanner's own reset gave /dev/video0 back in 6 s.
@@ -63,6 +63,20 @@ is simply getting colour, IR and depth out of the scanner on Linux.
 - ffmpeg and GStreamer cannot negotiate the depth format, and camera apps pick it up and show
   black. Capture goes through raw V4L2 ioctl + mmap (struct offsets assume 64-bit).
 - Some depth frames arrive truncated; drop any frame shorter than `sizeimage`.
+- GARBLED ROWS (found 2026-11-01, a line across the user's hand capture): frames of the right size in
+  which a run of 1-27 rows is not depth. Down each column the values step by exactly 64 raw units
+  (Y10 914, 850, 786, ... wrapping at 1024; Y14 by 64 or 1024), sometimes beside a smooth ramp across
+  the row; the object's own pixels in such rows often read 0. Both paths: the
+  10-30 marker recording (V4L2 Y10) has them in ~50 of 581 frames, and they were merged as object
+  (streaks in labels, sheets in cloud and mesh). Over USB with 8 URBs: 2 in 1500 frames idle, 100 in
+  700 with a CPU-heavy job beside it. The scanner does it when the host is slow to take its data:
+  under the same load (60 s, two runs each) 8 URBs gave 169-170 garbled and 693-949 broken frames
+  (16-19 fps), 64 URBs 0-1 and 67-73 (29.5 fps); 128 / 256 no better. So `usbdepth.NURBS` = 64, and
+  `depth.decode_depth` drops a garbled frame whole (all 0; `garbled_rows`: >= 15% of a row's
+  row-to-row steps are nonzero multiples of 64, real rows 0-3%; the ramp kind is not caught, hence
+  the whole frame). No hits on 614 synthetic frames; every real hit looked at was garbage. uvcvideo
+  keeps only 5 URBs for bulk, so 10-bit V4L2 depth stays more exposed. The viewer logs dropped
+  previews at close.
 - Only one program can stream from the scanner at a time. Close the viewer before running
   `python3 -m tribuutscan.pointcloud` (live grab) or `tribuutscan.measure`.
 - The scanner resets its USB connection 3-4 s after a program stops streaming: the kernel logs
@@ -551,6 +565,48 @@ centre piece, and the table connected the part to its surroundings.
 - `cloud.py` now saves through the Scanner (output filter, session.json "remove_base" /
   "base_found", saved state); `--keep-base` keeps the base. Careful: it writes next to the
   recording. Replay a scan's own -rec through a symlink elsewhere, or it overwrites that scan.
+- LEAKS CLOSED (2026-11-01 evening, after Phase 1's mesh showed 5 sheets of surroundings). A replay
+  logging the region per frame (radius, top, re-fit angle) and the labels drawn over colour frames
+  showed three causes:
+  - garbled depth rows (see Device facts) merged as object: horizontal streaks in the labels.
+  - `plane_in_camera` re-fitted the kept plane to everything within 10 mm of it. Where the part's
+    lower edge or a low face outnumbered the table, the re-fit tipped onto the part: 276 of 581
+    frames 20-64 degrees off, half the part's face labelled base, and 103 frames with an empty or
+    sheet-only object (the 54 empty-label frames of the Phase 1 notes). Now only points outside the
+    object's footprint (radius - margin) re-fit it, and a re-fit turning > 3 degrees or moving > 5 mm
+    (at the axis) is not taken.
+  - the region grew toward anything connected to anything inside it (its 20 mm margin included), 15
+    mm per frame: radius 148 -> 317 mm, top 183 -> 225 for a part 145 mm in radius. 3 mm instead of
+    6 mm connectivity changed nothing (the stand touches the part). Now: the object is the frame's
+    `centre_piece` (what the middle of the view hits, the piece tracking uses) when it reaches the
+    region's core (radius and top minus the margin), else everything connected to the core
+    (`Scene.off_centre` counts those; 0 on the marker replay); it grows only toward points in the
+    middle half of the view (`GROW_WINDOW` 0.5); merged points stay inside the region.
+  Marker recording, board camera, against the baseline (12 seeds; captures/baseline/separation-scan,
+  separation-run.txt):
+
+  | | baseline | now |
+  |---|---|---|
+  | cloud after Optimise: on the part | 92.4% | 98.6% |
+  | cloud: median / p90 | 0.229 / 0.562 mm | 0.236 / 0.576 mm |
+  | cloud: Creality within 1 / 2 mm | 66.5 / 68.9% | 66.5 / 68.9% |
+  | mesh: on the part | 76.9% | 95.0% |
+  | mesh: median / p90 | 0.083 / 0.356 mm | 0.090 / 0.340 mm |
+  | mesh: Creality within 1 / 2 mm | 66.2 / 68.7% | 66.1 / 68.5% |
+
+  Region 182 mm / top 183; 581 tracked, 0 lost, 206 merged (all with labels; was 207, 28 empty), mesh
+  from 206 frames. Without Optimise (replay only): 98.5% on the part, 0.219 / 0.528 mm (baseline
+  0.246 / 0.652), 68.2 / 72.1% (69.0 / 72.7). What is left off the part: two small pieces against
+  its edge, the stand it leans on (touching: the crop TODO).
+  evaluate.py `--against` the baseline (captures/eval/20261101-225354-separation): markers 581
+  tracked, 0 jumps, doubled 0.0001, marker scatter 0.938 -> 0.947 mm, 2 re-finds (was 1); ATE synth
+  1.17 -> 1.14, synth7 1.28 -> 1.27, synthhard 0.87 -> 0.93, synthfp 0.548 = 0.548, synthplate
+  10.8 -> 6.3 mm (160 of 160 tracked); truth mm equal or better.
+  MEASURED AND DROPPED: dropping a garbled frame whole instead of clearing its rows. On the marker
+  recording (3.3 fps) the 44 dropped frames let tracking double the part: coverage 66.5 -> 40.8%.
+- The user's hand-model capture (2026-11-01, captures/20261101-220331, one saved frame, long range,
+  ~44 cm, dark room): the floor is found as the base, the hand (about 22 cm tall, 90 mm region) is
+  the object, the cable and boxes around it are left out. It also showed the first garbled row seen.
 
 ## Pitfalls already hit
 
@@ -674,7 +730,7 @@ cubes on the GPU; the CPU keeps the 6x6 solve, markers, base votes, pose graph, 
     recording (was held constant); 54 tracked frames (256-389) of the marker scan have EMPTY labels
     (scene.masks found no object in them), and the object region's cylinder grew to 317 mm for a 274 mm
     part, so sheets of the surroundings stay in cloud and mesh (5 pieces, 4-7% of the area each;
-    visible in the 3D page). Both are object separation, next to look at.
+    visible in the 3D page). FIXED the same evening: see "Object separation", LEAKS CLOSED.
 - Phase 0.6 platform (2026-11-01): pyproject.toml has the manifest (core numpy; extra "scan" open3d,
   opencv-python-headless; a "gpu" extra comes with the bake-off) and setup-venv.sh builds a venv from
   it on any distro (`pip install -e .[scan]`; PYTHON=... picks the interpreter; leaves an existing
