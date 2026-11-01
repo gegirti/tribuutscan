@@ -290,12 +290,12 @@ def fuse_scan(directory, which="merged", voxel_mm=VOXEL_MM, trunc_voxels=TRUNC_V
     t1 = time.time()
     try:
         vertices, triangles, colours = extract(engine, scanner.output_mask, min_weight)
-        volume = engine.report() if hasattr(engine, "report") else {}
+        blocks, volume = engine.blocks(), engine.report() if hasattr(engine, "report") else {}
     finally:
-        if hasattr(engine, "close"):
+        if hasattr(engine, "close"):  # the GPU's memory back now, not when the collector runs
             engine.close()
     report = {"frames": engine.frames, "empty_frames": engine.empty, "which": which, "engine": engine.name, "voxel_mm": voxel_mm,
-              "trunc_mm": voxel_mm * trunc_voxels, "min_weight": min_weight, "blocks": engine.blocks(),
+              "trunc_mm": voxel_mm * trunc_voxels, "min_weight": min_weight, "blocks": blocks,
               "vertices": int(len(vertices)), "triangles": int(len(triangles)), "remove_base": scanner.remove_base,
               "camera": {"source": CAMERA.source, "fingerprint": CAMERA.fingerprint()}, "ms_per_frame": ms,
               "fuse_s": round(t1 - t0, 1), "extract_s": round(time.time() - t1, 1), **volume}

@@ -94,3 +94,44 @@ def test_mesh_ply_round_trip_and_page_payload():
     n, m = struct.unpack("<II", payload[:8])
     assert (n, m) == (4, 2) and len(payload) == 8 + 4 * 12 + 12 + 2 * 12
     assert np.frombuffer(payload[-24:], "<u4").reshape(2, 3).tolist() == triangles.tolist()
+
+
+def test_a_scan_meshes_the_same_on_the_gpu_and_on_the_cpu():
+    """fusion.make_mesh end to end on a synthetic scan: on the GPU engine when there is one (the frames
+    prepared on the CPU here: the synthetic camera has no colour model) and with TRIBUUTSCAN_GPU=0 on
+    Open3D; the two meshes lie on the same surface."""
+    fusion = fusion_or_none()
+    if fusion is None:
+        return
+    import json
+    import os
+    from tribuutscan import calib, synth
+    from tribuutscan import cloud as cl
+    before = calib.CAMERA.spec
+    calib.use(calib.ESTIMATES)
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            rec, out = Path(tmp) / "t-rec", Path(tmp) / "t-scan"
+            synth.generate(rec, n_frames=24)
+            sc = cl.scan(rec, log=lambda *a: None)
+            sc.save(out)
+            meshes = {}
+            for choice in ("auto", "0"):
+                os.environ["TRIBUUTSCAN_GPU"] = choice
+                report = fusion.make_mesh(out, log=lambda *a: None)
+                rec_ply, faces = view3d.read_ply(out / "mesh.ply", faces=True)
+                meshes[choice] = (report, np.stack([rec_ply["x"], rec_ply["y"], rec_ply["z"]], 1) * 1000, faces)
+                assert json.loads((out / "mesh.json").read_text())["triangles"] == report["triangles"] > 1000
+            assert meshes["0"][0]["engine"] == "open3d-cpu"
+            if meshes["auto"][0]["engine"].startswith("wgpu"):
+                import open3d as o3d
+                scene = o3d.t.geometry.RaycastingScene()
+                v, t = meshes["0"][1], meshes["0"][2]
+                scene.add_triangles(o3d.core.Tensor(v.astype(np.float32)), o3d.core.Tensor(t.astype(np.uint32)))
+                d = scene.compute_distance(o3d.core.Tensor(meshes["auto"][1].astype(np.float32))).numpy()
+                # the GPU takes each voxel's depth from the nearest pixel, Open3D from the one rounded down:
+                # slopes move by up to half a pixel (0.07 mm median here; 0.02 on the marker scan)
+                assert np.median(d) < 0.1 and (d > 0.5).mean() < 0.01
+    finally:
+        os.environ.pop("TRIBUUTSCAN_GPU", None)
+        calib.use(before)

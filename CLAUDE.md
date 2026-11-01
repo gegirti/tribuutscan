@@ -792,9 +792,10 @@ cubes on the GPU; the CPU keeps the 6x6 solve, markers, base votes, pose graph, 
   - FOUND: Open3D's integrate takes each voxel's depth from the pixel it falls in ROUNDED DOWN: half a
     pixel off along every slope (synthetic sphere: mesh 0.057 mm median from the truth; a tilted wall
     0.083 mm, exactly 0.5 px x pixel size x slope). The GPU engine takes the NEAREST pixel by default
-    (sphere 0.018 mm); `nearest=False` keeps Open3D's rule for the parity checks. Marker mesh vs
-    Creality: median 0.090 -> 0.083, p90 0.343 -> 0.353 (inconclusive against another scan; the
-    printed box decides).
+    (sphere 0.018 mm); `nearest=False` keeps Open3D's rule for the parity checks. Marker mesh vs the
+    Phase 1 mesh: 0.0000 mm median with Open3D's rule, 0.020 (p90 0.10) with the nearest pixel (the
+    0.05 mark holds either way); vs Creality: median 0.090 -> 0.083, p90 0.343 -> 0.353
+    (inconclusive against another scan; the printed box decides).
   - Not done in Phase 2: S1 decode of the raw Y14/Y10 bytes and the garbled-row check stay on the CPU
     (decode_depth); GPU tracking (Phase 3) will use `raycast` / `icp` as they are.
 
