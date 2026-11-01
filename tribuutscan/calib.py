@@ -10,6 +10,7 @@ The depth law and window depend on the scanner's depth mode (vendor.py): `use_mo
 top-level law is close range; other modes come from a "modes" block (a board calibration gets one from
 the disparity offsets in factory.json), else from LONG_B_SHIFT (`CAMERA.law_estimate` is True then).
 """
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -153,6 +154,13 @@ class Camera:
 
     def intrinsic_matrix(self):
         return np.array([[self.fx, 0, self.cx], [0, self.fy, self.cy], [0, 0, 1.0]])
+
+    def fingerprint(self):
+        """Short hash of what turns raw frames into points (size, depth lens, colour model, the active
+        mode's law): a scan is fused again only under the model it was tracked with."""
+        blob = json.dumps({**{k: self.spec.get(k) for k in ("size", "depth", "colour")}, "law": [self.a, self.b]},
+                          sort_keys=True)
+        return hashlib.sha1(blob.encode()).hexdigest()[:12]
 
 
 def law_window(a, b):

@@ -558,9 +558,33 @@ centre piece, and the table connected the part to its surroundings.
 
 ## Roadmap
 
-See the README TODO. Priority since 2026-11-01: object separation and background removal (the user's
-call); speed, accuracy (printed test box, long-range calibration) and IMU-in-tracking are queued there.
-The USB-capture idea is no longer needed: vendor.py reads and switches the depth modes directly.
+See the README TODO. The USB-capture idea is no longer needed: vendor.py reads and switches the
+depth modes directly.
+
+GPU PIPELINE (approved 2026-11-01, the user's top priority, several sessions): a GPU-resident,
+KinectFusion-style pipeline (depth maps, TSDF fusion, ray casting, frame-to-model tracking, marching
+cubes on the GPU; the CPU keeps the 6x6 solve, markers, base votes, pose graph, ORB when lost).
+- Ground rules from the user: reach everyone. Stock distro drivers only (no driver PPA upgrade), any
+  GPU vendor (Intel / AMD / NVIDIA) plus a CPU fallback, no CUDA / ROCm / oneAPI. Ubuntu 26.04 LTS
+  is coming within months: newer Python, numpy 2, newer Mesa.
+- Engine by bake-off: wgpu-py (WebGPU over Vulkan / Metal / DX12; the lean, since Mesa's Vulkan is
+  what ships everywhere and is the newest driver here, 25.2.8) vs pyopencl (OpenCL; here only Intel's
+  23.43 runtime). open3d-xpu is out (Intel-only, needs a newer driver). Kernel rules: no float or
+  64-bit atomics, no FP64, 32-bit indices, dense block index + brick pool (no hash map), 16-bit
+  normalised TSDF, same results on the CPU fallback (lavapipe / PoCL).
+- Phases: 0 ground work; 1 proper meshes on Open3D's CPU VoxelBlockGrid (first deliverable, no GPU
+  needed); 2 bake-off; 3 GPU tracking (keeps track.solve's contract: each frame's own centre piece
+  on uncleaned depth, model without the base, markers + prior on the CPU, only gated frames fused);
+  4 live 20-30 fps; 5 finishing (re-fuse after Optimise, colour, per-mode voxel size); 6 clean-up;
+  a checkpoint after the 26.04 upgrade.
+- Risks: disk (32 GB free, 93% full: full-rate Y14 + colour + IR ~147 MB/s), the A750 also drives
+  the desktop (chunk long kernels), only Intel hardware here (other vendors via testers).
+- Phase 0 done so far (2026-11-01): register_color fixed (it failed with any colour model); scans
+  now save frame_poses.txt (every tracked frame; Optimise's keyframe corrections spread to the frames
+  between), labels.npz (each tracked frame's 1/8 object/base mask, `cloud.view_mask`), session.json
+  `sources` [{rec, first_index}] (cloud.scan and the live worker's raw copy; continued and merged
+  scans keep their offsets) and `camera` {source, fingerprint}. evaluate.py unchanged (identical
+  metrics on all four datasets). Scans saved before this have only their merged poses.
 
 ## The person you are working with
 

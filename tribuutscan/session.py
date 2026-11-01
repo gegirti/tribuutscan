@@ -87,10 +87,13 @@ def merge(dir_a, dir_b, out, log=print):
     t, info = track.solve(track.levels(pb / 1000), track.levels(pa / 1000), t)
     if not accept(info):
         raise RuntimeError(f"the two scans do not line up well enough ({info})")
-    offset = max(i for i, _ in a.poses) + 1000  # keep frame indices apart
+    offset = max(i for i, _ in a.poses + a.frame_poses()) + 1000  # keep frame indices apart
     a.keyframes += [(i + offset, t @ p, *rest) for i, p, *rest in b.keyframes]
     a.poses += [(i + offset, t @ p) for i, p in b.poses]
     a.merged_data.update({i + offset: d for i, d in b.merged_data.items()})
+    a.track_log += [(i + offset, s, None if p is None else t @ p) for i, s, p in b.track_log]
+    a.labels.update({i + offset: m for i, m in b.labels.items()})
+    a.sources += [{**src, "first_index": src["first_index"] + offset} for src in b.sources]
     a.remerge({})
     report = optimise.optimise(a, log)
     Path(out).mkdir(parents=True, exist_ok=True)

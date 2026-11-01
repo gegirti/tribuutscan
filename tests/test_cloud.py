@@ -189,3 +189,42 @@ def test_output_leaves_out_base_background_and_floating_bits():
         keep = s.output_mask(centre)
         assert set(kinds[keep]) == wanted, (remove, set(kinds[keep]))
         assert keep[kinds == "obj"].all()
+
+
+def test_a_saved_scan_keeps_what_fusing_again_needs():
+    """Every tracked frame's pose, its labels, the source recording and the camera survive save and
+    restore, and Optimise's corrections move the frames between merged ones too."""
+    try:
+        from tribuutscan import synth
+    except ImportError:  # needs Open3D (.venv)
+        return
+    import json
+    import tempfile
+    from pathlib import Path
+    from tribuutscan import calib
+    before = calib.CAMERA.spec
+    calib.use(calib.ESTIMATES)  # synthetic frames are rendered with it
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            rec, out = Path(tmp) / "t-rec", Path(tmp) / "t-scan"
+            synth.generate(rec, n_frames=24)
+            sc = cl.scan(rec, log=lambda *a: None)
+            tracked = sc.frame_poses()
+            assert len(tracked) == sum(p is not None for _, _, p in sc.track_log) >= len(sc.poses) > 0
+            assert set(i for i, _ in tracked) <= set(sc.labels)
+            sc.save(out)
+            session = json.loads((out / "session.json").read_text())
+            assert session["sources"] == [{"rec": str(rec.resolve()), "first_index": 0}]
+            assert session["camera"] == {"source": "estimate", "fingerprint": calib.CAMERA.fingerprint()}
+            back = cl.Scanner.restore(out, log=lambda *a: None)
+            assert [i for i, _ in back.frame_poses()] == [i for i, _ in tracked]
+            assert all(np.allclose(p, q, atol=1e-5) for (_, p), (_, q) in zip(back.frame_poses(), tracked))
+            assert back.sources == sc.sources
+            assert all(np.array_equal(back.labels[i], sc.labels[i]) for i, _ in tracked)
+            shift = np.eye(4)
+            shift[0, 3] = 0.005  # every merged frame 5 mm along x
+            back.remerge({i: shift @ p for i, p in back.poses})
+            moved = [(q @ np.linalg.inv(p))[:3, 3] for (_, p), (_, q) in zip(tracked, back.frame_poses())]
+            assert np.allclose(moved, [0.005, 0, 0], atol=1e-5)
+    finally:
+        calib.use(before)

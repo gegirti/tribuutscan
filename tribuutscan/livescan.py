@@ -35,20 +35,8 @@ from .depth import decode_depth
 
 PAYLOAD_EVERY_S = 0.5  # rebuild the page's cloud at most this often
 LIVE_MIN_SEEN = 1  # the page shows every cube while scanning; the saved cloud uses cloud.MIN_SEEN
-VIEW_STEP = 8  # the frame's object mask goes back to the viewer at 1/8 of its size (160 x 100)
-
-
-def view_mask(view, step=VIEW_STEP):
-    """What a frame's pixels were, from Scanner.last_view: uint8 at 1/step size, 0 other (background,
-    or not seen), 1 base, 2 object; None if the frame was not tracked."""
-    if view is None:
-        return None
-    pix, obj, base, shape = view
-    out = np.zeros((shape[0] // step, shape[1] // step), np.uint8)
-    for value, mask in ((1, base), (2, obj)):
-        p = pix[mask] // step
-        out[np.minimum(p[:, 1], out.shape[0] - 1), np.minimum(p[:, 0], out.shape[1] - 1)] = value
-    return out
+VIEW_STEP = cl.LABEL_STEP  # the frame's object mask goes back to the viewer at 1/8 of its size (160 x 100)
+view_mask = cl.view_mask  # the same labels the scan keeps for fusing again
 
 
 class LiveSource:
@@ -169,6 +157,8 @@ def run(commands, replies, port=view3d.PORT):
             if keep_raw:
                 if recorder is None:
                     recorder = fr.Recorder(bytesperline, root=out_dir, extra={"note": "frames a live scan processed"})
+                    with source.lock:  # its frame 0 is the scanner's next index (continued scans count on)
+                        source.scanner.add_source(recorder.dir.resolve(), source.scanner.stats["frames"])
                 recorder.write({"color": yuyv, "ir": grey, "depth": depth_buf}, {"color": t_c, "ir": t_i, "depth": t_d})
             t1 = time.perf_counter()
             frame = {"yuyv": yuyv, "depth": decode_depth(depth_buf, fr.W, fr.H, bytesperline),  # colour decoded per point

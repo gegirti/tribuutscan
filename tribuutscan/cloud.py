@@ -11,7 +11,9 @@ Each frame is first cut down to the object: the depth window, then the table or 
 (if the object stands on it), then the connected piece at the image centre.
 
 Writes captures/<stamp>-scan/: cloud.ply (metres, x right, y up, z toward the scanner; like fuse.py),
-poses.txt, session.json. Distances rest on the ESTIMATED depth law and field of view.
+poses.txt (merged frames), frame_poses.txt (every tracked frame), labels.npz, session.json (with the
+camera model's source and fingerprint, and `sources`: the recordings the frame indices point into,
+so a scan can be fused again from its raw frames).
 """
 import json
 import sys
@@ -49,6 +51,7 @@ RELOCK_MAX_SCALE = 2.0  # a re-found pose may be at most this many normal steps 
 OBJECT_ABOVE_MM = 3.0  # (scene.py) the object starts this far above the table
 JOINT_MIN_FITNESS, JOINT_MAX_RMSE_MM = 0.3, 2.0  # accepting a joint-solve pose (markers: see Scanner)
 MODEL_EVERY = 5  # target="model": rebuild the model's levels after this many merges
+LABEL_STEP = 8  # per-frame labels (and the viewer's object mask) at 1/8 of the frame size (160 x 100)
 BIAS = 1 << 20  # voxel coordinates are packed into one int64 key, 21 bits each
 FLIP = np.diag([1.0, -1.0, -1.0])  # camera (y down, z forward) -> y up, z toward scanner
 
@@ -346,6 +349,32 @@ def scale_motion(t, s):
     return out
 
 
+def view_mask(view, step=LABEL_STEP):
+    """What a frame's pixels were, from Scanner.last_view: uint8 at 1/step size, 0 other (background,
+    or not seen), 1 base, 2 object; None if the frame was not tracked."""
+    if view is None:
+        return None
+    pix, obj, base, shape = view
+    out = np.zeros((shape[0] // step, shape[1] // step), np.uint8)
+    for value, mask in ((1, base), (2, obj)):
+        p = pix[mask] // step
+        out[np.minimum(p[:, 1], out.shape[0] - 1), np.minimum(p[:, 0], out.shape[1] - 1)] = value
+    return out
+
+
+def write_poses(path, poses):
+    with open(path, "w") as f:
+        for i, p in poses:
+            f.write(f"{i} " + " ".join(f"{v:.6f}" for v in p.ravel()) + "\n")
+
+
+def read_poses(path):
+    """[(index, 4x4 pose)] from a poses.txt-format file."""
+    text = Path(path).read_text()
+    rows = np.array([line.split() for line in text.splitlines() if line.strip()], float).reshape(-1, 17)
+    return [(int(r[0]), r[1:].reshape(4, 4)) for r in rows]
+
+
 def scene_margin():
     from .scene import REGION_MARGIN_MM
     return REGION_MARGIN_MM
@@ -439,6 +468,8 @@ class Scanner:
         self.on_merge = None  # optional callback(index, world_xyz_mm, rgb, world_normals, pose)
         self.remove_base = remove_base  # the saved/shown cloud leaves the base out (it is merged either way)
         self.last_view = None  # (pixels, object mask, base mask, shape) of the last tracked frame, for the viewer
+        self.labels = {}  # index -> view_mask of every tracked frame (what fusion takes as object / base)
+        self.sources = []  # [{"rec": recording dir, "first_index": scanner index of its frame 0}]
 
     def feed(self, frame, index=None):
         """Process one frame set ({'color', 'depth'}); returns True if it was merged into the cloud."""
@@ -537,6 +568,7 @@ class Scanner:
             self.last_view = (all_pix, obj, base, shape)
         else:
             self.last_view = (all_pix, keep, np.zeros(len(keep), bool), shape)
+        self.labels[index] = view_mask(self.last_view)
         stats["plane_frames"] += scene.plane is not None
         self.since_merge = getattr(self, "since_merge", 0) + 1
         if self.last_merged is not None:
@@ -556,6 +588,14 @@ class Scanner:
         else:  # merging runs beside tracking the next frame (numpy and Open3D release the GIL)
             self.pending.append(self.merger.submit(self.merge, *job))
         return True
+
+    def add_source(self, rec, first_index):
+        """Frames from `rec` (a Recorder directory) are fed from scanner index `first_index` on."""
+        self.sources.append({"rec": str(rec), "first_index": int(first_index)})
+
+    def frame_poses(self):
+        """[(index, pose)] of every tracked frame (a scan saved before these were kept: its merged ones)."""
+        return [(i, p) for i, _, p in self.track_log if p is not None] or list(self.poses)
 
     def merge(self, frame, index, pose, pix):
         """Merge one tracked frame's object pixels (cleaned, with normals) into the cloud."""
@@ -596,6 +636,14 @@ class Scanner:
                       nrm.astype(np.float64) @ pose[:3, :3].T)
         with self.cloud_lock:
             self.cloud = cloud
+        # every tracked frame moves with the last merged frame before it (the first one for those before)
+        fixes = {i: new_poses.get(i, old[i]) @ np.linalg.inv(old[i]) for i, _ in self.poses}
+        current = fixes[self.poses[0][0]]
+        log = []
+        for i, status, p in self.track_log:
+            current = fixes.get(i, current)
+            log.append((i, status, None if p is None else current @ p))
+        self.track_log = log
         self.poses = [(i, new_poses.get(i, p)) for i, p in self.poses]
         self.keyframes = [(i, new_poses.get(i, p), *rest) for i, p, *rest in self.keyframes]
         from .markermap import MarkerMap
@@ -627,6 +675,17 @@ class Scanner:
             sc.merged_data[int(index)] = (m["points"][a:b], m["rgb"][a:b], m["normals"][a:b])
         sc.pose = sc.last_merged = sc.poses[-1][1]
         sc.stats.update({k: session[k] for k in ("frames", "merged", "lost", "relocked") if k in session})
+        sc.sources = list(session.get("sources", []))
+        if (directory / "frame_poses.txt").exists():  # every tracked frame (scans saved before 2026-11-01: none)
+            status = {}
+            if (directory / "track.csv").exists():
+                for line in (directory / "track.csv").read_text().splitlines()[1:]:
+                    i, s = line.split(",")[:2]
+                    status[int(i)] = s
+            sc.track_log = [(i, status.get(i, "tracked"), p) for i, p in read_poses(directory / "frame_poses.txt")]
+        if (directory / "labels.npz").exists():
+            lab = np.load(directory / "labels.npz")
+            sc.labels = {int(i): m for i, m in zip(lab["index"], lab["labels"])}
         sc.scene.load(json.loads((directory / "scene.json").read_text()))
         sc.remerge({})
         return sc
@@ -811,13 +870,20 @@ class Scanner:
         self.flush()
         self.trim_table()
         self.stats["remove_base"], self.stats["base_found"] = self.remove_base, self.scene.plane is not None
+        self.stats["sources"] = self.sources
         out = save(directory, self.output_cloud(), self.poses, self.stats, self.preset, min_seen)
         self.save_state(directory)
         return out
 
     def save_state(self, directory):
-        """What Optimise and continuing a scan need: per-frame tracking log, keyframes, marker map and
-        the cloud's sums (track.csv, keyframes.npz, markers.json, cloud_state.npz)."""
+        """What Optimise, continuing a scan and fusing it again need: per-frame tracking log and poses,
+        labels, keyframes, marker map and the cloud's sums (track.csv, frame_poses.txt, labels.npz,
+        keyframes.npz, markers.json, cloud_state.npz, merged.npz, scene.json)."""
+        write_poses(directory / "frame_poses.txt", self.frame_poses())
+        tracked = [i for i, _ in self.frame_poses() if self.labels.get(i) is not None]
+        if tracked:
+            np.savez_compressed(directory / "labels.npz", index=np.array(tracked),
+                                labels=np.stack([self.labels[i] for i in tracked]), step=LABEL_STEP)
         info = dict(self.track_info)
         with open(directory / "track.csv", "w") as f:
             f.write("index,status,fitness,rmse_mm,degeneracy,markers_used\n")
@@ -869,6 +935,7 @@ class Scanner:
 def scan(directory, preset="small", log=print, remove_base=True):
     """Merge a recording; returns the Scanner (its cloud, poses and stats; save() writes the result)."""
     scanner = Scanner(preset, log, remove_base=remove_base)
+    scanner.add_source(Path(directory).resolve(), 0)
     for i, frame in enumerate(fr.read_recording(directory)):
         if scanner.feed(frame, i) and scanner.stats["merged"] % 10 == 1:
             log(f"frame {i:4d}: merged {scanner.stats['merged']:3d}, cubes {len(scanner.cloud):7d}, "
@@ -897,14 +964,14 @@ def save(directory, cloud, poses, stats, preset, min_seen=MIN_SEEN):
     xyz, rgb, normals, seen, min_seen = ply_arrays(cloud, poses, min_seen)
     out = directory / "cloud.ply"
     pc.write_ply(out, xyz, rgb, normals=normals, seen=seen)
-    with open(directory / "poses.txt", "w") as f:
-        for i, p in poses:
-            f.write(f"{i} " + " ".join(f"{v:.6f}" for v in p.ravel()) + "\n")
+    write_poses(directory / "poses.txt", poses)
     (directory / "session.json").write_text(json.dumps({
         "preset": preset, "point_distance_mm": cloud.point_mm, "min_seen": min_seen, "mode": stats.get("mode"),
         "raw_points": cloud.raw_points, "cubes": len(cloud), "points_kept": len(xyz), **stats,
         "depth_mode": CAMERA.mode,
-        "note": "distances rest on the estimated depth law and field of view",
+        "camera": {"source": CAMERA.source, "fingerprint": CAMERA.fingerprint()},
+        "note": ("distances rest on the estimated depth law and field of view" if CAMERA.estimate
+                 else f"camera: {CAMERA.source} calibration"),
     }, indent=2))
     return out, len(xyz)
 
