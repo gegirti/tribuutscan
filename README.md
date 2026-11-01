@@ -60,13 +60,16 @@ sudo cp udev/70-tribuutscan.rules /etc/udev/rules.d/
 sudo udevadm control --reload && sudo udevadm trigger --subsystem-match=usb --attr-match=idVendor=2bc5
 ```
 
-Scanning, calibration and meshing need Open3D and OpenCV, kept in a separate environment that the
-viewer finds by itself:
+Scanning, calibration and meshing need Open3D and OpenCV, kept in a separate environment (`.venv`)
+that the viewer finds by itself. `setup-venv.sh` builds it on any distro from the list in
+`pyproject.toml` (extra `scan`):
 
 ```
-python3 -m venv --system-site-packages .venv
-.venv/bin/pip install "numpy<2" open3d==0.20.0 opencv-python-headless==4.10.0.84
+./setup-venv.sh                      # or: PYTHON=python3.13 ./setup-venv.sh
 ```
+
+Tested with Python 3.12 (numpy 1.26, OpenCV 4.10) and Python 3.14 (numpy 2.5, OpenCV 5.0, Tk 9),
+both with Open3D 0.20: the same results on every test and evaluation.
 
 The viewer shows depth large in the middle, colour and IR on the left, and folding panels on the
 right: Scanner, Capture, Scan, IMU and View.

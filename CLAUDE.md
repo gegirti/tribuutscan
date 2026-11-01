@@ -315,6 +315,7 @@ python3 -m tribuutscan.view3d captures/<stamp>-scan    # browser 3D view at http
                                             # synthetic scan, ground truth poses + true_surface.ply
 .venv/bin/python -m tribuutscan.bench [rec] [--frames N] [--label x] [--against captures/bench/<run>.json]
                                             # per-stage timing table (warm, disk apart) -> captures/bench/
+./setup-venv.sh [dir]                       # build .venv from pyproject's "scan" extra (PYTHON=... to pick)
 .venv/bin/python -m tribuutscan.fuse captures/<stamp>-rec   # ROUGH mesh.ply from a recording (Open3D)
 .venv/bin/python -m tribuutscan.compare captures/<stamp>-scan [ref.ply] [--seeds 12] [--transform c.json]
                                             # score a cloud or mesh against a reference mesh (default
@@ -640,6 +641,16 @@ cubes on the GPU; the CPU keeps the 6x6 solve, markers, base votes, pose graph, 
   synth / synth7 / synthhard truth 0.37 / 0.35 / 0.34 mm; synthfp ATE 0.55 mm, truth 0.12 mm;
   synthplate ATE 10.8 mm, 3 re-finds, 86% on the object: tracking slips where the plate is edge-on (a
   thin-object case for Phase 3; Phase 1's both-faces check fuses it with the true poses).
+- Phase 0.6 platform (2026-11-01): pyproject.toml has the manifest (core numpy; extra "scan" open3d,
+  opencv-python-headless; a "gpu" extra comes with the bake-off) and setup-venv.sh builds a venv from
+  it on any distro (`pip install -e .[scan]`; PYTHON=... picks the interpreter; leaves an existing
+  directory alone). The user's .venv (made by hand, --system-site-packages) is unchanged. Throwaway
+  check with uv's standalone Python 3.14.5 (Tk 9.0) + numpy 2.5.4 + open3d 0.20.0 + OpenCV 5.0.0: all
+  tests pass; evaluate on all six datasets equal to the baseline within 1e-11 (markers 244 -> 218 ms
+  per frame); the board calibration solved from the 10-30 views agrees within 0.002% (fx 963.53 /
+  963.51, law a 289570 / 289564, same 28 views, reprojection 0.346 / 0.319 / 0.340 px vs 0.346 /
+  0.321 / 0.340); the viewer's PPM previews and a panel render the same under Tk 9.0. So Ubuntu 26.04's
+  likely stack needs no code change today; the checkpoint re-runs this on the real install.
 
 ## The person you are working with
 

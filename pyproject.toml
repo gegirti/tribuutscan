@@ -1,10 +1,27 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "tribuutscan"
 version = "0.1.0"
 description = "3BUUTscan: use a Creality CR-Scan Ferret Pro directly on Linux over V4L2"
 requires-python = ">=3.10"
 license = { text = "MIT" }
-dependencies = ["numpy"]
+# The viewer and capture need numpy and the standard library's tkinter (python3-tk on Debian/Ubuntu).
+dependencies = ["numpy>=1.24"]
+
+[project.optional-dependencies]
+# Scanning, calibration and meshing (the .venv the viewer starts its worker with; setup-venv.sh).
+# Tested (2026-11-01, same results): Python 3.12 + numpy 1.26 + open3d 0.20.0 + opencv 4.10, and
+# Python 3.14 + numpy 2.5 + open3d 0.20.0 + opencv 5.0 (Tk 9.0).
+scan = ["open3d>=0.20", "opencv-python-headless>=4.10"]
+
+[tool.setuptools]
+packages = ["tribuutscan"]
+
+[tool.setuptools.package-data]
+tribuutscan = ["web/*"]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
