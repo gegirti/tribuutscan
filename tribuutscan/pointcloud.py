@@ -81,6 +81,27 @@ def write_ply(path, xyz, rgb, normals=None, seen=None):
         f.write(rec.tobytes())
 
 
+def vertex_normals(xyz, triangles):
+    """Unit vertex normals: the area-weighted normals of the triangles around each vertex."""
+    face = np.cross(xyz[triangles[:, 1]] - xyz[triangles[:, 0]], xyz[triangles[:, 2]] - xyz[triangles[:, 0]])
+    normals = np.zeros_like(xyz, dtype=np.float64)
+    for k in range(3):
+        np.add.at(normals, triangles[:, k], face)
+    length = np.linalg.norm(normals, axis=1, keepdims=True)
+    return normals / np.where(length > 0, length, 1)
+
+
+def write_mesh_ply(path, xyz, rgb, triangles, normals=None):
+    """Binary PLY triangle mesh: float32 vertices with colour (and normals), faces as uchar + int lists."""
+    write_ply(path, xyz, rgb, normals)
+    faces = np.empty(len(triangles), dtype=[("n", "u1"), ("i", "<i4", 3)])
+    faces["n"], faces["i"] = 3, triangles
+    data = Path(path).read_bytes()
+    end = data.index(b"end_header\n")
+    header = data[:end] + f"element face {len(faces)}\nproperty list uchar int vertex_indices\n".encode() + b"end_header\n"
+    Path(path).write_bytes(header + data[end + len(b"end_header\n"):] + faces.tobytes())
+
+
 def main():
     if len(sys.argv) > 1:
         directory = Path(sys.argv[1])

@@ -3,11 +3,15 @@
     .venv/bin/python -m tribuutscan.evaluate                       # all datasets, current tracker
     .venv/bin/python -m tribuutscan.evaluate tilt synth --label x  # some datasets
     .venv/bin/python -m tribuutscan.evaluate --against captures/eval/<run>/report.json
+    .venv/bin/python -m tribuutscan.evaluate synth synthplate --mesh               # also fuse a mesh (fusion.py)
 
 Writes captures/eval/<stamp>-<label>/report.json and 3-view renders (none for private datasets).
 Metrics: tracked/lost/re-found frames, pose jumps, double-surface ratio, marker scatter, loop gap,
 ms per frame; on synthetic data ATE/RPE against the true poses and the cloud's distance to the true
-surface (in place, so tracking drift counts; points within 5 mm are on the object). (A keyframe residual and a split-half
+surface (in place, so tracking drift counts; points within 5 mm are on the object). With --mesh, the
+merged frames are also fused (fusion.py) at the tracked poses and, on synthetic sets, at the TRUE
+poses (fusion alone: the table cut by height), each scored against the true surface; the plate's two
+faces must each be covered within 0.5 mm. (A keyframe residual and a split-half
 Chamfer were tried and dropped: they read the same on the doubled and the good scan, because each
 half / keyframe already contains the shifted frames.)
 Real recordings use calib.CAMERA (board calibration, else the scanner's factory one); synthetic sets
@@ -89,7 +93,7 @@ def make_scanner(tracker, preset, mode):
     return cl.Scanner(preset, log=lambda m: None, **options)
 
 
-def run(name, tracker="baseline", preset="small", live_markers=False, optimise_after=False):
+def run(name, tracker="baseline", preset="small", live_markers=False, optimise_after=False, mesh=False):
     """live_markers: let the tracker detect markers itself (markers.detect_fast, as live) instead of
     being handed the cached reference detections. Synthetic sets run with the estimated camera they
     were rendered with."""
@@ -97,12 +101,48 @@ def run(name, tracker="baseline", preset="small", live_markers=False, optimise_a
     if name in SYNTH:
         calib.use(calib.ESTIMATES)
     try:
-        return _run(name, tracker, preset, live_markers, optimise_after)
+        return _run(name, tracker, preset, live_markers, optimise_after, mesh)
     finally:
         calib.use(calibrated)
 
 
-def _run(name, tracker, preset, live_markers, optimise_after):
+def surface_check(directory, vertices, triangles):
+    """A synthetic set's mesh against its true surface (mm); for the plate, each face's share within 0.5 mm."""
+    import open3d as o3d
+    d = synth.truth_distance(directory, vertices)
+    on = d < 5.0
+    out = {"median": round(float(np.median(d[on])), 3) if on.any() else None,
+           "p90": round(float(np.percentile(d[on], 90)), 3) if on.any() else None,
+           "on_object": round(float(on.mean()), 3) if len(d) else None}
+    if json.loads((Path(directory) / "info.json").read_text()).get("kind") == "plate" and len(triangles):
+        scene = o3d.t.geometry.RaycastingScene()
+        scene.add_triangles(o3d.core.Tensor(vertices.astype(np.float32)), o3d.core.Tensor(triangles.astype(np.uint32)))
+        out["faces_within_0.5mm"] = [round(float((scene.compute_distance(o3d.core.Tensor(f.astype(np.float32))).numpy()
+                                                  < 0.5).mean()), 3) for f in synth.plate_faces(directory)]
+    return out
+
+
+def mesh_result(name, directory, scanner):
+    """The merged frames fused at their tracked poses (and on synthetic sets at the true ones)."""
+    from . import fusion
+    if not scanner.sources:
+        scanner.add_source(Path(directory).resolve(), 0)
+    t = time.perf_counter()
+    engine, ms = fusion.fuse(fusion.scan_frames(scanner, "merged"), log=lambda m: None)
+    vertices, triangles, _ = fusion.extract(engine, scanner.output_mask)
+    out = {"frames": engine.frames, "triangles": int(len(triangles)), "s": round(time.perf_counter() - t, 1),
+           "integrate_ms": ms["integrate"]}
+    if name in SYNTH:
+        out["tracked"] = surface_check(directory, vertices, triangles)
+        truth = synth.read_truth(directory)
+        engine, _ = fusion.fuse(((f, truth[i], None) for i, f in enumerate(fr.read_recording(directory)) if i in truth),
+                                log=lambda m: None)
+        vertices, triangles, _ = fusion.extract(engine, lambda xyz: synth.height_above_table(directory, xyz) > 1.0)
+        out["true_poses"] = surface_check(directory, vertices, triangles)
+    return out
+
+
+def _run(name, tracker, preset, live_markers, optimise_after, mesh=False):
     directory = dataset_path(name)
     found = cached_markers(name, directory)
     scanner = make_scanner(tracker, preset, DATASETS[name][2])
@@ -146,6 +186,8 @@ def _run(name, tracker, preset, live_markers, optimise_after):
             [m @ p[:3, :3].T + p[:3, 3] * 1000 for _, p, _, _, mk in scanner.keyframes for m in mk]),
         "optimise": opt_report,
     }
+    if mesh:
+        result["mesh"] = mesh_result(name, directory, scanner)
     if name in SYNTH:
         truth = synth.read_truth(directory)
         result["ground_truth"] = {k: (round(v, 3) if isinstance(v, float) else v)
@@ -203,6 +245,7 @@ def show(results, against=None):
             ("double_surface_ratio", "double"), ("marker_scatter.scatter_mm", "mk mm"),
             ("keyframe_marker_scatter.scatter_mm", "kf mk mm"), ("loop_gap.mm", "gap mm"),
             ("ground_truth.ate_mm", "ATE mm"), ("keyframe_ground_truth.ate_mm", "kf ATE"), ("truth_mm.median", "truth mm"),
+            ("mesh.tracked.median", "mesh mm"), ("mesh.true_poses.median", "fused mm"),
             ("optimise.loops_kept", "loops"), ("ms_per_frame", "ms")]
     print(f"{'dataset':9s} " + " ".join(f"{h:>14s}" for _, h in cols))
     for r in results:
@@ -223,7 +266,8 @@ def main():
     results = []
     for name in names:
         t0 = time.time()
-        result, (xyz, rgb, normals) = run(name, tracker, preset, "--live-markers" in args, "--optimise" in args)
+        result, (xyz, rgb, normals) = run(name, tracker, preset, "--live-markers" in args, "--optimise" in args,
+                                          "--mesh" in args)
         results.append(result)
         if name not in PRIVATE:
             render_views(xyz, normals, out / f"{name}.png")

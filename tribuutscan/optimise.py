@@ -137,7 +137,8 @@ def optimise(scanner, log=print):
 def make_mesh(scanner, directory, depth=9):
     """Poisson surface from the cloud's oriented normals -> directory/mesh.ply (metres, y up like
     cloud.ply). Low-density vertices (surface guessed far from any point) are dropped. Returns the
-    triangle count. (A TSDF mesh needs the depth images; the merged frames keep only points.)"""
+    triangle count. Only for scans whose recordings are not at hand: fusion.py fuses the frames
+    themselves (a TSDF), which is closer to the surface."""
     from . import cloud as cl
     xyz, rgb, _, nrm = scanner.output_cloud().points(cl.MIN_SEEN, with_normals=True)  # as saved (base or not)
     ok = np.linalg.norm(nrm, axis=1) > 0.5
@@ -173,7 +174,13 @@ def process(scanner, directory, action, log=print):
         _, kept = scanner.save(directory)
         return f"merged again at {cl.PRESETS_MM[action]} mm: {kept:,} points"
     if action == "mesh":
-        return f"mesh: {make_mesh(scanner, directory):,} triangles -> mesh.ply"
+        from . import fusion
+        try:
+            report = fusion.make_mesh(directory, log=log, scanner=scanner)
+        except (ValueError, FileNotFoundError) as e:  # no recordings noted or kept, or another camera
+            return f"{e}. Made a rough mesh from the cloud instead: {make_mesh(scanner, directory):,} triangles"
+        return (f"mesh: {report['triangles']:,} triangles from {report['frames']} frames in "
+                f"{report['fuse_s'] + report['extract_s']:.0f} s -> mesh.ply, mesh.stl")
     if action in ("base-off", "base-on"):
         if scanner.scene.plane is None:
             return "no base was found in this scan: nothing to remove"

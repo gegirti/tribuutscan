@@ -24,7 +24,9 @@ We are open to testing more devices and to improvements from anyone. See
 
 - Live scanning works: move the scanner around an object and frames merge into one point cloud
   while you watch it grow in a browser 3D view. After Stop, an *Optimise* step ties the scan
-  together (loop closures), and a rough mesh can be made from it.
+  together (loop closures), and *Make mesh* fuses the scan's frames into a surface (PLY with colour,
+  STL for slicers). On our marker part the mesh lies 0.09 mm (median) from Creality's own scan of
+  it, 0.34 mm for 90% of it.
 - The scanner is **calibrated** with a printed board, and sizes come out right: on frames not used
   for the calibration, a 24.00 mm board square measures 24.03 mm from depth, and colour lands within
   0.3 px of depth. Without a board, the scanner's own factory calibration is used: it is read
@@ -81,15 +83,17 @@ right: Scanner, Capture, Scan, IMU and View.
   keep the frames the scan used, for replays.
   *Continue last* goes on with the last saved scan.
 - **Open 3D view**: the scan in the browser. *Process* has Optimise again, merge again at
-  0.5 / 1 / 2 mm point distance, Make mesh, and Remove base / Keep base; *Export* downloads
-  `cloud.ply` and `mesh.ply`.
+  0.5 / 1 / 2 mm point distance, Make mesh, and Remove base / Keep base; *Show* switches between
+  the cloud and the mesh (*Colour: Grey* shows its shape); *Export* downloads `cloud.ply`,
+  `mesh.ply` (metres, like the cloud) and `mesh.stl` (millimetres, for slicers).
 - **Save frame (s)** writes one colour + IR + depth set (and a `cloud.ply`) to `captures/<stamp>/`.
   **Record (r)** writes colour + depth sets at 30 (or 10) a second, plus the IMU's samples
   (`imu.csv`, 200 a second), for processing later. Depth is compressed losslessly and IR is left
   out, so 30 fps takes about 75 MB/s, more when depth fills more of the view (a minute is about
   4.5 GB); recording stops by itself when
   less than 5 GB is free, and the status line shows what is left.
-  **Mesh last recording (m)** makes a rough mesh from the latest one.
+  **Mesh last recording (m)** tracks the latest one, optimises it and makes its mesh
+  (`captures/<stamp>-scan/mesh.ply` and `mesh.stl`; a few minutes).
 - Sliders set colour and IR brightness; *Auto IR* finds an IR exposure without clipping.
 - **Range** switches between close (15-33 cm) and long range (about 20-72 cm); the images pause for
   about 10 s while the scanner switches.
@@ -245,6 +249,22 @@ The IR projector turns on by itself when the IR stream is opened.
   found"), although its udev rules list `2bc5:069c`.
 - **Markers** (white dot in a black ring, 6 or 10 mm, placed irregularly) are found in the colour
   image; their dot usually has depth too. They make tracking far steadier.
+- **Meshes** (`tribuutscan/fusion.py`): the frames are fused into a truncated signed distance volume
+  (0.5 mm voxels, 1.5 mm truncation) at their tracked poses, and the surface is taken from it. On the
+  marker recording, against Creality's scan of the same part:
+
+  | | median | 90% within | Creality's surface covered within 1 mm |
+  |---|---|---|---|
+  | point cloud (after Optimise) | 0.23 mm | 0.56 mm | 66.5% |
+  | mesh | 0.09 mm | 0.34 mm | 66.1% |
+
+  The mesh misses a thin band where the scanned area ends (a fused surface stops about a voxel
+  before the last points); otherwise it covers the same. Only the keyframes are fused (the frames
+  Optimise corrects): with every frame the 90% figure was 0.53 mm. Fusing the marker scan's 179
+  keyframes takes about a minute on the CPU. Pieces of the surroundings that the object region took in
+  (they are in the point cloud too, as loose points) show up as separate sheets around the part. On synthetic scans with known
+  motion the fused surface lies 0.02-0.03 mm (median) from the true one, and a 1.8 mm plate seen from
+  both sides keeps both faces (the truncation is kept under the plate's thickness for that).
 
 ## Layout
 
@@ -256,12 +276,13 @@ The IR projector turns on by itself when the IR stream is opened.
   (browser 3D view; three.js r160 is vendored so it works offline)
 - Scanning: `cloud.py` (voxel cloud, the scanner), `track.py` (the joint solve), `features.py` (ORB),
   `markers.py` + `markermap.py`, `scene.py` (table plane, object region), `prep.py` (depth cleanup),
-  `optimise.py` (loop closures, pose graph, mesh), `session.py` (continue or merge scans),
-  `fuse.py` (rough TSDF mesh from a recording)
+  `optimise.py` (loop closures, pose graph), `session.py` (continue or merge scans),
+  `fusion.py` (the mesh: frames fused into a TSDF volume), `fuse.py` (ICP helpers)
 - Camera: `calib.py` (the camera model), `calibrate.py` (board calibration)
 - Measuring: `evaluate.py` + `metrics.py` (tracking scores on saved and synthetic recordings),
   `synth.py` (synthetic scans with known motion), `measure.py` (depth flatness and noise),
-  `compare.py` (a scan against a reference mesh of the same part),
+  `compare.py` (a scan or mesh against a reference mesh of the same part), `bench.py` (time per
+  stage),
   `pointcloud.py` (single-frame export)
 - `tribuutscan-viewer.sh` launcher (copy to `~/.local/bin/tribuutscan-viewer`)
 - `udev/70-tribuutscan.rules` USB access for 14-bit depth
@@ -272,6 +293,10 @@ The IR projector turns on by itself when the IR stream is opened.
 
 Next up:
 
+- [ ] **GPU pipeline** (the top priority): depth processing, fusion, tracking against the fused model
+      and meshing on the GPU, for live 20-30 fps and meshes in seconds. Vendor-neutral (any GPU with
+      stock drivers, plus a CPU fallback), so it runs for everyone; the engine (WebGPU through wgpu,
+      or OpenCL) is chosen by measuring both. Today's CPU path is the reference it must match.
 - [ ] **Crop in the 3D view**: for what touches the object (a stand, a cable), which object
       separation keeps.
 - [ ] **Speed** (measured on the marker scan: 247 ms per frame, about 4 fps):
@@ -281,7 +306,6 @@ Next up:
   - [ ] fewer Open3D fit checks per frame (about 12 calls, 17 ms)
   - [ ] ORB features on every second frame (about 8 ms)
   - [ ] independent steps in parallel (11 of 12 CPU threads idle)
-  - [ ] GPU last, if still needed: Intel Arc A750, so OpenCL or Vulkan, not CUDA
 - [ ] **Accuracy**:
   - [ ] a printed test box with known dimensions and small details
   - [ ] a long-range board calibration
@@ -306,10 +330,12 @@ Done:
       loop closures, continuing a scan, merging two scans.
 - [x] **Markers**: detection, and tracking and alignment with them.
 - [x] **Browser 3D view** with export.
+- [x] **Meshes** fused from the frames (a TSDF volume on the CPU, Open3D), shown in the 3D view,
+      exported as PLY and STL.
 
 Later:
 
-- [ ] **Geometry**: cleanup and better meshing (today's mesh is a rough Poisson surface).
+- [ ] **Geometry**: hole filling and cleanup of the mesh.
 - [ ] **Texturing** from the colour camera.
 - [ ] **Interface polish** (viewer v2 is in place; a VS Code based interface is still an idea).
 - [ ] Packaging.

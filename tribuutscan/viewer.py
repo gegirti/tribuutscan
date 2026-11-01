@@ -8,8 +8,8 @@ Run with `python -m tribuutscan.viewer`. Panels (panels.py, each folds):
   then owns them). Auto IR steps them until the IR image has little clipping (clipping costs depth).
 - Capture: `s` saves the current frame set to captures/<timestamp>/; `r` records colour + depth sets
   at 30 or 10 fps (and IMU samples, imu.csv) to captures/<timestamp>-rec/, stopping when the disk has
-  under 5 GB free (frames.Recorder); `m` fuses the latest recording into mesh.ply
-  (fuse.py in the Open3D .venv).
+  under 5 GB free (frames.Recorder); `m` tracks, optimises and fuses the latest recording into
+  <stamp>-scan/mesh.ply and mesh.stl (cloud.py --optimise --mesh, fusion.py, in the Open3D .venv).
 - Scan: `c` merges frames live into one compact cloud (cloud.py) in a worker process; Open 3D view
   shows it growing in the browser. Stop saves captures/<timestamp>-scan/.
 - IMU: the scanner's accelerometer and gyroscope (imu.py): tilt from gravity, turn rate.
@@ -24,6 +24,7 @@ import fcntl
 import multiprocessing
 import os
 import queue
+import shutil
 import subprocess
 import threading
 import time
@@ -60,7 +61,7 @@ RECORD_RATES = {"30 fps": 30, "10 fps": 10}  # colour + compressed depth: about 
 GOOD, EDGE, BAD = "#2e7d32", "#ef6c00", "#c62828"
 
 REPO = Path(__file__).resolve().parent.parent
-VENV_PYTHON = REPO / ".venv" / "bin" / "python"  # has Open3D; see fuse.py
+VENV_PYTHON = REPO / ".venv" / "bin" / "python"  # has Open3D (setup-venv.sh)
 
 
 LOG = fr.CAPTURES / "viewer.log"
@@ -737,7 +738,9 @@ class App:
                  + f", {recorder.free:.0f} GB free")
 
     def mesh(self):
-        """Fuse the latest recording in a separate process so the live view keeps running."""
+        """Track, optimise and fuse the latest recording (cloud.py --optimise --mesh) in a separate
+        process, so the live view keeps running; in a memory-capped scope of its own where systemd-run
+        exists (an out-of-memory kill then takes only that job, not the viewer with it)."""
         job = self.job
         if job["process"]:
             self.log(f"still meshing {job['dir'].name}")
@@ -750,13 +753,14 @@ class App:
             self.log("no recording yet: press r to record")
             return
         if not VENV_PYTHON.exists():
-            self.log("meshing needs Open3D in .venv (see fuse.py)")
+            self.log("meshing needs Open3D in .venv (README: setup-venv.sh)")
             return
+        scope = ["systemd-run", "--user", "--scope", "-q", "-p", "MemoryMax=8G"] if shutil.which("systemd-run") else []
         job["process"] = subprocess.Popen(
-            [str(VENV_PYTHON), "-m", "tribuutscan.fuse", str(directory)], cwd=REPO,
+            scope + [str(VENV_PYTHON), "-m", "tribuutscan.cloud", str(directory), "--optimise", "--mesh"], cwd=REPO,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         job["dir"] = directory
-        self.log(f"meshing {directory.name} (takes about a minute) ...")
+        self.log(f"meshing {directory.name}: tracking, optimising, fusing (a few minutes) ...")
 
     def check_mesh(self):
         job = self.job
@@ -766,7 +770,8 @@ class App:
         lines = [ln for ln in process.stdout.read().splitlines() if ln.startswith(("mesh:", "Traceback"))]
         if process.returncode == 0:
             summary = lines[-1].split(" -> ")[0] if lines else "done"
-            self.log(f"meshed {job['dir'].name} ({summary}) -> mesh.ply")
+            scan = job["dir"].name.removesuffix("-rec") + "-scan"
+            self.log(f"meshed {job['dir'].name} ({summary}) -> {scan}/mesh.ply, mesh.stl")
         else:
             self.log(f"meshing {job['dir'].name} failed (exit {process.returncode})")
         job["process"] = None
@@ -822,7 +827,7 @@ class App:
 
     def check_scan(self):
         """Hand the worker a new frame when it is free; handle its replies."""
-        live, color, ir, depth = self.live, self.color, self.ir, self.depth
+        live, color, depth = self.live, self.color, self.depth
         if self.scan_state == "scanning" and live["inflight"] < 2 and color.raw and depth.raw \
                 and depth.stamp != live["sent"]:  # one frame in work, one waiting: the worker never idles
             d_raw, d_t = depth.raw, depth.stamp

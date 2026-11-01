@@ -323,3 +323,28 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+def _to_world(directory):
+    """Scan world (the first camera's frame, metres) -> synthetic world (table at z = 0), 4x4."""
+    info = json.loads((Path(directory) / "info.json").read_text())
+    return first_camera(info.get("kind", "box"), info.get("hard", False))
+
+
+def height_above_table(directory, xyz_mm):
+    """Height (mm) above the synthetic table of points in a scan's world (mm)."""
+    m = _to_world(directory)
+    return (np.asarray(xyz_mm) / 1000 @ m[:3, :3].T + m[:3, 3])[:, 2] * 1000
+
+
+def plate_faces(directory, spacing_mm=0.5):
+    """Points (scan world, mm) every spacing_mm on the plate's two large faces, front (+x) then back."""
+    ys = np.arange(-PLATE[1] / 2, PLATE[1] / 2, spacing_mm / 1000)
+    zs = np.arange(0.002, PLATE[2], spacing_mm / 1000)  # from 2 mm up: the foot meets the table
+    y, z = [a.ravel() for a in np.meshgrid(ys, zs)]
+    to_scan = np.linalg.inv(_to_world(directory))
+    faces = []
+    for x in (PLATE[0] / 2, -PLATE[0] / 2):
+        p = np.stack([np.full_like(y, x), y, z], 1)
+        faces.append((p @ to_scan[:3, :3].T + to_scan[:3, 3]) * 1000)
+    return faces

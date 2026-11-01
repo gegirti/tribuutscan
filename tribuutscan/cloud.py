@@ -2,6 +2,7 @@
 
     python3 -m tribuutscan.cloud captures/<stamp>-rec [small|medium|large] [--keep-base]
     .venv/bin/python -m tribuutscan.cloud ...      # with Open3D: tracks motion (ICP) between frames
+    .venv/bin/python -m tribuutscan.cloud captures/<stamp>-rec --optimise --mesh   # then Optimise, fusion.py
 
 Space is cut into cubes of side `point distance`. Every point that lands in a cube is averaged into
 that cube's one point, so the cloud grows with the object's surface, not with scan time. A cube
@@ -10,11 +11,12 @@ must be seen in `min_seen` frames to be kept, which drops noise and flying pixel
 Each frame is first cut down to the object: the depth window, then the table or turntable plane
 (if the object stands on it), then the connected piece at the image centre.
 
-Writes captures/<stamp>-scan/: cloud.ply (metres, x right, y up, z toward the scanner; like fuse.py),
+Writes captures/<stamp>-scan/: cloud.ply (metres, x right, y up, z toward the scanner),
 poses.txt (merged frames), frame_poses.txt (every tracked frame), labels.npz, session.json (with the
 camera model's source and fingerprint, and `sources`: the recordings the frame indices point into,
 so a scan can be fused again from its raw frames).
 """
+import bisect
 import json
 import sys
 import time
@@ -382,6 +384,21 @@ def load_npz(path):
         return {name: f[name] for name in f.files}
 
 
+def blend(a, b, t):
+    """The rigid transform a fraction t of the way from a (t = 0) to b (t = 1): rotation along the
+    shortest arc, translation along a straight line."""
+    d = a[:3, :3].T @ b[:3, :3]
+    angle = np.arccos(np.clip((np.trace(d) - 1) / 2, -1, 1))
+    r = a[:3, :3]
+    if angle > 1e-12:
+        w = np.array([d[2, 1] - d[1, 2], d[0, 2] - d[2, 0], d[1, 0] - d[0, 1]]) / (2 * np.sin(angle))
+        k = np.array([[0, -w[2], w[1]], [w[2], 0, -w[0]], [-w[1], w[0], 0]])
+        r = r @ (np.eye(3) + np.sin(t * angle) * k + (1 - np.cos(t * angle)) * k @ k)
+    out = np.eye(4)
+    out[:3, :3], out[:3, 3] = r, (1 - t) * a[:3, 3] + t * b[:3, 3]
+    return out
+
+
 def scene_margin():
     from .scene import REGION_MARGIN_MM
     return REGION_MARGIN_MM
@@ -643,13 +660,26 @@ class Scanner:
                       nrm.astype(np.float64) @ pose[:3, :3].T)
         with self.cloud_lock:
             self.cloud = cloud
-        # every tracked frame moves with the last merged frame before it (the first one for those before)
+        # every tracked frame gets a correction blended from the merged frames on either side of it, within
+        # one source recording (held constant instead, the corrections jumped at each merged frame and
+        # the mesh fused from every frame came out blurred: p90 0.55 mm against 0.34 from merged frames)
         fixes = {i: new_poses.get(i, old[i]) @ np.linalg.inv(old[i]) for i, _ in self.poses}
-        current = fixes[self.poses[0][0]]
+        keyed = sorted(fixes)
+        starts = sorted(src["first_index"] for src in self.sources)
+        part = lambda i: bisect.bisect_right(starts, i)
         log = []
         for i, status, p in self.track_log:
-            current = fixes.get(i, current)
-            log.append((i, status, None if p is None else current @ p))
+            if p is not None:
+                k = bisect.bisect_left(keyed, i)
+                if k < len(keyed) and (keyed[k] == i or k == 0):
+                    fix = fixes[keyed[k]]
+                elif k == len(keyed) or part(keyed[k - 1]) != part(keyed[k]):
+                    fix = fixes[keyed[k - 1]]
+                else:
+                    a, b = keyed[k - 1], keyed[k]
+                    fix = blend(fixes[a], fixes[b], (i - a) / (b - a))
+                p = fix @ p
+            log.append((i, status, p))
         self.track_log = log
         self.poses = [(i, new_poses.get(i, p)) for i, p in self.poses]
         self.keyframes = [(i, new_poses.get(i, p), *rest) for i, p, *rest in self.keyframes]
@@ -999,6 +1029,14 @@ def main():
     print(f"raw points {cloud.raw_points} (~{raw_mb:.0f} MB) -> {len(cloud)} cubes at {cloud.point_mm} mm "
           f"-> {kept} kept (seen >= {MIN_SEEN}, object only), {out.stat().st_size / 1e6:.1f} MB, {time.time() - t0:.0f} s")
     print(f"-> {out}")
+    if "--optimise" in sys.argv:  # as a live scan does after Stop
+        from . import optimise
+        print(optimise.process(scanner, out_dir, "optimise"))
+    if "--mesh" in sys.argv:
+        from . import fusion
+        report = fusion.make_mesh(out_dir, scanner=scanner)
+        print(f"mesh: {report['triangles']:,} triangles from {report['frames']} frames, "
+              f"{time.time() - t0:.0f} s in all -> {out_dir / 'mesh.ply'}, mesh.stl")
 
 
 if __name__ == "__main__":

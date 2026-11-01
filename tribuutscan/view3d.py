@@ -21,25 +21,40 @@ WEB = Path(__file__).resolve().parent / "web"
 PORT = 8765
 FILES = {"/": ("index.html", "text/html"), "/three.module.min.js": ("three.module.min.js", "text/javascript"),
          "/OrbitControls.js": ("OrbitControls.js", "text/javascript")}
-PLY_TYPES = {"float": "<f4", "double": "<f8", "uchar": "u1", "ushort": "<u2", "int": "<i4", "uint": "<u4"}
+PLY_TYPES = {"float": "<f4", "double": "<f8", "uchar": "u1", "ushort": "<u2", "int": "<i4", "uint": "<u4",
+             "char": "i1", "short": "<i2", "float32": "<f4", "float64": "<f8", "uint8": "u1", "int8": "i1",
+             "uint16": "<u2", "int16": "<i2", "int32": "<i4", "uint32": "<u4"}
 
 
-def read_ply(path):
-    """Vertices of a binary little-endian PLY as a numpy record array."""
+def read_ply(path, faces=False):
+    """Vertices of a binary little-endian PLY as a numpy record array; with `faces`, also its
+    triangles ((M, 3) int, None when it has none)."""
     data = Path(path).read_bytes()
     end = data.index(b"end_header\n") + len(b"end_header\n")
     header = data[:end].decode().splitlines()
     if "format binary_little_endian 1.0" not in header:
         raise ValueError(f"{path}: only binary little-endian PLY is supported")
-    count, fields, in_vertex = 0, [], False
+    elements = []  # [name, count, [property parts]]
     for line in header:
         parts = line.split()
         if parts[:1] == ["element"]:
-            in_vertex = parts[1] == "vertex"
-            count = int(parts[2]) if in_vertex else count
-        elif parts[:1] == ["property"] and in_vertex:
-            fields.append((parts[2], PLY_TYPES[parts[1]]))
-    return np.frombuffer(data, dtype=fields, count=count, offset=end)
+            elements.append([parts[1], int(parts[2]), []])
+        elif parts[:1] == ["property"] and elements:
+            elements[-1][2].append(parts[1:])
+    vertex, triangles, offset = None, None, end
+    for name, count, props in elements:
+        if name == "vertex":
+            vertex = np.frombuffer(data, dtype=[(p[1], PLY_TYPES[p[0]]) for p in props], count=count, offset=offset)
+            offset += vertex.nbytes
+        elif name == "face" and props and props[0][0] == "list":
+            rec = np.frombuffer(data, dtype=[("n", PLY_TYPES[props[0][1]]), ("i", PLY_TYPES[props[0][2]], 3)],
+                                count=count, offset=offset)
+            if len(rec) and (rec["n"] != 3).any():
+                raise ValueError(f"{path}: only triangle faces are supported")
+            triangles, offset = rec["i"].astype(np.int64), offset + rec.nbytes
+        else:
+            break  # an element this reader does not know: what follows cannot be located
+    return (vertex, triangles) if faces else vertex
 
 
 def pack_cloud(rec):
@@ -48,6 +63,23 @@ def pack_cloud(rec):
     xyz = np.stack([rec["x"], rec["y"], rec["z"]], 1)
     rgb = np.stack([rec["red"], rec["green"], rec["blue"]], 1) if "red" in names else None
     return pack_arrays(xyz, rgb, rec["seen"] if "seen" in names else None)
+
+
+def pack_mesh(path):
+    """Binary mesh payload for the page from a mesh PLY: u32 vertices, u32 triangles, f32 xyz, u8 rgb
+    (padded to 4), u32 indices."""
+    rec, triangles = read_ply(path, faces=True)
+    n, m = len(rec), 0 if triangles is None else len(triangles)
+    xyz = np.stack([rec["x"], rec["y"], rec["z"]], 1)
+    rgb = (np.stack([rec["red"], rec["green"], rec["blue"]], 1) if "red" in rec.dtype.names
+           else np.full((n, 3), 200, np.uint8)).astype(np.uint8)
+    return (struct.pack("<II", n, m) + np.asarray(xyz, "<f4").tobytes() + rgb.tobytes() + b"\0" * (-3 * n % 4)
+            + (np.asarray(triangles, "<u4").tobytes() if m else b""))
+
+
+def mesh_version(path):
+    """A token that changes when the mesh file does (None: no mesh)."""
+    return str(path.stat().st_mtime_ns) if path is not None and path.exists() else None
 
 
 def pack_arrays(xyz, rgb=None, seen=None):
@@ -95,10 +127,9 @@ class FileSource:
                 rec = read_ply(self.ply)
                 self.payload = pack_cloud(rec)
                 session = json.loads(self.session.read_text()) if self.session.exists() else {}
-                self.info = {"name": self.ply.parent.name, "points": len(rec), "session": session,
-                             "mesh": self.mesh_path().exists(), "phase": "done"}
+                self.info = {"name": self.ply.parent.name, "points": len(rec), "session": session, "phase": "done"}
                 self.version = version
-            return self.version, self.payload, self.info
+            return self.version, self.payload, dict(self.info, mesh=mesh_version(self.mesh_path()))
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -120,10 +151,12 @@ class Handler(BaseHTTPRequestHandler):
             body = self.source.ply_bytes() if hasattr(self.source, "ply_bytes") else None
             if body is not None:
                 return self.reply(body, "application/octet-stream", f"{self.source.download_name()}.ply")
-        if path == "/mesh.ply":
-            mesh = self.source.mesh_path() if hasattr(self.source, "mesh_path") else None
-            if mesh is not None and mesh.exists():
-                return self.reply(mesh.read_bytes(), "application/octet-stream", f"{self.source.download_name()}-mesh.ply")
+        mesh = self.source.mesh_path() if hasattr(self.source, "mesh_path") else None
+        if path in ("/mesh.ply", "/mesh.stl") and mesh is not None and mesh.with_suffix(path[-4:]).exists():
+            return self.reply(mesh.with_suffix(path[-4:]).read_bytes(), "application/octet-stream",
+                              f"{self.source.download_name()}-mesh{path[-4:]}")
+        if path == "/mesh.bin" and mesh is not None and mesh.exists():
+            return self.reply(pack_mesh(mesh), "application/octet-stream")
         self.send_error(404)
 
     def do_POST(self):

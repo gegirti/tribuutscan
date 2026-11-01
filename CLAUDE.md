@@ -309,14 +309,17 @@ python3 -m tribuutscan.view3d captures/<stamp>-scan    # browser 3D view at http
 .venv/bin/python -m tribuutscan.session merge A-scan B-scan AB-scan   # merge two scans into one
 .venv/bin/python -m tribuutscan.calibrate board|capture [square_mm]|solve <dir> [square_mm]
                                             # ChArUco calibration -> captures/calibration.json
-.venv/bin/python -m tribuutscan.evaluate [datasets] [--label x] [--against report.json]
-                                            # tracking metrics on saved + synthetic recordings
+.venv/bin/python -m tribuutscan.evaluate [datasets] [--label x] [--against report.json] [--mesh]
+                                            # tracking metrics on saved + synthetic recordings (--mesh:
+                                            # also fuse, score against the true surface)
 .venv/bin/python -m tribuutscan.synth [out] [frames] [every] [hard] [--plate] [--pattern MM] [--y14]
                                             # synthetic scan, ground truth poses + true_surface.ply
 .venv/bin/python -m tribuutscan.bench [rec] [--frames N] [--label x] [--against captures/bench/<run>.json]
                                             # per-stage timing table (warm, disk apart) -> captures/bench/
 ./setup-venv.sh [dir]                       # build .venv from pyproject's "scan" extra (PYTHON=... to pick)
-.venv/bin/python -m tribuutscan.fuse captures/<stamp>-rec   # ROUGH mesh.ply from a recording (Open3D)
+.venv/bin/python -m tribuutscan.fusion captures/<stamp>-scan [--all] [--min-weight 4] [--force]
+                                            # fuse a scan's keyframes -> mesh.ply (m) + mesh.stl (mm)
+.venv/bin/python -m tribuutscan.cloud captures/<stamp>-rec --optimise --mesh   # what the viewer's `m` runs
 .venv/bin/python -m tribuutscan.compare captures/<stamp>-scan [ref.ply] [--seeds 12] [--transform c.json]
                                             # score a cloud or mesh against a reference mesh (default
                                             # captures/reference/part/mesh.ply) -> compare[-<name>].json/.ply
@@ -552,8 +555,10 @@ centre piece, and the table connected the part to its surroundings.
 ## Pitfalls already hit
 
 - Open3D (0.20, in the gitignored `.venv`): the legacy `ScalableTSDFVolume` gives empty meshes on
-  this data. The tensor `VoxelBlockGrid` works, and its mesh extraction skips voxels seen in
-  fewer than 3 frames. Plain frame-to-frame ICP lost track when the object was moved, so
+  this data. The tensor `VoxelBlockGrid` works, with three catches: its extraction keeps weights
+  STRICTLY above the threshold (3 meant "seen in 4 frames"; fusion.py passes n - 0.5), float depth
+  needs float colour (or uint16 depth with uint8 colour), and a frame touching no block raises
+  ("No block is touched"), so empty frames are skipped. Plain frame-to-frame ICP lost track when the object was moved, so
   `fuse.py` uses coarse-to-fine ICP plus a check that rejects implausible jumps.
 
 - The v4l2_format union starts at byte 8 on 64-bit; getting this wrong silently ignores the
@@ -564,8 +569,8 @@ centre piece, and the table connected the part to its surroundings.
   Optimise now peaks at 1.3 GB.
 - That 8 GB process ran inside VS Code's systemd scope, so the OOM killer's kill made systemd stop the
   whole scope (OOMPolicy=stop) and VS Code died with it. Start heavy jobs from a session in their own
-  capped scope: `systemd-run --user --scope -q -p MemoryMax=6G -p MemorySwapMax=2G <cmd>` (pass
-  variables with `-E`). Note too that this machine's shells have `.venv` activated, so plain `python3`
+  capped scope: `systemd-run --user --scope -q -p MemoryMax=6G -p MemorySwapMax=2G <cmd>` (it keeps
+  the working directory and environment). Note too that this machine's shells have `.venv` activated, so plain `python3`
   is the venv: use `/usr/bin/python3` to test without Open3D.
 - Automatic colour/depth registration by edge correlation did not converge on a flat shelf scene
   of dark boxes; a calibration target or marker is the right way, not more tuning.
@@ -641,6 +646,35 @@ cubes on the GPU; the CPU keeps the 6x6 solve, markers, base votes, pose graph, 
   synth / synth7 / synthhard truth 0.37 / 0.35 / 0.34 mm; synthfp ATE 0.55 mm, truth 0.12 mm;
   synthplate ATE 10.8 mm, 3 re-finds, 86% on the object: tracking slips where the plate is edge-on (a
   thin-object case for Phase 3; Phase 1's both-faces check fuses it with the true poses).
+- PHASE 1 DONE (2026-11-01): meshes on the CPU engine. `fusion.py`: `Engine` (Open3D VoxelBlockGrid,
+  0.5 mm voxels, 8^3 blocks, tsdf f32 + weight/colour uint16; depth as float mm, pinhole K) knows
+  nothing about the scanner; the Ferret layer removes the lens distortion by a fixed nearest-pixel
+  lookup (`Pinhole`), cleans like the merge (prep.clean, only around the label mask), takes colour per
+  pixel at its distance, masks by the frame's labels (1/8, grown one cell), skips empty frames. At
+  extraction: the cloud's output_mask (cylinder, base, connected to the core) on the vertices, then
+  crumbs under 1% of the largest piece dropped. mesh.ply (own writer: float32, colour, normals, metres,
+  y up) + mesh.stl (mm) + mesh.json. `cloud.py --optimise --mesh`, Process "Make mesh" (Poisson only
+  as a fallback when the recordings are gone), viewer `m` (cloud.py in a capped scope), the 3D page's
+  Show Cloud/Mesh + STL download (checked in headless Chrome: renders), `evaluate --mesh`. fuse.py
+  keeps only the ICP helpers.
+  - Settings measured on the marker scan (compare.py from the optimised cloud's placement):
+    truncation 1.5 mm (2 mm shifts the 1.8 mm plate's faces: median 0.034 -> 0.076 mm); keyframes
+    only (all 527 frames: p90 0.55 mm; with corrections blended between keyframes 0.53; keyframes
+    0.34), so frames between keyframes carry tracking error Optimise does not fix; min weight 4 frames
+    (3: p90 0.36, 6: 0.32 but less surface).
+  - Pass marks: marker mesh median 0.094 / p90 0.336 mm against the cloud's 0.229 / 0.562: PASS.
+    Creality surface within 1 mm 66.1% against 66.5%: MISSED by 0.4 points, all of it a thin band at
+    the edge of the scanned area (a fused surface stops about a voxel before the last points; mapped).
+    Synthetic, true poses: 0.018-0.025 mm median (<= 0.1: PASS); plate faces 100% / 99.9% within
+    0.5 mm (PASS). Time: 58 s for 179 keyframes (prepare 154 ms per frame, integrate 17, reading every
+    recorded frame 52).
+  - With tracked poses: synthetic meshes 0.055-0.10 mm; the plate loses its back face (78% / 2%):
+    tracking, Phase 3.
+  - Found on the way: Optimise's spread of keyframe corrections now blends between keyframes within a
+    recording (was held constant); 54 tracked frames (256-389) of the marker scan have EMPTY labels
+    (scene.masks found no object in them), and the object region's cylinder grew to 317 mm for a 274 mm
+    part, so sheets of the surroundings stay in cloud and mesh (5 pieces, 4-7% of the area each;
+    visible in the 3D page). Both are object separation, next to look at.
 - Phase 0.6 platform (2026-11-01): pyproject.toml has the manifest (core numpy; extra "scan" open3d,
   opencv-python-headless; a "gpu" extra comes with the bake-off) and setup-venv.sh builds a venv from
   it on any distro (`pip install -e .[scan]`; PYTHON=... picks the interpreter; leaves an existing

@@ -65,13 +65,14 @@
     <li data-action="small">Merge again: small<small>0.5 mm</small></li>
     <li data-action="medium">Merge again: medium<small>1 mm</small></li>
     <li data-action="large">Merge again: large<small>2 mm</small></li>
-    <li data-action="mesh">Make mesh<small>Poisson</small></li>
+    <li data-action="mesh">Make mesh<small>fuse the frames</small></li>
     <li data-action="base-off">Remove base<small>save without the table</small></li>
     <li data-action="base-on">Keep base<small>save with the table under it</small></li>
   </ul></div>
   <div class="menu"><button>Export</button><ul>
     <li id="dl-ply">Download cloud.ply</li>
     <li id="dl-mesh" class="later">Download mesh.ply<small>make a mesh first</small></li>
+    <li id="dl-stl" class="later">Download mesh.stl<small>mm, for slicers</small></li>
     <li id="dl-png">Save view as PNG</li>
   </ul></div>
   <div class="menu"><button>View</button><ul>
@@ -88,15 +89,23 @@
     <dt>Frames merged</dt><dd id="frames">–</dd>
     <dt>Tracking</dt><dd id="tracking">–</dd>
   </dl>
-  <label for="size">Point size</label>
-  <input id="size" type="range" min="0.3" max="4" step="0.1" value="1.5">
+  <label for="show">Show</label>
+  <select id="show">
+    <option value="cloud">Cloud</option>
+    <option value="mesh" disabled>Mesh (make one first)</option>
+  </select>
+  <div id="sizebox">
+    <label for="size">Point size</label>
+    <input id="size" type="range" min="0.3" max="4" step="0.1" value="1.5">
+  </div>
   <label for="mode">Colour</label>
   <select id="mode">
     <option value="rgb">Camera colour</option>
+    <option value="grey">Grey (mesh shape)</option>
     <option value="seen">Times seen (blue few, red many)</option>
     <option value="height">Height</option>
   </select>
-  <div class="hint">Drag to orbit, right-drag to pan, scroll to zoom. Sizes are estimates until calibration.</div>
+  <div class="hint">Drag to orbit, right-drag to pan, scroll to zoom. Colour: grey shows the mesh's shape.</div>
 </aside>
 <script type="module">
 import * as THREE from "three";
@@ -112,7 +121,13 @@ const controls = new OrbitControls(camera, canvas);
 controls.enableDamping = true;
 
 const material = new THREE.PointsMaterial({ size: 0.0015, vertexColors: true, sizeAttenuation: true });
+const meshMaterial = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.8, metalness: 0, side: THREE.DoubleSide });
+scene.add(new THREE.HemisphereLight(0xffffff, 0x404048, 1.2));
+const headlight = new THREE.DirectionalLight(0xffffff, 1.6);
+camera.add(headlight);  // lights the mesh from where you look
+scene.add(camera);
 let points = null, data = null, version = null, pointMm = 1, framed = false, messageAt = 0;
+let mesh = null, meshVersion = null, meshRgb = null;
 const $ = (id) => document.getElementById(id);
 
 function resize() {
@@ -134,6 +149,8 @@ function colours() {
   const n = data.n, out = new Float32Array(n * 3), mode = $("mode").value;
   if (mode === "rgb") {
     for (let i = 0; i < n * 3; i++) out[i] = data.rgb[i] / 255;
+  } else if (mode === "grey") {
+    out.fill(0.72);
   } else if (mode === "seen" && data.seen) {
     let max = 1;
     for (let i = 0; i < n; i++) max = Math.max(max, data.seen[i]);
@@ -146,10 +163,42 @@ function colours() {
   return out;
 }
 
+function meshColours() {  // camera colour, or plain grey for the shape
+  const n = meshRgb.length / 3, out = new Float32Array(n * 3);
+  if ($("mode").value === "rgb") for (let i = 0; i < n * 3; i++) out[i] = meshRgb[i] / 255;
+  else out.fill(0.72);
+  return out;
+}
+
+async function loadMesh() {
+  const buf = await (await fetch("mesh.bin")).arrayBuffer();
+  const [n, m] = new Uint32Array(buf, 0, 2);
+  const xyz = new Float32Array(buf, 8, n * 3);
+  const rgbAt = 8 + n * 12, idxAt = rgbAt + n * 3 + ((4 - (n * 3) % 4) % 4);
+  meshRgb = new Uint8Array(buf, rgbAt, n * 3);
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute("position", new THREE.BufferAttribute(xyz, 3));
+  geometry.setAttribute("color", new THREE.BufferAttribute(meshColours(), 3));
+  geometry.setIndex(new THREE.BufferAttribute(new Uint32Array(buf, idxAt, m * 3), 1));
+  geometry.computeVertexNormals();
+  if (mesh) { scene.remove(mesh); mesh.geometry.dispose(); }
+  mesh = new THREE.Mesh(geometry, meshMaterial);
+  scene.add(mesh);
+  showWhich();
+}
+
+function showWhich() {  // the cloud or the mesh
+  const wantMesh = $("show").value === "mesh" && mesh;
+  if (points) points.visible = !wantMesh;
+  if (mesh) mesh.visible = !!wantMesh;
+  $("sizebox").style.display = wantMesh ? "none" : "";
+}
+
 function frame() {
-  if (!points) return;
-  points.geometry.computeBoundingSphere();
-  const s = points.geometry.boundingSphere;
+  const shown = $("show").value === "mesh" && mesh ? mesh : points;
+  if (!shown) return;
+  shown.geometry.computeBoundingSphere();
+  const s = shown.geometry.boundingSphere;
   controls.target.copy(s.center);
   camera.position.copy(s.center).add(new THREE.Vector3(0, 0, s.radius * 2.6));
   camera.near = s.radius / 100; camera.far = s.radius * 100;
@@ -170,6 +219,7 @@ async function load() {
   if (points) { scene.remove(points); points.geometry.dispose(); }
   points = new THREE.Points(geometry, material);
   scene.add(points);
+  showWhich();
   if (!framed && n > 0) { frame(); framed = true; }
 }
 
@@ -198,6 +248,19 @@ async function poll() {
     if (Date.now() - messageAt > 8000)  // a Process result stays readable for a while
       $("status").innerHTML = info.phase === "optimising" ? "<b>●</b> optimising…" : "<b>●</b> connected";
     $("dl-mesh").classList.toggle("later", !info.mesh);
+    $("dl-stl").classList.toggle("later", !info.mesh);
+    const meshOption = $("show").options[1];
+    meshOption.disabled = !info.mesh;
+    meshOption.textContent = info.mesh ? "Mesh" : "Mesh (make one first)";
+    if (info.mesh && info.mesh !== meshVersion) {
+      meshVersion = info.mesh;
+      await loadMesh();
+      $("show").value = "mesh";  // a new mesh: show it
+      showWhich();
+    } else if (!info.mesh && mesh) {
+      scene.remove(mesh); mesh.geometry.dispose(); mesh = null; meshVersion = null;
+      $("show").value = "cloud"; showWhich();
+    }
   } catch (e) {
     $("status").textContent = "server stopped";
   }
@@ -207,11 +270,14 @@ async function poll() {
 $("size").addEventListener("input", () => { material.size = pointMm / 1000 * $("size").value; });
 $("mode").addEventListener("change", () => {
   if (points) points.geometry.setAttribute("color", new THREE.BufferAttribute(colours(), 3));
+  if (mesh) mesh.geometry.setAttribute("color", new THREE.BufferAttribute(meshColours(), 3));
 });
+$("show").addEventListener("change", showWhich);
 $("reset").addEventListener("click", frame);
 window.addEventListener("keydown", (e) => { if (e.key === "r" || e.key === "R") frame(); });
 $("dl-ply").addEventListener("click", () => { location.href = "cloud.ply"; });
 $("dl-mesh").addEventListener("click", () => { if (!$("dl-mesh").classList.contains("later")) location.href = "mesh.ply"; });
+$("dl-stl").addEventListener("click", () => { if (!$("dl-stl").classList.contains("later")) location.href = "mesh.stl"; });
 document.querySelectorAll("[data-action]").forEach((li) => li.addEventListener("click", async () => {
   $("status").textContent = `working: ${li.textContent.trim()}…`;
   messageAt = Date.now() + 600000;  // until the answer comes

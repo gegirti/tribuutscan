@@ -59,15 +59,14 @@ class LiveSource:
             if key != self.built_key and time.time() - self.built_at >= PAYLOAD_EVERY_S:
                 xyz, rgb, seen = s.output_cloud(connect=False).points(LIVE_MIN_SEEN)  # region, base as chosen
                 payload = view3d.pack_arrays(xyz @ cl.FLIP.T / 1000, rgb, seen)
-                info = {"name": self.name, "points": len(xyz), "phase": self.phase,
-                        "mesh": bool(self.out_dir and (self.out_dir / "mesh.ply").exists()), "session": {
+                info = {"name": self.name, "points": len(xyz), "phase": self.phase, "session": {
                     "preset": s.preset, "point_distance_mm": s.cloud.point_mm,
                     "raw_points": s.cloud.raw_points,
                     **{k: s.stats[k] for k in ("frames", "merged", "lost", "relocked", "tracking")},
                     "cue": dict(s.cue)}}
                 self.cached = ("-".join(map(str, key)), payload, info)
                 self.built_key, self.built_at = key, time.time()
-            return self.cached
+            return self.cached[0], self.cached[1], dict(self.cached[2], mesh=view3d.mesh_version(self.mesh_path()))
 
 
     def process(self, action):

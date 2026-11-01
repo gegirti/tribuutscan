@@ -228,8 +228,30 @@ def test_a_saved_scan_keeps_what_fusing_again_needs():
             back.remerge({i: shift @ p for i, p in back.poses})
             moved = [(q @ np.linalg.inv(p))[:3, 3] for (_, p), (_, q) in zip(tracked, back.frame_poses())]
             assert np.allclose(moved, [0.005, 0, 0], atol=1e-5)
+            again = cl.Scanner.restore(out, log=lambda *a: None)  # corrections growing along the scan:
+            keys = [i for i, _ in again.poses]  # frames between merged ones get them blended, not held
+            ramp = {}
+            for i, pose in again.poses:
+                t = np.eye(4)
+                t[0, 3] = 0.0001 * i
+                ramp[i] = t @ pose
+            again.remerge(ramp)
+            between = [(i, p, q) for (i, p), (_, q) in zip(tracked, again.frame_poses()) if keys[0] < i < keys[-1]]
+            assert between and all(np.allclose((q @ np.linalg.inv(p))[:3, 3], [0.0001 * i, 0, 0], atol=1e-6)
+                                   for i, p, q in between)
     finally:
         calib.use(before)
+
+
+def test_blend_goes_along_the_shortest_arc():
+    a = np.eye(4)
+    b = np.eye(4)
+    b[:3, :3] = [[0, -1, 0], [1, 0, 0], [0, 0, 1]]  # 90 degrees about z
+    b[:3, 3] = [2.0, 0, 0]
+    half = cl.blend(a, b, 0.5)
+    c = np.cos(np.pi / 4)
+    assert np.allclose(half[:3, :3], [[c, -c, 0], [c, c, 0], [0, 0, 1]]) and np.allclose(half[:3, 3], [1, 0, 0])
+    assert np.allclose(cl.blend(a, b, 0), a) and np.allclose(cl.blend(a, b, 1), b)
 
 
 def test_synthetic_sensor_sets_and_their_true_surface():
