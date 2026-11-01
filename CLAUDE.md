@@ -593,7 +593,7 @@ cubes on the GPU; the CPU keeps the 6x6 solve, markers, base votes, pose graph, 
   on uncleaned depth, model without the base, markers + prior on the CPU, only gated frames fused);
   4 live 20-30 fps; 5 finishing (re-fuse after Optimise, colour, per-mode voxel size); 6 clean-up;
   a checkpoint after the 26.04 upgrade.
-- Risks: disk (32 GB free, 93% full: full-rate Y14 + colour + IR ~147 MB/s), the A750 also drives
+- Risks: disk (46 GB free on 11-01; recordings now ~75 MB/s at full rate, Phase 0.3), the A750 also drives
   the desktop (chunk long kernels), only Intel hardware here (other vendors via testers).
 - Phase 0 done so far (2026-11-01): register_color fixed (it failed with any colour model); scans
   now save frame_poses.txt (every tracked frame; Optimise's keyframe corrections spread to the frames
