@@ -273,7 +273,7 @@ def solve(directory, square_mm=SQUARE_MM, out=None, log=print):
         # observed is only where the board was held, not the scanner's limit)
         "window_mm": [min(calib.ESTIMATES["window_mm"][0], seen[0]), max(calib.ESTIMATES["window_mm"][1], seen[1])],
         "colour": {"K": k_c.tolist(), "dist": d_c.ravel().tolist(), "R": rot.tolist(), "T_mm": trans.ravel().tolist()},
-        "colour_from_depth": affine_at(k_i, k_c, rot, trans, 250.0),
+        "colour_from_depth": calib.affine_at(k_i, k_c, rot, trans, 250.0),
         "report": report,
     }
     out = Path(out or fr.CAPTURES / "calibration.json")
@@ -281,21 +281,6 @@ def solve(directory, square_mm=SQUARE_MM, out=None, log=print):
     log(json.dumps(report, indent=2))
     log(f"-> {out}")
     return spec
-
-
-def affine_at(k_depth, k_colour, rot, trans, z_mm):
-    """The old affine depth->colour pixel mapping, refitted for distance z_mm (for code paths that
-    still use it). The real mapping depends on distance (parallax), which calib.Camera handles."""
-    vv, uu = np.mgrid[100:700:50, 100:1180:60]
-    u, v = uu.ravel().astype(float), vv.ravel().astype(float)
-    pts = np.stack([(u - k_depth[0, 2]) / k_depth[0, 0] * z_mm, (v - k_depth[1, 2]) / k_depth[1, 1] * z_mm,
-                    np.full(len(u), z_mm)], 1)
-    c = pts @ np.asarray(rot).T + np.asarray(trans).ravel()
-    x = c[:, 0] / c[:, 2] * k_colour[0, 0] + k_colour[0, 2]
-    y = c[:, 1] / c[:, 2] * k_colour[1, 1] + k_colour[1, 2]
-    ax, bx = np.polyfit(x, u, 1)  # depth u = ax * colour x + bx (the old REG form)
-    ay, by = np.polyfit(y, v, 1)
-    return {"ax": float(ax), "bx": float(bx), "ay": float(ay), "by": float(by)}
 
 
 def board_place(frame, col, to_ir, k_rough):

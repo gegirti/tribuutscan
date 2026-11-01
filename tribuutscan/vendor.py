@@ -14,6 +14,7 @@ sets only the properties in SETTABLE (the IMU's on/off switches, as the SDK's IM
 
     python3 -m tribuutscan.vendor            # known properties and structures
     python3 -m tribuutscan.vendor modes      # the depth modes the scanner offers (list 4034)
+    python3 -m tribuutscan.vendor factory    # the factory calibration (lists 4026, 4027, 4024)
     python3 -m tribuutscan.vendor switch "Long_range_mode Default"   # WRITES the current depth mode
     python3 -m tribuutscan.vendor scan       # also try every property id 0-299 and structure 1000-1043
 Careful: a read of structure 1044 hung the scanner's firmware until it was replugged. Any timeout
@@ -57,6 +58,8 @@ PROPERTIES = {2: "LDP", 3: "LASER", 4: "LASER_PULSE_WIDTH", 14: "DEPTH_MIRROR", 
               95: "DEVICE_WORK_MODE", 98: "SWITCH_IR_MODE", 99: "LASER_POWER_LEVEL", 100: "LDP_MEASURE_DISTANCE",
               119: "LASER_POWER_ACTUAL_LEVEL", 182: "LASER_CONTROL", 184: "IR_BRIGHTNESS"}
 DEPTH_MODE_LIST = 4034  # OB_RAW_DATA_DEPTH_ALG_MODE_LIST (OrbbecSDK_v2 InternalProperty.hpp)
+# the factory calibration, read as the SDK's G2AlgParamManager does (list command versions 1, 0, 0)
+DEPTH_CALIB_PARAM, ALIGN_CALIB_PARAM, D2C_PROFILE_LIST = 4026, 4027, 4024
 LIST_CHUNK = 252  # bytes per list read; the SDK uses up to DEFAULT_CMD_MAX_DATA_SIZE
 STRUCTURES = {1002: "BASELINE_CALIBRATION_PARAM", 1003: "DEVICE_TEMPERATURE", 1035: "DEVICE_SERIAL_NUMBER",
               1043: "CURRENT_DEPTH_ALG_MODE", 1045: "DEPTH_PRECISION_SUPPORT_LIST",
@@ -150,10 +153,10 @@ class Channel:
         """A structure list, the SDK's way (getStructureDataListProtoV1_1): start (cmdVer, size), read in
         chunks, finish. Returns the bytes; finish is sent whenever start succeeded (not after a timeout)."""
         ver, size = struct.unpack_from("<HI", self.request(INIT_READ_LIST, struct.pack("<I", pid)))
-        if ver != cmd_version:
-            raise VendorError(f"list {pid}: command version {ver}, expected {cmd_version}")
         out = bytearray()
         try:
+            if ver != cmd_version:
+                raise VendorError(f"list {pid}: command version {ver}, expected {cmd_version}")
             while len(out) < size:
                 n = min(LIST_CHUNK, size - len(out))
                 out += self.request(READ_LIST, struct.pack("<III", pid, len(out), n), 1024)[:n]
@@ -176,6 +179,13 @@ class Channel:
             raise VendorError(f"current depth mode: command version {ver}, expected 0")
         return entry
 
+    def factory_calibration(self):
+        """The scanner's own calibration for its current depth mode (reads only):
+        {"depth_calib": parse_depth_calib, "cameras": parse_camera_params, "profiles": parse_d2c_profiles}."""
+        return {"depth_calib": parse_depth_calib(self.read_list(DEPTH_CALIB_PARAM, 1)),
+                "cameras": parse_camera_params(self.read_list(ALIGN_CALIB_PARAM)),
+                "profiles": parse_d2c_profiles(self.read_list(D2C_PROFILE_LIST))}
+
     def switch_depth_mode(self, name):
         """THE WRITE: make `name`, an entry of the scanner's own list, the current depth mode
         (SET_STRUCTURE_V1_1 of 1043, command version 0, the entry's bytes unchanged). Returns False if
@@ -195,6 +205,39 @@ class Channel:
 
 def mode_name(entry):
     return entry[16:48].split(b"\0")[0].decode(errors="replace")
+
+
+# packed layouts from OrbbecSDK_v2 src/shared/InternalTypes.hpp and include/libobsensor/h/ObTypes.h (MIT)
+def parse_depth_calib(data):
+    """OBDepthCalibrationParam (28 bytes): distance = unit * baseline * focal / (disparity + offset)."""
+    keys = ("depth_mode", "baseline", "z0", "focal", "unit", "disp_offset", "invalid_disp")
+    return dict(zip(keys, struct.unpack_from("<I5fi", data)))
+
+
+def parse_camera_params(data):
+    """OBCameraParam_Internal_V0 records (152 bytes each): depth and colour intrinsics (fx fy cx cy w h),
+    distortion (k1-k6, p1, p2) and the depth -> colour transform (colour = R depth + T, mm)."""
+    out = []
+    for o in range(0, len(data) - 151, 152):
+        intr = [dict(zip(("fx", "fy", "cx", "cy", "w", "h"), struct.unpack_from("<4f2h", data, o + i)))
+                for i in (0, 20)]
+        dist = [dict(zip(("k1", "k2", "k3", "k4", "k5", "k6", "p1", "p2"), struct.unpack_from("<8f", data, o + i)))
+                for i in (40, 72)]
+        rt = struct.unpack_from("<12f", data, o + 104)
+        out.append({"depth": intr[0], "colour": intr[1], "depth_dist": dist[0], "colour_dist": dist[1],
+                    "R": list(rt[:9]), "T_mm": list(rt[9:])})
+    return out
+
+
+def parse_d2c_profiles(data):
+    """OBD2CProfile entries (22 bytes each): which camera record serves a colour/depth size pair, and the
+    crop (left, top, right, bottom; negative = rows/columns cut) after scaling by `scale`. record 255: none."""
+    out = []
+    for o in range(0, len(data) - 21, 22):
+        cw, ch, dw, dh, align, record, scale, *crop = struct.unpack_from("<4HBBf4h", data, o)
+        out.append({"colour": (cw, ch), "depth": (dw, dh), "align": align & 7, "record": record,
+                    "scale": scale, "crop": tuple(crop)})
+    return out
 
 
 def camera_users():
@@ -233,6 +276,15 @@ def main():
             cur = ch.get_structure(1043)[16:48].split(b"\0")[0].decode()
             for name, option, checksum in ch.depth_modes():
                 print(f"  {'*' if name == cur else ' '} {name:32} option {option:#x}  checksum {checksum}")
+            return
+        if "factory" in sys.argv:
+            print(f"factory calibration ({mode_name(ch.current_mode())}):")
+            fac = ch.factory_calibration()
+            print(f"  depth law {fac['depth_calib']}")
+            for n, cam in enumerate(fac["cameras"]):
+                print(f"  record {n}: {cam}")
+            for p in fac["profiles"]:
+                print(f"  profile {p}")
             return
         print("properties (cur, max, min, def, step):")
         ids = range(300) if "scan" in sys.argv else PROPERTIES

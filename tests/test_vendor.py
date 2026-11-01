@@ -34,3 +34,33 @@ def test_only_the_imu_switches_are_settable():
     except vendor.VendorError:
         pass
     assert ch.usb.calls == []
+
+
+def test_factory_calibration_parsers():
+    law = vendor.parse_depth_calib(struct.pack("<I5fi", 1, 150.25, 662.0, 960.5, 0.5, 218.0, 0))
+    assert law["baseline"] == 150.25 and law["disp_offset"] == 218.0 and law["unit"] == 0.5
+    rec = struct.pack("<4f2h", 960.5, 960.5, 646.25, 398.75, 1280, 800) + struct.pack("<4f2h", 842, 842, 637, 395, 1280, 800)
+    rec += struct.pack("<8f", *[0] * 8) + struct.pack("<8f", 1, 2, 3, 4, 5, 6, 7, 8) + struct.pack("<12f", *range(12))
+    (cam,) = vendor.parse_camera_params(rec)
+    assert cam["depth"]["cx"] == 646.25 and cam["colour"]["h"] == 800 and cam["colour_dist"]["p2"] == 8
+    assert cam["R"] == list(range(9)) and cam["T_mm"] == [9, 10, 11]
+    (prof,) = vendor.parse_d2c_profiles(struct.pack("<4HBBf4h", 1280, 720, 1280, 800, 3, 0, 1.0, 0, -40, 0, -40))
+    assert prof == {"colour": (1280, 720), "depth": (1280, 800), "align": 3, "record": 0, "scale": 1.0,
+                    "crop": (0, -40, 0, -40)}
+
+
+def test_read_list_finishes_after_a_wrong_command_version():
+    ch = vendor.Channel(usb=FakeUsb(b""))
+    sent = []
+
+    def request(opcode, payload=b"", reply_len=64):
+        sent.append(opcode)
+        return struct.pack("<HI", 1, 28) if opcode == vendor.INIT_READ_LIST else b""
+
+    ch.request = request
+    try:
+        ch.read_list(vendor.ALIGN_CALIB_PARAM, 0)
+        raise AssertionError("a wrong command version was accepted")
+    except vendor.VendorError:
+        pass
+    assert sent == [vendor.INIT_READ_LIST, vendor.FINISH_READ_LIST]

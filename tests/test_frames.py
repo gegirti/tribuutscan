@@ -73,3 +73,36 @@ def test_recording_keeps_imu_samples():
         assert fr.read_imu(tmp) is None
     assert rec.imu_rows == 7 and len(imu["host_t"]) == 7
     assert np.allclose(imu["device_us"], rows[:, 1]) and np.allclose(imu["ay_g"], -1) and np.allclose(imu["temp_c"], 30.25)
+
+
+def test_depth_mode_survives_a_failing_factory_read():
+    from tribuutscan import calib, vendor
+    entry = bytes(16) + b"Long_range_mode Default".ljust(32, b"\0") + bytes(4)
+    noted, logs = [], []
+
+    class FakeChannel:
+        fail = False
+
+        def __init__(self, dev=None, usb=None):
+            pass
+
+        def current_mode(self):
+            return entry
+
+        def factory_calibration(self):
+            if FakeChannel.fail:
+                raise vendor.VendorError("unsupported")
+            return {"depth_calib": {}}
+
+        def close(self):
+            pass
+
+    real_channel, real_note = vendor.Channel, calib.note_factory
+    vendor.Channel, calib.note_factory = FakeChannel, lambda fac, mode: noted.append(mode)
+    try:
+        assert fr.depth_mode({"depth": "x"}, logs.append) == calib.LONG and noted == [calib.LONG]
+        FakeChannel.fail = True
+        assert fr.depth_mode({"depth": "x"}, logs.append) == calib.LONG and noted == [calib.LONG]
+        assert "factory calibration not readable" in logs[-1]
+    finally:
+        vendor.Channel, calib.note_factory = real_channel, real_note

@@ -27,15 +27,17 @@ We are open to testing more devices and to improvements from anyone. See
   together (loop closures), and a rough mesh can be made from it.
 - The scanner is **calibrated** with a printed board, and sizes come out right: on frames not used
   for the calibration, a 24.00 mm board square measures 24.03 mm from depth, and colour lands within
-  0.3 px of depth.
+  0.3 px of depth. Without a board, the scanner's own factory calibration is used: it is read
+  automatically, and on our unit it is within 0.9 px and 0.25% of the board's.
 - With markers on the object, tracking holds: a recent scan kept 579 of 581 frames, using about 11
   markers per frame, and Optimise's largest correction was 2.8 mm.
 
 The limits, honestly:
 
 - **Depth exists between about 15 and 33 cm in close range, and about 20 and 72 cm in long range.**
-  Both are the scanner's own modes; the viewer's *Range* menu switches them. Long-range distances are
-  an estimate until that mode is calibrated (checked once: 50 cm read as 49.3 cm).
+  Both are the scanner's own modes; the viewer's *Range* menu switches them. Long-range distances
+  follow the scanner's own numbers for that mode, but no board calibration has been done at long
+  range yet (checked once by hand: 50 cm read as 49.3 cm).
 - **Tracking runs at 3-7 frames per second** (Python on the CPU), so move slowly. Plain objects
   without markers lose tracking easily: a cardboard box at 27-31 cm tracked only 138 of 353 frames.
 - **Something touching the object** (the stand it rests on, a cable) stays in the scan. The table
@@ -83,8 +85,8 @@ right: Scanner, Capture, Scan, IMU and View.
   (`imu.csv`, 200 a second), for processing later;
   **Mesh last recording (m)** makes a rough mesh from the latest one.
 - Sliders set colour and IR brightness; *Auto IR* finds an IR exposure without clipping.
-- **Range** switches between close (15-33 cm) and long range (about 20-72 cm, an estimate until
-  calibrated); the images pause for about 10 s while the scanner switches.
+- **Range** switches between close (15-33 cm) and long range (about 20-72 cm); the images pause for
+  about 10 s while the scanner switches.
 - **IMU** shows the scanner's tilt (a small horizon) and how fast it turns, from its built-in
   accelerometer and gyroscope (`tribuutscan/imu.py`; needs the udev rule).
 
@@ -95,9 +97,14 @@ seconds after a program stops streaming, so give it about 5 s before starting th
 
 ## Calibrating your scanner
 
-Every unit differs a little, so calibrate your own. Without a calibration, everything runs on
-rough estimates (a guessed field of view, a hand-measured depth law), and clouds come out about 13%
-too narrow sideways.
+Every unit differs a little. Each time the toolkit opens the scanner it reads the scanner's own
+factory calibration (kept in `captures/factory.json`) and uses it, unless you have made a board
+calibration. On our unit the factory one is good (colour on depth 0.88 px, a 24.00 mm square
+measures 24.06 mm); the board calibration is tighter (0.34 px, and 24.03 mm on frames it never saw),
+so make one if you want the best. With neither (say,
+replaying a recording on a PC that never had the scanner), everything runs on rough estimates (a
+guessed field of view, a hand-measured depth law), and clouds come out about 13% too narrow sideways.
+`TRIBUUTSCAN_CAMERA=board|factory|estimate` picks one by hand.
 
 ```
 .venv/bin/python -m tribuutscan.calibrate board          # writes captures/calib/board.svg
@@ -114,7 +121,7 @@ too narrow sideways.
 3. It solves and prints a report into `captures/calib/<stamp>/calibration.json`. If the
    reprojection errors are under about 0.5 px and the depth-law fit under 1 mm, copy that file to
    `captures/calibration.json`. Everything uses it from then on; delete it to go back to the
-   estimates. (`calibrate solve captures/calib/<stamp> 24.0` solves again and writes
+   factory calibration. (`calibrate solve captures/calib/<stamp> 24.0` solves again and writes
    `captures/calibration.json` directly.)
 
 Our unit, for comparison: 28 views, reprojection 0.35 px (colour) and 0.32 px (IR), depth-law fit
@@ -213,8 +220,12 @@ The IR projector turns on by itself when the IR stream is opened.
   way Orbbec's SDK reads it. It is written for horizontally mirrored depth and colour images. Read
   that way, on our unit it agrees with the board calibration: depth law within 0.5 mm across the
   close range, colour on depth within 0.9 px, a 24.00 mm square measures 24.06 mm. Its colour model
-  is for 1280x720; the 1280x800 colour mode is that image stretched by 10/9. Not used by the
-  toolkit yet.
+  is for 1280x720; the 1280x800 colour mode is that image stretched by 10/9. It also gives each
+  depth mode's disparity offset (218 px in close, 100 px in long range), so the long-range law is
+  the close one shifted by exactly 4 x 118 raw steps. The toolkit uses it when there is no board
+  calibration; `python3 -m tribuutscan.vendor factory` prints it. Our marker scan replayed with it
+  sits as close to Creality's own scan of the part as with the board calibration (median 0.22 against
+  0.25 mm).
 - **IR is mirrored** horizontally relative to colour and depth. It shows the scene only through the
   projector's dots, which break up printed codes, so the calibration finds the board in colour and
   aligns IR to it.
@@ -269,8 +280,6 @@ Next up:
   - [ ] a printed test box with known dimensions and small details
   - [ ] a long-range board calibration
   - [ ] the up-to-3 mm rim error against Creality's scan of the same part
-- [ ] **Factory calibration as the default**: use the scanner's own calibration when there is no
-      board calibration (today: rough estimates, clouds 13% too narrow).
 - [ ] **IMU in tracking**: read the scanner's IMU calibration, check its clock against the depth
       frames, use the gyro as the rotation guess.
 
@@ -285,6 +294,8 @@ Done:
       median distance to Creality's scan 0.69 -> 0.22 mm.
 
 - [x] **Calibration**: depth law, both cameras, colour-to-depth registration, from a printed board.
+- [x] **Factory calibration** read from the scanner and used when there is no board calibration; it
+      also makes the long-range depth law exact.
 - [x] **Live scanning**: tracking (shape + markers + image features), merged cloud, Optimise with
       loop closures, continuing a scan, merging two scans.
 - [x] **Markers**: detection, and tracking and alignment with them.

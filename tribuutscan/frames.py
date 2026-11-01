@@ -32,11 +32,17 @@ def decode(color_buf, ir_buf, depth_buf, depth_bytesperline):
 
 
 def depth_mode(nodes, log=print):
-    """The scanner's active depth mode (read only, over vendor.py), or close range if it can't be read."""
+    """The scanner's active depth mode (read only, over vendor.py), or close range if it can't be read.
+    Also keeps the scanner's factory calibration (calib.note_factory); without it the model stays."""
     try:
         ch = vendor.Channel(nodes["depth"])
         try:
-            return vendor.mode_name(ch.current_mode())
+            mode = vendor.mode_name(ch.current_mode())
+            try:
+                calib.note_factory(ch.factory_calibration(), mode)
+            except (OSError, vendor.VendorError, ValueError, KeyError) as e:
+                log(f"factory calibration not readable ({e}); keeping the {calib.CAMERA.source} camera model")
+            return mode
         finally:
             ch.close()
     except (OSError, vendor.VendorError) as e:
@@ -117,6 +123,7 @@ def save(frames, root=CAPTURES, extra=None):
         "depth_median": float(np.median(valid)) if valid.size else None,
         "note": "ir is flipped horizontally to match colour/depth (sensor output is mirrored); depth is raw, on the Y10 scale",
         "depth_mode": calib.CAMERA.mode,
+        "calibration": calib.CAMERA.source,
         **(extra or {}),
     }, indent=2))
     return out
@@ -139,7 +146,7 @@ class Recorder:
         self.frame_bytes = {**FRAME_BYTES, "depth": depth_bytesperline * H}
         (self.dir / "info.json").write_text(json.dumps({
             "size": [W, H], "depth_bytesperline": depth_bytesperline, "frame_bytes": self.frame_bytes,
-            "depth_mode": calib.CAMERA.mode,
+            "depth_mode": calib.CAMERA.mode, "calibration": calib.CAMERA.source,
             "note": "raw sensor buffers; ir is NOT flipped here (read_recording flips it)",
             **(extra or {}),
         }, indent=2))

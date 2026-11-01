@@ -1,11 +1,12 @@
-"""Rough point-cloud export from a raw depth map plus colour. NOT metrically calibrated.
+"""Point-cloud export from a raw depth map plus colour.
 
     python3 -m tribuutscan.pointcloud                    # grab a frame set now
     python3 -m tribuutscan.pointcloud captures/<stamp>   # use a saved set
 
-The camera model (depth law, intrinsics, colour registration) comes from calib.CAMERA: a real
-calibration when captures/calibration.json exists, otherwise ESTIMATES (hand-measured depth fit,
-guessed field of view, colour registration eyeballed from one frame). Not a calibration until then.
+The camera model (depth law, intrinsics, colour registration) comes from calib.CAMERA: the board
+calibration (captures/calibration.json), else the scanner's factory calibration (captures/factory.json,
+kept whenever the scanner is opened), else ESTIMATES (hand-measured depth fit, guessed field of view,
+colour registration eyeballed from one frame): metric only with one of the first two.
 Output units are millimetres, x right, y up, z away from the scanner.
 """
 import json

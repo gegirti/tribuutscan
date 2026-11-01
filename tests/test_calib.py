@@ -78,3 +78,96 @@ def test_long_estimate_matches_the_50cm_check():
     cam = calib.Camera({**calib.ESTIMATES, "law": {"a_mm": 289570.18, "b": 873.42}})
     cam.set_mode(calib.LONG)
     assert abs(cam.depth_mm(175.7) - 501) < 2  # hand-measured 50 cm read 175.7 (2026-10-31)
+
+
+# our unit's factory calibration (read 2026-11-01), as vendor.Channel.factory_calibration returns it
+FACTORY = {
+    "depth_calib": {"depth_mode": 1, "baseline": 150.2841, "z0": 662.1558, "focal": 960.5139, "unit": 0.5,
+                    "disp_offset": 218.0, "invalid_disp": 0},
+    "cameras": [{
+        "depth": {"fx": 960.5139, "fy": 960.5139, "cx": 646.2972, "cy": 398.9413, "w": 1280, "h": 800},
+        "colour": {"fx": 842.0515, "fy": 842.3624, "cx": 637.1276, "cy": 395.3939, "w": 1280, "h": 800},
+        "depth_dist": dict.fromkeys(("k1", "k2", "k3", "k4", "k5", "k6", "p1", "p2"), 0.0),
+        "colour_dist": {"k1": 13.2937, "k2": -30.6221, "k3": 19.6306, "k4": 12.8383, "k5": -29.3117,
+                        "k6": 18.6331, "p1": -0.00054969, "p2": 9.0764e-05},
+        "R": [0.99999, -0.0024178, 0.0037682, 0.0024172, 0.999997, 0.0001689, -0.0037686, -0.0001598, 0.999993],
+        "T_mm": [19.5479, -0.0345, -0.7658]}],
+    "profiles": [{"colour": (1280, 720), "depth": (1280, 800), "align": 3, "record": 0, "scale": 1.0,
+                  "crop": (0, -40, 0, -40)},
+                 {"colour": (1280, 800), "depth": (1280, 800), "align": 3, "record": 255, "scale": 1.0,
+                  "crop": (0, 0, 0, 0)}],
+}
+
+
+def test_rational_lens_model_round_trip():
+    d = [13.2937, -30.6221, -0.00054969, -9.0764e-05, 19.6306, 12.8383, -29.3117, 18.6331]
+    x, y = np.meshgrid(np.linspace(-0.75, 0.75, 9), np.linspace(-0.45, 0.45, 7))
+    xu, yu = calib.undistort(*calib.distort(x, y, d), d)
+    assert np.abs(xu - x).max() < 1e-6 and np.abs(yu - y).max() < 1e-6
+    assert np.allclose(calib.distort(x, y, d[:5]), calib.distort(x, y, d[:5] + [0, 0, 0]))
+
+
+def test_factory_spec_matches_the_factory_formulas():
+    """A depth pixel of OUR frame, taken through the factory formulas in the factory's (mirrored) frame,
+    lands on the colour pixel the converted spec gives."""
+    cam = calib.Camera(calib.from_factory(FACTORY, calib.CLOSE))
+    rec, w = FACTORY["cameras"][0], 1280
+    u, v, raw = np.array([100.0, 640.0, 1100.0]), np.array([80.0, 400.0, 700.0]), np.array([50.0, 280.0, 900.0])
+    dc = FACTORY["depth_calib"]
+    z = dc["unit"] * dc["baseline"] * dc["focal"] / (raw / 4 + dc["disp_offset"])
+    assert np.allclose(cam.depth_mm(raw), z)
+    d, c, cd = rec["depth"], rec["colour"], rec["colour_dist"]
+    p = np.stack([(w - 1 - u - d["cx"]) / d["fx"] * z, (v - d["cy"]) / d["fy"] * z, z], -1)
+    q = p @ np.reshape(rec["R"], (3, 3)).T + rec["T_mm"]
+    xd, yd = calib.distort(q[:, 0] / q[:, 2], q[:, 1] / q[:, 2],
+                           [cd["k1"], cd["k2"], cd["p1"], cd["p2"], cd["k3"], cd["k4"], cd["k5"], cd["k6"]])
+    x_rec, y_rec = xd * c["fx"] + c["cx"], yd * c["fy"] + c["cy"]
+    x, y = cam.colour_px(u, v, z)
+    assert np.allclose(x, w - 1 - x_rec, atol=1e-6) and np.allclose(y, (y_rec - 40 + 0.5) * 800 / 720 - 0.5, atol=1e-6)
+    assert np.allclose(cam.depth_px(x, y, q[:, 2]), (u, v), atol=1e-3)  # and back (depth_px: colour-axis distance)
+
+
+def test_disparity_offsets_make_long_range_exact():
+    import json
+    import os
+    import tempfile
+    from pathlib import Path
+    with tempfile.TemporaryDirectory() as tmp:
+        board, factory = Path(tmp) / "calibration.json", Path(tmp) / "factory.json"
+        board.write_text(json.dumps({**calib.ESTIMATES, "estimate": False, "law": {"a_mm": 289570.0, "b": 873.4}}))
+        cam = calib.Camera(calib.chosen_spec(board, factory))
+        cam.set_mode(calib.LONG)
+        assert cam.source == "board" and np.isclose(cam.b, 873.4 - 472) and cam.law_estimate  # default offsets
+        long_read = {**FACTORY, "depth_calib": {**FACTORY["depth_calib"], "disp_offset": 100.0}}
+        factory.write_text(json.dumps(calib.from_factory(long_read, calib.LONG, {calib.CLOSE: 218.0})))
+        cam = calib.Camera(calib.chosen_spec(board, factory))
+        cam.set_mode(calib.LONG)
+        assert np.isclose(cam.b, 873.4 - 472) and not cam.law_estimate  # this scanner's own offsets
+        os.environ["TRIBUUTSCAN_CAMERA"] = "factory"
+        try:
+            cam = calib.Camera(calib.chosen_spec(board, factory))
+        finally:
+            del os.environ["TRIBUUTSCAN_CAMERA"]
+        cam.set_mode(calib.LONG)
+        assert cam.source == "factory" and np.isclose(cam.b, 400) and not cam.law_estimate
+        cam.set_mode(calib.CLOSE)
+        assert np.isclose(cam.b, 872) and not cam.law_estimate
+
+
+def test_note_factory_keeps_the_offsets_of_one_scanner():
+    import json
+    import tempfile
+    from pathlib import Path
+    before = calib.CAMERA.spec
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "factory.json"
+            calib.note_factory(FACTORY, calib.CLOSE, path)
+            long_read = {**FACTORY, "depth_calib": {**FACTORY["depth_calib"], "disp_offset": 100.0}}
+            calib.note_factory(long_read, calib.LONG, path)
+            assert json.loads(path.read_text())["disp_offsets"] == {calib.CLOSE: 218.0, calib.LONG: 100.0}
+            other = {**FACTORY, "depth_calib": {**FACTORY["depth_calib"], "baseline": 149.907}}
+            calib.note_factory(other, calib.CLOSE, path)
+            assert json.loads(path.read_text())["disp_offsets"] == {calib.CLOSE: 218.0}
+    finally:
+        calib.use(before)

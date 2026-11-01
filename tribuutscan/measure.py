@@ -6,8 +6,8 @@
 Appends a row to captures/measure.csv. plane_rms_mm is the spread of the centre region around its
 best-fit plane (per frame, median over frames): depth noise plus the rounding to raw steps.
 temporal_mm is each pixel's spread over the frames. step_mm is one raw step at the median distance
-(14-bit steps are 1/16 of a 10-bit step). Distances use calib.CAMERA (calibrated when
-captures/calibration.json exists).
+(14-bit steps are 1/16 of a 10-bit step). Distances use calib.CAMERA (board calibration, else the
+scanner's factory calibration, else estimates).
 """
 import csv
 import sys

@@ -20,9 +20,12 @@ is simply getting colour, IR and depth out of the scanner on Linux.
   releases or issues. The repo is public at https://github.com/gegirti/tribuutscan.
 - **Be honest about what is estimated.** Calibrated on 2026-10-30 (captures/calibration.json, on
   this one scanner): depth intrinsics and lens distortion, the depth law, the colour camera, and
-  colour <-> depth registration. Still estimates: the near end of the depth window (17 cm, never
-  reached during calibration), depth noise, and anything computed WITHOUT calibration.json (the
-  ESTIMATES block in calib.py: 60 degree FOV, eyeballed REG). Say "estimate" for those.
+  colour <-> depth registration. The factory calibration (captures/factory.json, the scanner's own,
+  used when there is no calibration.json) is checked on this unit only. Still estimates: the near
+  end of the board calibration's depth window (17 cm, never reached during calibration), depth
+  noise, the long-range law when this scanner's disparity offsets were never read (LONG_B_SHIFT, from
+  two units), and anything computed with neither calibration (the ESTIMATES block in calib.py: 60
+  degree FOV, eyeballed REG). Say "estimate" for those.
 - Keep captures out of git: `captures/` is ignored (it holds photos of the workspace). Only
   `examples/` is meant to be public; check an image before adding it.
 - Match the existing style: small numpy-only modules, short docstrings, no heavy dependencies.
@@ -158,12 +161,13 @@ is simply getting colour, IR and depth out of the scanner on Linux.
     Same flat surface (close mode raw 93.4 = 299.5 mm): long mode raw 564.7; areas that were beyond
     the close window now have depth. IF long mode keeps a = 289570, b_long = 402.1 and the window is
     ~203-718 mm (raw 1023..1). Tested at a hand-measured 50 cm: centre raw 175.7 (predicted 177), i.e.
-    501 mm. So long mode is z = 289570 / (v + 402.1), ~20-72 cm: still an estimate (one hand distance).
-    Close mode at that 50 cm: 0% valid.
+    501 mm. So long mode is z = 289570 / (v + 402.1), ~20-72 cm. Close mode at that 50 cm: 0% valid.
+    SETTLED 2026-11-01 by the factory calibration: disparity offsets 218 (close) / 100 (long), so
+    b_long = b - 472 exactly (401.4 with the board law; 175.7 then reads 501.8 mm).
   - The toolkit knows the modes (2026-10-31): `frames.open_depth` reads the active mode and calls
-    `calib.use_mode`; `calib.Camera.set_mode` takes a "modes" block from calibration.json if present,
-    else long range = close law with b + LONG_B_SHIFT (-471.3), window raw 1023..1, `law_estimate`
-    True. Recordings, saved frames and session.json note "depth_mode"; `read_recording` switches the
+    `calib.use_mode`; `calib.Camera.set_mode` takes a "modes" block if present (a board calibration
+    gets one from factory.json's disparity offsets, a factory spec has its own), else long range =
+    close law with b + LONG_B_SHIFT (-472), window raw 1023..1, `law_estimate` True. Recordings, saved frames and session.json note "depth_mode"; `read_recording` switches the
     law from it (close when missing); the live worker gets it in its start command. calibrate.py tags
     views and refuses to solve non-close views until a long-mode block exists.
   - The viewer's Range menu switches Close <-> Long: streams pause (`Stream.pause/resume`), 6 s for the
@@ -228,8 +232,8 @@ is simply getting colour, IR and depth out of the scanner on Linux.
   G2AlgParamManager does; layouts from its InternalTypes.hpp, packed; raw bytes and factory.json in
   captures/factory/; the scanner stayed on USB). Lead from github.com/ssjrocks/ubuntu-ferret-scanner.
   - 4026 (OBDepthCalibrationParam, command version 1, 28 bytes): baseline 150.284 x unit 0.5 =
-    75.14 mm, focalPix 960.51, dispOffset 218 (close mode; ssjrocks' unit reads 100 in long mode, not
-    read on ours), z0 662.16 (the far end in 0.5 mm). On the Y10 scale z = 4 unit baseline focal /
+    75.14 mm, focalPix 960.51, dispOffset 218 (close mode; 100 in long, below), z0 662.16 (the far
+    end in 0.5 mm). On the Y10 scale z = 4 unit baseline focal /
     (v + 4 dispOffset) = 288700 / (v + 872). Ours 289570 / (v + 873.4): 0.34-0.46 mm apart over the
     whole close window. Lateral scale a / fx 300.57 against ours 300.53.
   - 4027 (OBCameraParam_Internal_V0, 2 x 152 bytes; the 2nd is labelled 800x600, cy - 100): depth
@@ -245,9 +249,26 @@ is simply getting colour, IR and depth out of the scanner on Linux.
     "vendor commands"). Tested on the 23 usable board views (797 corners): colour on depth 0.88 px
     median, p90 1.24, with both mirrored and R p + t; the 7 other combinations 16-360 px. Ours on the
     same views 0.34 px, but ours was fitted on them. A 24.00 mm square: factory 24.06 mm, ours 24.01.
-  - So a scanner without calibration.json could start from its factory values instead of ESTIMATES
-    (not done yet). Per-unit values differ: other units read depth fx 956.8 / 956.6, cx 645.6 / 638.9
-    (ssjrocks, rafik24; both firmware 1.2.2, ours 1.2.6).
+  - Long range (read after a switch): dispOffset 100, z0 1443.50; everything else, 4027 and 4024
+    byte-identical. Back in close range afterwards, the scanner stayed on USB.
+  - USED since 2026-11-01. `calib.CAMERA.source` is "board" (calibration.json) > "factory"
+    (captures/factory.json) > "estimate"; TRIBUUTSCAN_CAMERA=board|factory|estimate forces one.
+    `frames.depth_mode` (every open, also after a range switch or reconnect) reads the lists with the
+    mode and calls `calib.note_factory`: factory.json gets `calib.from_factory`'s spec in our frames
+    (mirroring done there; the colour lens is the 8-coefficient rational model, which `calib.distort`
+    now takes) plus "disp_offsets" for every mode read so far (reset when baseline/focal differ:
+    another scanner). A failed read is logged and changes nothing. The viewer's start log names the
+    source; saved sets and recordings note "calibration" in info.json.
+  - Checked through `calib.Camera`: the same 0.88 px / 24.06 mm. On the scanner: close and long opens
+    gave offsets {218, 100}; board long law 289570 / (v + 401.4), factory 288700 / (v + 872) and
+    / (v + 400), none marked estimate. evaluate.py identical to before (board camera), 246 -> 250 ms.
+  - Marker recording replayed with each camera (same code, compare SEEDS 12): board median 0.246 /
+    p90 0.652 mm, 92.3% on the part, Creality surface covered 69 / 73% within 1 / 2 mm; factory 0.216
+    / 0.515 mm, 92.4%, 65 / 68%. Creality's mesh comes from Creality's software, which presumably uses
+    this same factory calibration, so a closer fit is expected and does not show the factory model is
+    more accurate; the printed test box decides that.
+  - Per-unit values differ: other units read depth fx 956.8 / 956.6, cx 645.6 / 638.9 (ssjrocks,
+    rafik24; both firmware 1.2.2, ours 1.2.6).
   - Not read: IMU calibration 4036. The SDK reads it with the raw opcodes 17/18/19, and that sequence
     on 4027 knocked ssjrocks' unit off USB until a replug.
 - CrealityScan (Windows, run under Bottles) ships a custom Orbbec SDK (OrbbecSDK.dll) with a
@@ -272,7 +293,8 @@ python3 -m tribuutscan.viewer               # depth (middle), colour + IR (left)
                                             # Scan: `c` live scan (worker process), Open 3D view
                                             # IMU: tilt horizon, turn rate; View: Find markers
                                             # events: message line, console, captures/viewer.log
-python3 -m tribuutscan.vendor [modes|scan|switch "<mode>"]   # scanner's depth modes (switch WRITES)
+python3 -m tribuutscan.vendor [modes|factory|scan|switch "<mode>"]   # depth modes, factory calibration
+                                            # (switch WRITES); TRIBUUTSCAN_CAMERA=board|factory|estimate
 python3 -m tribuutscan.imu [seconds]         # switch the IMU on, read it, switch it off
 python3 -m tribuutscan.pointcloud [dir]     # .ply from a saved set, or grab a live one
 python3 -m tribuutscan.measure [cm]         # flat target: plane RMS, noise, step -> captures/measure.csv

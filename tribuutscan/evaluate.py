@@ -9,7 +9,7 @@ Metrics: tracked/lost/re-found frames, pose jumps, double-surface ratio, marker 
 ms per frame; ATE/RPE against ground truth on synthetic data. (A keyframe residual and a split-half
 Chamfer were tried and dropped: they read the same on the doubled and the good scan, because each
 half / keyframe already contains the shifted frames.)
-Real recordings use the calibration (captures/calibration.json) when there is one; synthetic sets
+Real recordings use calib.CAMERA (board calibration, else the scanner's factory one); synthetic sets
 always use the estimated camera they were rendered with. The first datasets (tilt, standing, kettle,
 hand, face) were deleted on 2026-10-30; their numbers stay in CLAUDE.md.
 """

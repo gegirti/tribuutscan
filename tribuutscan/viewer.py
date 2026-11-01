@@ -1,7 +1,8 @@
 """Live viewer: depth in the middle, colour and IR on the left, setting panels on the right.
 
 Run with `python -m tribuutscan.viewer`. Panels (panels.py, each folds):
-- Scanner: Range switches close range (15-33 cm) / long range (~20-72 cm, an estimate until calibrated);
+- Scanner: Range switches close range (15-33 cm) / long range (20-72 cm; the law from the scanner's own
+  disparity offsets);
   the streams pause about 10 s while it switches (vendor.py). IR exposure and gain are controls on the
   depth function: they change the IR sensor that depth is computed from (14-bit USB depth, usbdepth.py,
   then owns them). Auto IR steps them until the IR image has little clipping (clipping costs depth).
@@ -239,7 +240,8 @@ def ir_exposure_by_hand(nodes, log):
         log(f"IR exposure mode not set ({e.strerror}): the IR sliders may do nothing")
 
 
-RANGES = {"Close range 15-33 cm": calib.CLOSE, "Long range ~20-72 cm (estimate)": calib.LONG}
+RANGES = {"Close range 15-33 cm": calib.CLOSE, "Long range 20-72 cm": calib.LONG}
+SOURCES = {"board": "board calibration", "factory": "factory calibration", "estimate": "estimates"}
 SWITCH_SETTLE_S = 6.0  # the scanner may reset its USB connection a few seconds after its streams stop
 
 
@@ -360,7 +362,8 @@ class App:
             s.start()
         on_usb = isinstance(self.depth.cap, usbdepth.DepthCapture)
         self.log(f"viewer started (pid {os.getpid()}, depth {'14-bit over USB' if on_usb else '10-bit V4L2'}, "
-                 f"{calib.CAMERA.mode}{', distances are estimates' if calib.CAMERA.law_estimate else ''})")
+                 f"{calib.CAMERA.mode}{', distances are estimates' if calib.CAMERA.law_estimate else ''}, "
+                 f"camera: {SOURCES.get(calib.CAMERA.source, calib.CAMERA.source)})")
         if self.imu_want:
             self.imu_on()
         else:

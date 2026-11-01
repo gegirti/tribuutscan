@@ -1,23 +1,33 @@
 """The camera model in one place: depth intrinsics, depth law, depth window, colour <-> depth pixels.
 
-Loads captures/calibration.json (to be written by calibrate.py) when it exists. Otherwise it uses the
-ESTIMATES below and `CAMERA.estimate` is True, so output can say the numbers are estimates.
+Three sources, the first found wins (`CAMERA.source`):
+- "board": captures/calibration.json, written by calibrate.py from a printed board
+- "factory": captures/factory.json, the scanner's own calibration, kept by frames.open_depth each time it
+  opens the scanner (`note_factory`)
+- "estimate": the ESTIMATES below; `CAMERA.estimate` is True, so output can say the numbers are estimates
+TRIBUUTSCAN_CAMERA=board|factory|estimate forces one (if it exists; else the estimates).
 The depth law and window depend on the scanner's depth mode (vendor.py): `use_mode` picks them. The
-top-level law is close range; other modes come from a "modes" block, else from the estimate below
-(`CAMERA.law_estimate` is True then).
+top-level law is close range; other modes come from a "modes" block (a board calibration gets one from
+the disparity offsets in factory.json), else from LONG_B_SHIFT (`CAMERA.law_estimate` is True then).
 """
 import json
+import os
 from pathlib import Path
 
 import numpy as np
 
 CALIBRATION = Path(__file__).resolve().parent.parent / "captures" / "calibration.json"
+FACTORY = CALIBRATION.parent / "factory.json"
 DEFAULT_Z_MM = 250.0  # distance assumed for colour <-> depth pixels when it is not known
 CLOSE, LONG = "Close_range_mode Default", "Long_range_mode Default"
-# Long range until calibrated: the close law with b shifted. One flat surface read 93.4 in close mode and
-# 564.7 in long mode (2026-10-31): with a unchanged that is b - 471.3, and a hand-measured 50 cm then
-# read 175.7 where this predicts 177. The window is what raw 1023..1 then spans (~20-72 cm).
-LONG_B_SHIFT = -471.3
+# A raw depth unit (Y10 scale) is a quarter pixel of disparity, and each depth mode is the same law with
+# another disparity offset: b = 4 x offset. Both units read so far (ours and one other, 2026-11-01) have
+# 218 in close and 100 in long range; without this scanner's own offsets, long range is the close law with
+# b - 472 (it was -471.3 from one flat surface, and a hand-measured 50 cm read 175.7, which -472 puts at
+# 501.8 mm). The window is what raw 1023..1 then spans (~20-72 cm).
+DEFAULT_OFFSETS = {CLOSE: 218.0, LONG: 100.0}
+LONG_B_SHIFT = 4 * (DEFAULT_OFFSETS[LONG] - DEFAULT_OFFSETS[CLOSE])
+COLOUR_STRETCH = 800 / 720  # the 1280x800 colour mode is the 1280x720 picture stretched to 800 rows
 ESTIMATES = {
     "estimate": True,
     "size": [1280, 800],
@@ -29,10 +39,11 @@ ESTIMATES = {
 
 
 def distort(x, y, d):
-    """Normalised camera coordinates through the OpenCV lens model (k1, k2, p1, p2, k3)."""
-    k1, k2, p1, p2, k3 = (list(d) + [0.0] * 5)[:5]
+    """Normalised camera coordinates through the OpenCV lens model (k1, k2, p1, p2, k3, and the rational
+    model's k4, k5, k6 when given: the factory colour model uses them)."""
+    k1, k2, p1, p2, k3, k4, k5, k6 = (list(d) + [0.0] * 8)[:8]
     r2 = x * x + y * y
-    radial = 1 + k1 * r2 + k2 * r2 ** 2 + k3 * r2 ** 3
+    radial = (1 + k1 * r2 + k2 * r2 ** 2 + k3 * r2 ** 3) / (1 + k4 * r2 + k5 * r2 ** 2 + k6 * r2 ** 3)
     return (x * radial + 2 * p1 * x * y + p2 * (r2 + 2 * x * x),
             y * radial + p1 * (r2 + 2 * y * y) + 2 * p2 * x * y)
 
@@ -57,6 +68,7 @@ class Camera:
     def __init__(self, spec):
         self.spec = spec
         self.estimate = bool(spec.get("estimate", False))
+        self.source = spec.get("source", "estimate" if self.estimate else "board")
         self.width, self.height = spec["size"]
         d = spec["depth"]
         if "fx" in d:
@@ -83,7 +95,7 @@ class Camera:
             estimate = bool(own.get("estimate", False))
         elif name.startswith("Long_range"):
             b += LONG_B_SHIFT
-            window = (a / (1023 + b), a / (1 + b))
+            window = tuple(law_window(a, b))
             estimate = True
         else:
             estimate = self.estimate or name != CLOSE  # Interleave / Narrow_View: same law, unverified
@@ -143,6 +155,105 @@ class Camera:
         return np.array([[self.fx, 0, self.cx], [0, self.fy, self.cy], [0, 0, 1.0]])
 
 
+def law_window(a, b):
+    """What raw 1023 (near) .. 1 (far) spans under z = a / (v + b), mm."""
+    return [a / (1023 + b), a / (1 + b)]
+
+
+def mode_block(a, b, estimate=False):
+    return {"law": {"a_mm": a, "b": b}, "window_mm": law_window(a, b), "estimate": estimate}
+
+
+def affine_at(k_depth, k_colour, rot, trans, z_mm):
+    """The old affine depth->colour pixel mapping, refitted for distance z_mm (for code paths that
+    still use it). The real mapping depends on distance (parallax), which Camera handles."""
+    vv, uu = np.mgrid[100:700:50, 100:1180:60]
+    u, v = uu.ravel().astype(float), vv.ravel().astype(float)
+    pts = np.stack([(u - k_depth[0, 2]) / k_depth[0, 0] * z_mm, (v - k_depth[1, 2]) / k_depth[1, 1] * z_mm,
+                    np.full(len(u), z_mm)], 1)
+    c = pts @ np.asarray(rot).T + np.asarray(trans).ravel()
+    x = c[:, 0] / c[:, 2] * k_colour[0, 0] + k_colour[0, 2]
+    y = c[:, 1] / c[:, 2] * k_colour[1, 1] + k_colour[1, 2]
+    ax, bx = np.polyfit(x, u, 1)  # depth u = ax * colour x + bx (the old REG form)
+    ay, by = np.polyfit(y, v, 1)
+    return {"ax": float(ax), "bx": float(bx), "ay": float(ay), "by": float(by)}
+
+
+def from_factory(fac, mode, offsets=None):
+    """A spec in calibration.json's format from the scanner's factory calibration (as
+    vendor.Channel.factory_calibration returns it, read in depth mode `mode`; `offsets` are the disparity
+    offsets of modes read before). The factory frame is our depth AND colour images mirrored left-right
+    (the IR stream's orientation), with colour = R depth + T. Checked on our unit (2026-11-01) on the
+    board calibration's views: colour lands on depth within 0.88 px median, a 24.00 mm square measures
+    24.06 mm, and the close law is within 0.5 mm of the board's."""
+    w, h = ESTIMATES["size"]
+    dc = fac["depth_calib"]
+    offsets = {**(offsets or {}), mode: dc["disp_offset"]}
+    a = 4 * dc["unit"] * dc["baseline"] * dc["focal"]
+    b = 4 * offsets.get(CLOSE, DEFAULT_OFFSETS[CLOSE])
+    modes = {m: mode_block(a, 4 * off) for m, off in offsets.items() if m != CLOSE}
+    if CLOSE not in offsets:  # close range not read from this scanner yet
+        modes[CLOSE] = mode_block(a, b, estimate=True)
+    cam = next((c for c in fac["cameras"] if (c["depth"]["w"], c["depth"]["h"]) == (w, h)), fac["cameras"][0])
+    d = cam["depth"]
+    m = np.diag([-1.0, 1.0, 1.0])
+    k_depth = np.array([[d["fx"], 0, w - 1 - d["cx"]], [0, d["fy"], d["cy"]], [0, 0, 1]])
+    spec = {"estimate": False, "source": "factory", "size": [w, h],
+            "depth": {"fx": d["fx"], "fy": d["fy"], "cx": w - 1 - d["cx"], "cy": d["cy"], "dist": []},  # rectified
+            "law": {"a_mm": a, "b": b}, "window_mm": law_window(a, b), "modes": modes,
+            "colour_from_depth": ESTIMATES["colour_from_depth"], "disp_offsets": offsets, "factory": fac}
+    # the colour record that serves 1280x720 colour: its crop places that picture in the record's frame
+    prof = next((p for p in fac["profiles"] if tuple(p["colour"]) == (1280, 720) and tuple(p["depth"]) == (w, h)
+                 and p["record"] < len(fac["cameras"])), None)
+    if prof is not None:
+        rec = fac["cameras"][prof["record"]]
+        c, cd, s = rec["colour"], rec["colour_dist"], prof["scale"]
+        cx720, cy720 = c["cx"] * s + prof["crop"][0], c["cy"] * s + prof["crop"][1]
+        k_colour = np.array([[c["fx"] * s, 0, w - 1 - cx720],
+                             [0, c["fy"] * s * COLOUR_STRETCH, (cy720 + 0.5) * COLOUR_STRETCH - 0.5], [0, 0, 1]])
+        rot, trans = m @ np.reshape(rec["R"], (3, 3)) @ m, m @ np.asarray(rec["T_mm"])
+        spec["colour"] = {"K": k_colour.tolist(),
+                          "dist": [cd["k1"], cd["k2"], cd["p1"], -cd["p2"], cd["k3"], cd["k4"], cd["k5"], cd["k6"]],
+                          "R": rot.tolist(), "T_mm": trans.tolist()}  # mirroring flips p2's sign
+        spec["colour_from_depth"] = affine_at(k_depth, k_colour, rot, trans, DEFAULT_Z_MM)
+    return spec
+
+
+def note_factory(fac, mode, path=None):
+    """Keep the factory calibration read in depth mode `mode` in captures/factory.json, with the disparity
+    offset of every mode read so far (forgotten when another scanner turns up), and reload CAMERA from
+    the chosen source. The caller then picks the mode (`use_mode`)."""
+    path = Path(path or FACTORY)
+    old = json.loads(path.read_text()) if path.exists() else {}
+    dc, old_dc = fac["depth_calib"], old.get("factory", {}).get("depth_calib", {})
+    same = all(old_dc.get(k) == dc[k] for k in ("baseline", "focal", "unit"))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")  # replaced in one step: a scan worker may be loading it
+    tmp.write_text(json.dumps(from_factory(fac, mode, old.get("disp_offsets") if same else None), indent=2))
+    tmp.replace(path)
+    use(chosen_spec(factory_path=path))
+
+
+def chosen_spec(board_path=None, factory_path=None):
+    """The spec of the first source found (board, factory), or ESTIMATES; TRIBUUTSCAN_CAMERA forces one.
+    A board calibration takes the disparity offsets read from the scanner for its other modes."""
+    paths = {"board": Path(board_path or CALIBRATION), "factory": Path(factory_path or FACTORY)}
+    forced = os.environ.get("TRIBUUTSCAN_CAMERA", "").lower()
+    if forced and forced not in (*paths, "estimate"):
+        raise ValueError(f"TRIBUUTSCAN_CAMERA={forced}: use board, factory or estimate")
+    for source in [forced] if forced else ["board", "factory"]:
+        if source in paths and paths[source].exists():
+            spec = {**json.loads(paths[source].read_text()), "source": source}
+            if source == "board" and paths["factory"].exists():
+                offsets = json.loads(paths["factory"].read_text()).get("disp_offsets", {})
+                if CLOSE in offsets:
+                    a, b = spec["law"]["a_mm"], spec["law"]["b"]
+                    spec["modes"] = {**{m: mode_block(a, b + 4 * (off - offsets[CLOSE]))
+                                        for m, off in offsets.items() if m != CLOSE}, **spec.get("modes", {})}
+            return spec
+    return ESTIMATES
+
+
 def use(spec):
     """Switch the shared camera model in place (every module holds this same CAMERA object). Synthetic
     data is made and read with ESTIMATES, a pinhole camera, whatever is calibrated."""
@@ -154,9 +265,9 @@ def use_mode(name):
     CAMERA.set_mode(name)
 
 
-def load(path=CALIBRATION):
-    path = Path(path)
-    return Camera(json.loads(path.read_text()) if path.exists() else ESTIMATES)
+def load(path=None):
+    """The camera from `path` (a calibration.json-format file), or from the chosen source."""
+    return Camera(json.loads(Path(path).read_text()) if path else chosen_spec())
 
 
 CAMERA = load()
