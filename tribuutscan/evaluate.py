@@ -6,7 +6,8 @@
 
 Writes captures/eval/<stamp>-<label>/report.json and 3-view renders (none for private datasets).
 Metrics: tracked/lost/re-found frames, pose jumps, double-surface ratio, marker scatter, loop gap,
-ms per frame; ATE/RPE against ground truth on synthetic data. (A keyframe residual and a split-half
+ms per frame; on synthetic data ATE/RPE against the true poses and the cloud's distance to the true
+surface (in place, so tracking drift counts; points within 5 mm are on the object). (A keyframe residual and a split-half
 Chamfer were tried and dropped: they read the same on the doubled and the good scan, because each
 half / keyframe already contains the shifted frames.)
 Real recordings use calib.CAMERA (board calibration, else the scanner's factory one); synthetic sets
@@ -37,8 +38,14 @@ DATASETS = {  # name: (path or glob under captures/, notes, scan mode)
     "synth7": ("synth/box-tilt-7fps-rec", "the same at ~7 fps (every 3rd frame), like a slow live worker", "still"),
     "synthhard": ("synth/box-hard-rec", "synthetic at 10 fps with a jerk and a stretch beyond the depth window",
                   "still"),
+    "synthfp": ("synth/box-pattern-rec", "synthetic box, 14-bit, a fixed per-pixel depth error like the scanner's "
+                "(0.14 mm RMS at 20 cm, growing with z^2; its pattern an estimate) and 0.05 mm frame noise", "still"),
+    "synthplate": ("synth/plate-rec", "synthetic 1.8 mm plate standing on the table, seen from both sides; "
+                   "14-bit with the fixed error of synthfp", "still"),
 }
-SYNTH = {"synth": dict(every=1), "synth7": dict(every=3), "synthhard": dict(every=2, hard=True)}
+SENSOR = dict(pattern_mm=0.144, noise_mm=0.05, bits=14)  # synth.py: closer to the real sensor
+SYNTH = {"synth": dict(every=1), "synth7": dict(every=3), "synthhard": dict(every=2, hard=True),
+         "synthfp": dict(every=1, **SENSOR), "synthplate": dict(every=1, kind="plate", **SENSOR)}
 PRIVATE = set()  # datasets never rendered (none at the moment)
 
 
@@ -145,6 +152,11 @@ def _run(name, tracker, preset, live_markers, optimise_after):
                                   for k, v in metrics.ate_rpe(dict(tracked), truth).items()}
         result["keyframe_ground_truth"] = {k: (round(v, 3) if isinstance(v, float) else v)
                                            for k, v in metrics.ate_rpe(dict(scanner.poses), truth).items()}
+        d = synth.truth_distance(directory, xyz)
+        on = d < 5.0
+        result["truth_mm"] = {"median": round(float(np.median(d[on])), 3) if on.any() else None,
+                              "p90": round(float(np.percentile(d[on], 90)), 3) if on.any() else None,
+                              "on_object": round(float(on.mean()), 3) if len(d) else None}
     return result, (xyz, rgb, normals)
 
 
@@ -190,7 +202,7 @@ def show(results, against=None):
     cols = [("tracked", "tracked"), ("relocked", "re-found"), ("pose_jumps", "jumps"),
             ("double_surface_ratio", "double"), ("marker_scatter.scatter_mm", "mk mm"),
             ("keyframe_marker_scatter.scatter_mm", "kf mk mm"), ("loop_gap.mm", "gap mm"),
-            ("ground_truth.ate_mm", "ATE mm"), ("keyframe_ground_truth.ate_mm", "kf ATE"),
+            ("ground_truth.ate_mm", "ATE mm"), ("keyframe_ground_truth.ate_mm", "kf ATE"), ("truth_mm.median", "truth mm"),
             ("optimise.loops_kept", "loops"), ("ms_per_frame", "ms")]
     print(f"{'dataset':9s} " + " ".join(f"{h:>14s}" for _, h in cols))
     for r in results:

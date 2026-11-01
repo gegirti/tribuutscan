@@ -230,3 +230,36 @@ def test_a_saved_scan_keeps_what_fusing_again_needs():
             assert np.allclose(moved, [0.005, 0, 0], atol=1e-5)
     finally:
         calib.use(before)
+
+
+def test_synthetic_sensor_sets_and_their_true_surface():
+    """The 14-bit plate set with a fixed per-pixel error: no IR, Y14 depth, and frame 0's points lie on
+    true_surface.ply (the first camera's frame is the scan's world)."""
+    try:
+        from tribuutscan import synth
+    except ImportError:  # needs Open3D (.venv)
+        return
+    import json
+    import tempfile
+    from pathlib import Path
+    from tribuutscan import calib
+    from tribuutscan import frames as fr
+    before = calib.CAMERA.spec
+    calib.use(calib.ESTIMATES)
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            rec = synth.generate(Path(tmp) / "p-rec", n_frames=2, kind="plate", pattern_mm=0.144, noise_mm=0.05, bits=14)
+            info = json.loads((rec / "info.json").read_text())
+            assert info["depth_bytesperline"] == fr.W * 14 // 8 and info["streams"] == ["color", "depth"]
+            assert not (rec / "ir.raw").exists() and (rec / "true_surface.ply").exists()
+            frame = next(fr.read_recording(rec))
+            assert frame["ir"] is None and frame["depth"].dtype == np.float32
+            xyz, _, _ = cl.frame_points(frame)
+            d = synth.truth_distance(rec, xyz)
+            on = d < 5
+            assert on.mean() > 0.05 and np.median(d[on]) < 0.3  # the plate and its markers, within the sensor error
+            pattern = synth.fixed_pattern(0.144, 0)
+            assert abs(pattern.std() * 200.0 ** 2 / calib.CAMERA.a - 0.144) < 1e-9
+            assert np.array_equal(pattern, synth.fixed_pattern(0.144, 0))  # fixed: the same every time
+    finally:
+        calib.use(before)
