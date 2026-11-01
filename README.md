@@ -81,8 +81,11 @@ right: Scanner, Capture, Scan, IMU and View.
   0.5 / 1 / 2 mm point distance, Make mesh, and Remove base / Keep base; *Export* downloads
   `cloud.ply` and `mesh.ply`.
 - **Save frame (s)** writes one colour + IR + depth set (and a `cloud.ply`) to `captures/<stamp>/`.
-  **Record (r)** writes raw sets, about 10 a second (about 49 MB/s), plus the IMU's samples
-  (`imu.csv`, 200 a second), for processing later;
+  **Record (r)** writes colour + depth sets at 30 (or 10) a second, plus the IMU's samples
+  (`imu.csv`, 200 a second), for processing later. Depth is compressed losslessly and IR is left
+  out, so 30 fps takes about 75 MB/s, more when depth fills more of the view (a minute is about
+  4.5 GB); recording stops by itself when
+  less than 5 GB is free, and the status line shows what is left.
   **Mesh last recording (m)** makes a rough mesh from the latest one.
 - Sliders set colour and IR brightness; *Auto IR* finds an IR exposure without clipping.
 - **Range** switches between close (15-33 cm) and long range (about 20-72 cm); the images pause for

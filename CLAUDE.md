@@ -287,8 +287,9 @@ tribuutscan-viewer                          # launcher in ~/.local/bin, copy of 
 python3 -m tribuutscan.viewer               # depth (middle), colour + IR (left), panels (right, fold):
                                             # Scanner: Range close 15-33 / long ~20-72 cm (estimate),
                                             #   IR exposure/gain, colour brightness, Auto IR
-                                            # Capture: `s` saves captures/<stamp>/, `r` records raw sets
-                                            #   + imu.csv to captures/<stamp>-rec/ (~49 MB/s), `m` meshes
+                                            # Capture: `s` saves captures/<stamp>/, `r` records colour +
+                                            #   zlib depth + imu.csv to captures/<stamp>-rec/ at 30 or 10 fps
+                                            #   (~75 / 25 MB/s, stops under 5 GB free), `m` meshes
                                             #   the latest recording via .venv fuse.py
                                             # Scan: `c` live scan (worker process), Open 3D view
                                             # IMU: tilt horizon, turn rate; View: Find markers
@@ -585,6 +586,15 @@ cubes on the GPU; the CPU keeps the 6x6 solve, markers, base votes, pose graph, 
   `sources` [{rec, first_index}] (cloud.scan and the live worker's raw copy; continued and merged
   scans keep their offsets) and `camera` {source, fingerprint}. evaluate.py unchanged (identical
   metrics on all four datasets). Scans saved before this have only their merged poses.
+- Phase 0.3 disk (2026-11-01), measured on the marker recording and Y14 frames: IR is 1.02 of 4.86 MB
+  per set and nothing replays it; zlib level 1 packs Y10 depth 5.5x and Y14 4.0x (at 30-37% valid
+  pixels; 172-240 MB/s on one core, the GIL is released); colour YUYV only 1.4x for ~0.85 core, and
+  MJPG would need a JPEG decoder (not numpy/tkinter), so colour stays raw. Recorder now keeps colour +
+  depth.zlib (4-byte length + data per frame; a cut-off last record is dropped), ~2.3-3 MB per set,
+  ~75 MB/s at 30 fps (was 146 with IR at full rate); old recordings read as before. Stops (DiskFull)
+  under 5 GB free, checked every 15 sets; the viewer records at 30 or 10 fps (Capture panel) and shows
+  the free space; the live worker's raw copy stops but the scan goes on. Re-recorded marker frames
+  decode identically.
 
 ## The person you are working with
 

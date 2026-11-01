@@ -71,8 +71,11 @@ class CapturePanel(Panel):
 
     def build(self, body):
         tk.Button(body, text="Save frame (s)", command=self.app.save).pack(fill="x")
-        self.record = tk.Button(body, command=self.app.toggle_record)
-        self.record.pack(fill="x")
+        row = tk.Frame(body)
+        row.pack(fill="x")
+        self.record = tk.Button(row, command=self.app.toggle_record)
+        self.record.pack(side="left", expand=True, fill="x")
+        tk.OptionMenu(row, self.app.record_rate, *self.app.record_rates).pack(side="left")
         self.mesh = tk.Button(body, command=self.app.mesh)
         self.mesh.pack(fill="x")
 

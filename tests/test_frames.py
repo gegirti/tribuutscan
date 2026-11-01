@@ -1,4 +1,5 @@
 import tempfile
+from pathlib import Path
 
 import numpy as np
 
@@ -15,15 +16,66 @@ def test_record_roundtrip():
         "depth": encode_y10(depth),
     }
     with tempfile.TemporaryDirectory() as tmp:
-        rec = fr.Recorder(fr.W * 10 // 8, root=tmp)
+        rec = fr.Recorder(fr.W * 10 // 8, root=tmp, streams=fr.STREAMS, compress_depth=False)  # the old layout
         for t in range(3):
             rec.write(bufs, {k: float(t) for k in fr.STREAMS})
         rec.close()
+        assert sorted(p.name for p in rec.dir.glob("*.raw")) == ["color.raw", "depth.raw", "ir.raw"]
         sets = list(fr.read_recording(rec.dir))
     assert len(sets) == 3
     assert np.array_equal(sets[2]["depth"], depth)
     ir = np.frombuffer(bufs["ir"], np.uint8).reshape(fr.H, fr.W)
     assert np.array_equal(sets[0]["ir"], ir[:, ::-1])
+
+
+def test_scan_recording_leaves_ir_out_and_packs_depth():
+    rng = np.random.default_rng(4)
+    depth = np.where(rng.random((fr.H, fr.W)) < 0.6, 0, rng.integers(1, 1024, size=(fr.H, fr.W))).astype(np.uint16)
+    color = rng.integers(0, 256, fr.FRAME_BYTES["color"], dtype=np.uint8).tobytes()
+    with tempfile.TemporaryDirectory() as tmp:
+        rec = fr.Recorder(fr.W * 10 // 8, root=tmp)
+        for t in range(3):
+            rec.write({"color": color, "ir": None, "depth": encode_y10(depth)}, {"color": t + 0.01, "depth": float(t)})
+        rec.close()
+        assert sorted(p.name for p in rec.dir.iterdir()) == ["color.raw", "depth.zlib", "info.json", "stamps.csv"]
+        assert rec.megabytes < 3 * (fr.FRAME_BYTES["color"] + fr.FRAME_BYTES["depth"]) / 1e6
+        sets = list(fr.read_recording(rec.dir))
+        assert len(sets) == 3 and sets[0]["ir"] is None
+        assert np.array_equal(sets[2]["depth"], depth) and abs(sets[1]["skew_ms"] - 10) < 0.01
+        with open(rec.dir / "depth.zlib", "ab") as f:  # a set cut off while writing
+            f.write(b"\xff\xff\x00\x00partial")
+        assert len(list(fr.read_recording(rec.dir))) == 3
+        empty = fr.Recorder(fr.W * 10 // 8, root=Path(tmp) / "x")  # started and stopped at once
+        empty.close()
+        assert list(fr.read_recording(empty.dir)) == []
+
+
+def test_recording_stops_when_the_disk_is_nearly_full():
+    bufs = {"color": bytes(fr.FRAME_BYTES["color"]), "ir": None, "depth": bytes(fr.FRAME_BYTES["depth"])}
+    floor = fr.Recorder.FREE_FLOOR_GB
+    with tempfile.TemporaryDirectory() as tmp:
+        try:
+            fr.Recorder.FREE_FLOOR_GB = 1e9
+            try:
+                fr.Recorder(fr.W * 10 // 8, root=tmp)
+                raise AssertionError("started with too little free space")
+            except fr.DiskFull:
+                pass
+            assert not list(Path(tmp).iterdir())  # nothing created
+            fr.Recorder.FREE_FLOOR_GB = floor
+            rec = fr.Recorder(fr.W * 10 // 8, root=tmp)
+            for t in range(fr.Recorder.CHECK_EVERY):
+                rec.write(bufs, {"color": 0.0, "depth": 0.0})
+            fr.Recorder.FREE_FLOOR_GB = 1e9
+            try:
+                rec.write(bufs, {"color": 0.0, "depth": 0.0})  # the next check stops it
+                raise AssertionError("kept writing")
+            except fr.DiskFull:
+                pass
+            rec.close()
+        finally:
+            fr.Recorder.FREE_FLOOR_GB = floor
+        assert len(list(fr.read_recording(rec.dir))) == fr.Recorder.CHECK_EVERY
 
 
 def test_record_roundtrip_y14():

@@ -5,7 +5,7 @@ to it over two queues. The worker also serves the browser 3D view of the growing
 (view3d page), so cloud data never passes back through the viewer.
 
 Commands:  ("start", preset, out_dir, keep_raw, continue_from or None, depth mode name, remove_base)
-           | ("frame", yuyv, grey, depth_buf, bytesperline, (t_colour, t_ir, t_depth))
+           | ("frame", yuyv, grey or None, depth_buf, bytesperline, (t_colour, t_ir, t_depth))
            | ("stop",) | ("quit",)   (times: camera capture times, seconds)
 Replies:   ("ready", url) | ("log", text) | ("frame_done", merged, frames, points, tracking, cue, view)
            | ("saved", path, points)
@@ -13,7 +13,8 @@ Replies:   ("ready", url) | ("log", text) | ("frame_done", merged, frames, point
            view: what the frame was, at 1/VIEW_STEP of its size (uint8: 0 other, 1 base, 2 object), or None
 
 With keep_raw, the frames the worker processed are also written to out_dir/<stamp>-rec/ (the
-viewer's recording format), so a scan can be replayed offline with cloud.py for debugging.
+viewer's recording format, without IR), so a scan can be replayed offline with cloud.py for
+debugging. The copy stops (the scan goes on) when the disk is nearly full (frames.Recorder).
 """
 import io
 import multiprocessing
@@ -155,11 +156,18 @@ def run(commands, replies, port=view3d.PORT):
             _, yuyv, grey, depth_buf, bytesperline, (t_c, t_i, t_d) = cmd
             t0 = time.perf_counter()
             if keep_raw:
-                if recorder is None:
-                    recorder = fr.Recorder(bytesperline, root=out_dir, extra={"note": "frames a live scan processed"})
-                    with source.lock:  # its frame 0 is the scanner's next index (continued scans count on)
-                        source.scanner.add_source(recorder.dir.resolve(), source.scanner.stats["frames"])
-                recorder.write({"color": yuyv, "ir": grey, "depth": depth_buf}, {"color": t_c, "ir": t_i, "depth": t_d})
+                try:
+                    if recorder is None:
+                        recorder = fr.Recorder(bytesperline, root=out_dir, extra={"note": "frames a live scan processed"})
+                        with source.lock:  # its frame 0 is the scanner's next index (continued scans count on)
+                            source.scanner.add_source(recorder.dir.resolve(), source.scanner.stats["frames"])
+                    recorder.write({"color": yuyv, "ir": grey, "depth": depth_buf}, {"color": t_c, "ir": t_i, "depth": t_d})
+                except fr.DiskFull as e:
+                    keep_raw = False
+                    if recorder is not None:
+                        recorder.close()
+                        recorder = None
+                    replies.put(("log", f"raw copy stopped, the scan goes on: {e}"))
             t1 = time.perf_counter()
             frame = {"yuyv": yuyv, "depth": decode_depth(depth_buf, fr.W, fr.H, bytesperline),  # colour decoded per point
                      "t": t_d, "skew_ms": (t_c - t_d) * 1000}

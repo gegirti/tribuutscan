@@ -9,8 +9,11 @@ scanner's depth mode (close / long range), whose law calib.CAMERA then uses when
 import json
 import os
 import select
+import shutil
+import struct
 import threading
 import time
+import zlib
 from pathlib import Path
 
 import numpy as np
@@ -24,9 +27,10 @@ CAPTURES = Path(__file__).resolve().parent.parent / "captures"
 
 
 def decode(color_buf, ir_buf, depth_buf, depth_bytesperline):
+    """Decoded frame set; "ir" is None when there is no IR buffer (scan recordings leave it out)."""
     return {
         "color": yuyv_to_rgb(color_buf, W, H),
-        "ir": np.frombuffer(ir_buf, np.uint8, W * H).reshape(H, W)[:, ::-1].copy(),  # flipped to match colour/depth
+        "ir": None if ir_buf is None else np.frombuffer(ir_buf, np.uint8, W * H).reshape(H, W)[:, ::-1].copy(),  # flipped to match colour/depth
         "depth": decode_depth(depth_buf, W, H, depth_bytesperline),
     }
 
@@ -130,42 +134,78 @@ def save(frames, root=CAPTURES, extra=None):
 
 
 STREAMS = ("color", "ir", "depth")
+SCAN_STREAMS = ("color", "depth")  # what recordings keep by default
 FRAME_BYTES = {"color": W * H * 2, "ir": W * H, "depth": W * H * 10 // 8}  # YUYV, GREY, packed Y10 (Y14: 14 // 8)
+
+
+class DiskFull(OSError):
+    """Less than FREE_FLOOR_GB left on the disk a recording writes to."""
+
+
+def free_gb(path):
+    """Free space (GB) on the disk holding `path`, or where it will be created."""
+    path = Path(path).resolve()
+    while not path.exists():
+        path = path.parent
+    return shutil.disk_usage(path).free / 1e9
 
 
 class Recorder:
     """Append raw frame sets to captures/<timestamp>-rec/: one file per stream plus stamps.csv.
 
-    Frames are stored undecoded (about 4.3 MB per set, 4.9 MB with 14-bit depth) so recording keeps up
-    with the camera; `read_recording` decodes them later.
+    Frames are stored undecoded so recording keeps up with the camera; `read_recording` decodes them
+    later. Scan recordings keep colour and depth only (IR is a fifth of a set and nothing replays it).
+    Depth is zlib-compressed (level 1, each frame a 4-byte length + data, depth.zlib): measured 4x on
+    14-bit depth at 30% valid pixels, ~10 ms of one core per frame. A set is then about 2.5 MB
+    (colour 2.05 MB raw YUYV: zlib gave only 1.4x for a whole core), ~75 MB/s at 30 fps.
+    Raises DiskFull (at the start, or from `write`) when the disk has less than FREE_FLOOR_GB left.
     """
+    FREE_FLOOR_GB = 5.0
+    CHECK_EVERY = 15  # sets between free-space checks (0.5 s at 30 fps)
 
-    def __init__(self, depth_bytesperline, root=CAPTURES, extra=None):
+    def __init__(self, depth_bytesperline, root=CAPTURES, extra=None, streams=SCAN_STREAMS, compress_depth=True):
+        self.free = free_gb(root)
+        if self.free < self.FREE_FLOOR_GB:
+            raise DiskFull(f"only {self.free:.1f} GB free (recording stops under {self.FREE_FLOOR_GB:.0f} GB)")
         self.dir = Path(root) / (time.strftime("%Y%m%d-%H%M%S") + "-rec")
         self.dir.mkdir(parents=True, exist_ok=True)
+        self.streams, self.zlib = tuple(k for k in STREAMS if k in streams), compress_depth
         self.frame_bytes = {**FRAME_BYTES, "depth": depth_bytesperline * H}
         (self.dir / "info.json").write_text(json.dumps({
             "size": [W, H], "depth_bytesperline": depth_bytesperline, "frame_bytes": self.frame_bytes,
+            "streams": list(self.streams), "depth_codec": "zlib" if compress_depth else "raw",
             "depth_mode": calib.CAMERA.mode, "calibration": calib.CAMERA.source,
             "note": "raw sensor buffers; ir is NOT flipped here (read_recording flips it)",
             **(extra or {}),
         }, indent=2))
-        self.files = {k: open(self.dir / f"{k}.raw", "wb") for k in STREAMS}
+        self.files = {k: open(self.dir / (f"{k}.zlib" if k == "depth" and compress_depth else f"{k}.raw"), "wb")
+                      for k in self.streams}
         self.stamps = open(self.dir / "stamps.csv", "w")
         self.stamps.write("index,color_t,ir_t,depth_t\n")
         self.imu, self.imu_rows, self.lock = None, 0, threading.Lock()
-        self.count = 0
+        self.count, self.bytes = 0, 0
 
     def write(self, bufs, stamps):
-        """bufs/stamps: dicts keyed by stream name; buffers are cut to their fixed frame size."""
-        for k in STREAMS:
-            self.files[k].write(bufs[k][: self.frame_bytes[k]])
-        self.stamps.write(f"{self.count}," + ",".join(f"{stamps[k]:.4f}" for k in STREAMS) + "\n")
+        """bufs/stamps: dicts keyed by stream name (streams not recorded are ignored, and may be None);
+        buffers are cut to their fixed frame size."""
+        if self.count % self.CHECK_EVERY == 0:
+            self.free = free_gb(self.dir)
+            if self.free < self.FREE_FLOOR_GB:
+                raise DiskFull(f"only {self.free:.1f} GB free: recording stopped (floor {self.FREE_FLOOR_GB:.0f} GB)")
+        for k in self.streams:
+            data = bufs[k][: self.frame_bytes[k]]
+            if k == "depth" and self.zlib:
+                data = zlib.compress(data, 1)
+                data = struct.pack("<I", len(data)) + data
+            self.files[k].write(data)
+            self.bytes += len(data)
+        self.stamps.write(f"{self.count}," + ",".join(f"{stamps[k]:.4f}" if k in self.streams else "nan"
+                                                      for k in STREAMS) + "\n")
         self.count += 1
 
     @property
     def megabytes(self):
-        return self.count * sum(self.frame_bytes.values()) / 1e6
+        return self.bytes / 1e6
 
     def write_imu(self, rows):
         """Append IMU samples (imu.ImuStream rows) to imu.csv; called from the IMU thread."""
@@ -200,6 +240,18 @@ def read_imu(directory):
     return {name: data[:, i] for i, name in enumerate(IMU_HEADER.split(","))}
 
 
+def zlib_records(data):
+    """(start, size) of each complete record in a depth.zlib file (4-byte little-endian length + data)."""
+    records, at = [], 0
+    while at + 4 <= len(data):
+        size = int(data[at:at + 4].view("<u4")[0])
+        if at + 4 + size > len(data):
+            break  # cut off (the program stopped while writing)
+        records.append((at + 4, size))
+        at += 4 + size
+    return records
+
+
 def read_recording(directory):
     """Yield decoded frame sets (as from `decode`) from a Recorder directory.
 
@@ -210,12 +262,25 @@ def read_recording(directory):
     info = json.loads((directory / "info.json").read_text())
     calib.use_mode(info.get("depth_mode", calib.CLOSE))
     sizes = {**FRAME_BYTES, **info.get("frame_bytes", {})}
-    data = {k: np.memmap(directory / f"{k}.raw", np.uint8, "r") for k in STREAMS}
+    streams = info.get("streams", STREAMS)  # older recordings hold all three, depth raw
+    packed = info.get("depth_codec") == "zlib"
+    mapped = lambda path: np.memmap(path, np.uint8, "r") if path.stat().st_size else np.zeros(0, np.uint8)
+    raw = {k: mapped(directory / f"{k}.raw") for k in streams if not (k == "depth" and packed)}
+    if packed:
+        raw["depth"] = mapped(directory / "depth.zlib")
+        depth = zlib_records(raw["depth"])
+    else:
+        depth = [(i * sizes["depth"], sizes["depth"]) for i in range(len(raw["depth"]) // sizes["depth"])]
+    count = min([len(depth)] + [len(raw[k]) // sizes[k] for k in streams if k != "depth"])  # a cut-off last set is dropped
     stamps_file = directory / "stamps.csv"
-    stamps = np.loadtxt(stamps_file, delimiter=",", skiprows=1, ndmin=2) if stamps_file.exists() else None
-    for i in range(len(data["depth"]) // sizes["depth"]):
-        bufs = [data[k][i * sizes[k]:(i + 1) * sizes[k]].tobytes() for k in STREAMS]
-        frame = decode(*bufs, info["depth_bytesperline"])
+    stamps = np.loadtxt(stamps_file, delimiter=",", skiprows=1, ndmin=2) if stamps_file.exists() and count else None
+    for i in range(count):
+        bufs = {k: raw[k][i * sizes[k]:(i + 1) * sizes[k]].tobytes() for k in streams if k != "depth"}
+        start, size = depth[i]
+        bufs["depth"] = raw["depth"][start:start + size].tobytes()
+        if packed:
+            bufs["depth"] = zlib.decompress(bufs["depth"])
+        frame = decode(bufs["color"], bufs.get("ir"), bufs["depth"], info["depth_bytesperline"])
         if stamps is not None and i < len(stamps):
             frame["t"] = float(stamps[i, 3])
             frame["skew_ms"] = float((stamps[i, 1] - stamps[i, 3]) * 1000)

@@ -6,8 +6,9 @@ Run with `python -m tribuutscan.viewer`. Panels (panels.py, each folds):
   the streams pause about 10 s while it switches (vendor.py). IR exposure and gain are controls on the
   depth function: they change the IR sensor that depth is computed from (14-bit USB depth, usbdepth.py,
   then owns them). Auto IR steps them until the IR image has little clipping (clipping costs depth).
-- Capture: `s` saves the current frame set to captures/<timestamp>/; `r` records raw sets (and IMU
-  samples, imu.csv) to captures/<timestamp>-rec/; `m` fuses the latest recording into mesh.ply
+- Capture: `s` saves the current frame set to captures/<timestamp>/; `r` records colour + depth sets
+  at 30 or 10 fps (and IMU samples, imu.csv) to captures/<timestamp>-rec/, stopping when the disk has
+  under 5 GB free (frames.Recorder); `m` fuses the latest recording into mesh.ply
   (fuse.py in the Open3D .venv).
 - Scan: `c` merges frames live into one compact cloud (cloud.py) in a worker process; Open 3D view
   shows it growing in the browser. Stop saves captures/<timestamp>-scan/.
@@ -54,7 +55,7 @@ CLIP_LO, CLIP_HI, MEAN_LO = 0.3, 2.0, 35
 GAIN_CAP = 2000  # auto never raises gain past this (gain clipped badly in the 25 cm test)
 AUTO_STEP_MS, AUTO_MAX_STEPS = 600, 16
 
-RECORD_FPS = 10  # about 49 MB/s of raw data
+RECORD_RATES = {"30 fps": 30, "10 fps": 10}  # colour + compressed depth: about 75 / 25 MB/s (frames.Recorder)
 
 GOOD, EDGE, BAD = "#2e7d32", "#ef6c00", "#c62828"
 
@@ -305,7 +306,9 @@ class App:
         self.controls = {}  # label -> (node name, control id, info, scale); targets[node] is looked up at use
         self.auto = {"steps": 0, "running": False}
         self.switching = {"busy": False, "done": None}  # a range switch in progress / finished (its thread)
-        self.rec = {"recorder": None, "thread": None}
+        self.rec = {"recorder": None, "thread": None, "missed": 0}
+        self.record_rates = RECORD_RATES  # for the Capture panel
+        self.record_rate = tk.StringVar(value=next(iter(RECORD_RATES)))
         self.job = {"process": None, "dir": None}
         self.live = {"proc": None, "commands": None, "replies": None, "url": None, "open": False,
                      "inflight": 0, "sent": 0.0}
@@ -422,7 +425,8 @@ class App:
         recorder = self.rec["recorder"]
         if recorder:
             self.message = (f"REC {recorder.count} sets, {recorder.megabytes:.0f} MB"
-                            + (f", {recorder.imu_rows} IMU samples" if recorder.imu_rows else ""))
+                            + (f", {recorder.imu_rows} IMU samples" if recorder.imu_rows else "")
+                            + f", {self.rec['missed']} missed, {recorder.free:.0f} GB free")
         self.note.configure(text=self.message)
         for panel in self.panels:
             panel.refresh()
@@ -673,23 +677,39 @@ class App:
         pointcloud.write_ply(out / "cloud.ply", xyz, rgb)
         self.log(f"saved {out.name} (with cloud.ply, {len(hits)} markers)")
 
-    def record_loop(self, recorder):
-        last = 0.0
+    def record_loop(self, recorder, fps):
+        """Write every depth frame (30 fps) or every third (10 fps) with the colour frame nearest to it.
+        Works through the depth stream's kept frames (~0.4 s), so a slow write drops nothing, and takes a
+        depth frame once colour has a frame after it (until then its nearest colour is not known). Frames
+        it falls too far behind for (their colour may be gone) count as `missed`, as do camera gaps."""
         color, ir, depth = self.color, self.ir, self.depth
+        others = [color] + ([ir] if "ir" in recorder.streams else [])
+        gap = 1 / fps - 0.5 / 30  # half a camera frame of slack
+        last = depth.stamp - gap
         while self.rec["recorder"] is recorder:
-            t = time.time()
-            if depth.stamp != last and color.raw and ir.raw:
-                d_raw, last = depth.raw, depth.stamp
-                (c_raw, c_t), (i_raw, i_t) = color.nearest(last), ir.nearest(last)
-                recorder.write({"color": c_raw, "ir": i_raw, "depth": d_raw}, {"color": c_t, "ir": i_t, "depth": last})
-            time.sleep(max(0.0, 1 / RECORD_FPS - (time.time() - t)))
+            newest = depth.stamp
+            for d_t, d_raw in list(depth.recent):
+                if d_t - last < gap or newest - d_t > 0.25:
+                    continue
+                if any(s.stamp <= d_t for s in others):
+                    break
+                self.rec["missed"] += max(0, round((d_t - last) * fps) - 1)
+                last = d_t
+                (c_raw, c_t), (i_raw, i_t) = color.nearest(d_t), ir.nearest(d_t) if ir in others else (None, 0.0)
+                try:
+                    recorder.write({"color": c_raw, "ir": i_raw, "depth": d_raw}, {"color": c_t, "ir": i_t, "depth": d_t})
+                except fr.DiskFull as e:
+                    self.stop_recording()
+                    self.log(str(e))
+                    break
+            time.sleep(0.01)
         recorder.close()
 
     def stop_recording(self):
         recorder, self.rec["recorder"] = self.rec["recorder"], None
         if self.imu is not None:
             self.imu.listener = None
-        self.log(f"recorded {recorder.count} sets"
+        self.log(f"recorded {recorder.count} sets ({self.rec['missed']} missed)"
                  + (f" and {recorder.imu_rows} IMU samples" if recorder.imu_rows else "") + f" to {recorder.dir.name}")
 
     def toggle_record(self):
@@ -699,16 +719,22 @@ class App:
         if not self.depth.raw or self.switching["busy"]:
             self.log("nothing to record yet")
             return
-        extra = {"controls": self.control_values(), "fps": RECORD_FPS}
+        fps = RECORD_RATES[self.record_rate.get()]
+        extra = {"controls": self.control_values(), "fps": fps}
         if self.imu is not None:
             extra["imu"] = self.imu.settings
-        recorder = fr.Recorder(self.depth.cap.bytesperline, extra=extra)
-        self.rec["recorder"] = recorder
+        try:
+            recorder = fr.Recorder(self.depth.cap.bytesperline, extra=extra)
+        except fr.DiskFull as e:
+            self.log(f"not recording: {e}")
+            return
+        self.rec.update(recorder=recorder, missed=0)
         if self.imu is not None:
             self.imu.listener = recorder.write_imu
-        self.rec["thread"] = threading.Thread(target=self.record_loop, args=(recorder,), daemon=True)
+        self.rec["thread"] = threading.Thread(target=self.record_loop, args=(recorder, fps), daemon=True)
         self.rec["thread"].start()
-        self.log(f"recording started: {recorder.dir.name}" + (" (with IMU)" if self.imu is not None else ""))
+        self.log(f"recording started at {fps} fps: {recorder.dir.name}" + (" (with IMU)" if self.imu is not None else "")
+                 + f", {recorder.free:.0f} GB free")
 
     def mesh(self):
         """Fuse the latest recording in a separate process so the live view keeps running."""
@@ -797,13 +823,13 @@ class App:
     def check_scan(self):
         """Hand the worker a new frame when it is free; handle its replies."""
         live, color, ir, depth = self.live, self.color, self.ir, self.depth
-        if self.scan_state == "scanning" and live["inflight"] < 2 and color.raw and ir.raw and depth.raw \
+        if self.scan_state == "scanning" and live["inflight"] < 2 and color.raw and depth.raw \
                 and depth.stamp != live["sent"]:  # one frame in work, one waiting: the worker never idles
             d_raw, d_t = depth.raw, depth.stamp
             live["sent"] = d_t
             live["inflight"] += 1
-            (c_raw, c_t), (i_raw, i_t) = color.nearest(d_t), ir.nearest(d_t)
-            live["commands"].put(("frame", c_raw, i_raw, d_raw, depth.cap.bytesperline, (c_t, i_t, d_t)))
+            c_raw, c_t = color.nearest(d_t)  # no IR: the worker's raw copy leaves it out (frames.SCAN_STREAMS)
+            live["commands"].put(("frame", c_raw, None, d_raw, depth.cap.bytesperline, (c_t, 0.0, d_t)))
         while live["replies"] is not None:
             try:
                 kind, *rest = live["replies"].get_nowait()
