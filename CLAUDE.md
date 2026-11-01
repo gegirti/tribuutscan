@@ -333,6 +333,10 @@ python3 -m tribuutscan.view3d captures/<stamp>-scan    # browser 3D view at http
 ./setup-venv.sh [dir]                       # build .venv from pyproject's "scan" extra (PYTHON=... to pick)
 .venv/bin/python -m tribuutscan.fusion captures/<stamp>-scan [--all] [--min-weight 4] [--force]
                                             # fuse a scan's keyframes -> mesh.ply (m) + mesh.stl (mm)
+                                            # (on the GPU when there is one; TRIBUUTSCAN_GPU=0: Open3D)
+.venv/bin/python -m tribuutscan.gpucheck [--frames N] [--out r.json]   # GPU self-check, no scanner
+.venv/bin/python -m tribuutscan.bakeoff slice captures/<stamp>-scan [--seconds S] [--capacity N]
+                                            # GPU slice timing / stability on a saved scan
 .venv/bin/python -m tribuutscan.cloud captures/<stamp>-rec --optimise --mesh   # what the viewer's `m` runs
 .venv/bin/python -m tribuutscan.compare captures/<stamp>-scan [ref.ply] [--seeds 12] [--transform c.json]
                                             # score a cloud or mesh against a reference mesh (default
@@ -741,6 +745,57 @@ cubes on the GPU; the CPU keeps the 6x6 solve, markers, base votes, pose graph, 
   963.51, law a 289570 / 289564, same 28 views, reprojection 0.346 / 0.319 / 0.340 px vs 0.346 /
   0.321 / 0.340); the viewer's PPM previews and a panel render the same under Tk 9.0. So Ubuntu 26.04's
   likely stack needs no code change today; the checkpoint re-runs this on the real install.
+- PHASE 2 DONE (2026-11-01 night, the user away): ENGINE = WEBGPU (wgpu-py 0.32, `gpu_wgpu.py`). Shared layout,
+  inputs and numpy references in `gpu.py`; the bake-off harness `bakeoff.py` (dump / run / slice); a
+  no-scanner self-check for testers `gpucheck.py`. Installed into .venv: wgpu (+ cffi, rendercanvas,
+  pycparser); pyopencl + pocl-binary-distribution only for the bake-off.
+  - Layout (both engines, the portability rules): dense u32 brick index over the scan's box -> pool of
+    65536 bricks of 8^3 voxels; voxel = u32 TSDF int16 (normalised by the truncation) | weight uint16
+    << 16, plus u32 RGB8; 32-bit integer atomics only (CAS allocation, visible-brick list); ICP sums
+    reduced per work-group in f32, finished on the CPU in f64; <= 8 storage buffers and <= 128 MB per
+    binding (WebGPU's defaults; llvmpipe allows no more). Bricks are allocated as Open3D's DepthTouch
+    does: every 4th pixel each way (its down_factor), 4 depths along the ray within the truncation.
+    Voxels at origin + index * voxel, x fastest in a brick (= Open3D's order).
+  - Bake-off, marker recording's 206 keyframes (board camera), both engines on the A750 and on their
+    CPU fallbacks (llvmpipe / PoCL): the same volume as Open3D (10523 of 10532 bricks, the 9 outside
+    the box; TSDF median 4e-6, 0.006% of voxels > 0.01; weights differ on 0.06% of 3M voxels), frame
+    maps = numpy to 2e-5 mm, ICP sums = numpy to 1.3e-7. Kernel ms on the A750 (30 frames; WGSL after
+    unrolling): integrate 0.14 / 0.10 (WebGPU / OpenCL), ray cast 2.65 / 1.10, ICP 0.16 / 0.12, maps
+    0.07 / 0.09; ICP pass + readback 0.63 / 0.48; llvmpipe ray cast 96, PoCL 165. OpenCL is faster on
+    Intel (IGC vs Mesa's backend; WGSL work-group size and unrolling closed the ICP gap, not the ray
+    cast's), but a stock Ubuntu desktop has Vulkan (xserver-xorg / libvulkan1 recommend
+    mesa-vulkan-drivers: anv, radv, nouveau/nvk, llvmpipe) and no OpenCL (intel-opencl-icd was
+    installed by hand here; AMD needs mesa-opencl-icd + RUSTICL_ENABLE; nouveau none). WebGPU also
+    covers Windows (DX12) and macOS (Metal). Decided on reach, the user's first rule.
+  - The full slice in WebGPU: frame preparation on the GPU (`set_camera`, `fuse_frame`: prep.clean's
+    window / jump / grazing / erosion / 7x7 speckle on the cut-out frame_images uses, the 1/8 labels
+    grown one cell, colour through the calibrated colour camera from raw YUYV, the Pinhole lookup) =
+    the CPU path pixel for pixel on the marker frames (same pixels kept, depth 3e-5 mm, colour 0.01%
+    one-pixel rounding); marching cubes on the GPU (table generated in `gpu.triangle_table`: closed and
+    outward on a sphere and a random field) = Open3D's mesh (559734 / 559722 triangles, 0.00003 mm
+    median apart). `fusion.open_engine` takes the GPU when wgpu has an adapter (TRIBUUTSCAN_GPU=0: Open3D,
+    =cpu: llvmpipe), volume = the scan cloud's box + 20 mm (`scan_bounds`); `read_recording(yuyv=True)`
+    leaves colour raw; `scan_frames` yields 1/8 labels now.
+  - Pass marks (A750, marker scan, `bakeoff slice`): prep + maps 0.49 ms (<= 3), integrate 0.22 + ray
+    cast 2.5-4.3 (<= 10), ICP 0.24 (<= 2), mesh 0.17 s (<= 2); 206 frames in 6 s with reading
+    (8 ms a frame on the CPU); `fusion` mesh 17.7-24 s (was ~57; the rest is restoring the scan);
+    compare vs Creality identical to Phase 1 (0.090 / 0.343 mm, 95% on the part). Full pool (4000
+    bricks): 6517 refused and counted, mesh from what fitted. Compile 0.05 s. Stability: a 10-minute
+    loop of 127 full replays, no error, the same 559736 triangles every pass (GPU memory then peaked
+    at 4.5 GB: see close() below; with it, 67 replays in 5 minutes held 735-809 MB, host 3.6 GB); the
+    desktop was idle (the user away) and the 3D page not open: that part of the mark is not done.
+  - FOUND: wgpu-native hands Vulkan timestamps as raw ticks (A750: ~52 ns, calibrated 56-57 with
+    submission; llvmpipe ns): `calibrate_ticks`. GPU memory: wgpu-py's device and queue form a
+    reference cycle, so engines were freed only by the cycle collector (a replay loop held 3.9 GB);
+    `close()` drops the references and collects (back to 1 MB), destroy() alone frees nothing.
+  - FOUND: Open3D's integrate takes each voxel's depth from the pixel it falls in ROUNDED DOWN: half a
+    pixel off along every slope (synthetic sphere: mesh 0.057 mm median from the truth; a tilted wall
+    0.083 mm, exactly 0.5 px x pixel size x slope). The GPU engine takes the NEAREST pixel by default
+    (sphere 0.018 mm); `nearest=False` keeps Open3D's rule for the parity checks. Marker mesh vs
+    Creality: median 0.090 -> 0.083, p90 0.343 -> 0.353 (inconclusive against another scan; the
+    printed box decides).
+  - Not done in Phase 2: S1 decode of the raw Y14/Y10 bytes and the garbled-row check stay on the CPU
+    (decode_depth); GPU tracking (Phase 3) will use `raycast` / `icp` as they are.
 
 ## The person you are working with
 

@@ -26,10 +26,11 @@ W, H = 1280, 800
 CAPTURES = Path(__file__).resolve().parent.parent / "captures"
 
 
-def decode(color_buf, ir_buf, depth_buf, depth_bytesperline):
-    """Decoded frame set; "ir" is None when there is no IR buffer (scan recordings leave it out)."""
+def decode(color_buf, ir_buf, depth_buf, depth_bytesperline, yuyv=False):
+    """Decoded frame set; "ir" is None when there is no IR buffer (scan recordings leave it out). With
+    `yuyv` the colour stays as it came ("yuyv": the raw bytes) for whoever converts only what it needs."""
     return {
-        "color": yuyv_to_rgb(color_buf, W, H),
+        ("yuyv" if yuyv else "color"): color_buf if yuyv else yuyv_to_rgb(color_buf, W, H),
         "ir": None if ir_buf is None else np.frombuffer(ir_buf, np.uint8, W * H).reshape(H, W)[:, ::-1].copy(),  # flipped to match colour/depth
         "depth": decode_depth(depth_buf, W, H, depth_bytesperline),
     }
@@ -252,8 +253,9 @@ def zlib_records(data):
     return records
 
 
-def read_recording(directory):
-    """Yield decoded frame sets (as from `decode`) from a Recorder directory.
+def read_recording(directory, yuyv=False):
+    """Yield decoded frame sets (as from `decode`, colour left as YUYV bytes with `yuyv`) from a Recorder
+    directory.
 
     Each set also carries "t" (depth timestamp, s) and "skew_ms" (colour minus depth time) when the
     recording has stamps.csv. Switches calib.CAMERA to the recording's depth mode (close if not noted).
@@ -280,7 +282,7 @@ def read_recording(directory):
         bufs["depth"] = raw["depth"][start:start + size].tobytes()
         if packed:
             bufs["depth"] = zlib.decompress(bufs["depth"])
-        frame = decode(bufs["color"], bufs.get("ir"), bufs["depth"], info["depth_bytesperline"])
+        frame = decode(bufs["color"], bufs.get("ir"), bufs["depth"], info["depth_bytesperline"], yuyv)
         if stamps is not None and i < len(stamps):
             frame["t"] = float(stamps[i, 3])
             frame["skew_ms"] = float((stamps[i, 1] - stamps[i, 3]) * 1000)

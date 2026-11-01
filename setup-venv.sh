@@ -18,6 +18,6 @@ fi
 "$py" -m venv "$dir" ||
     { echo "could not make a venv (Debian/Ubuntu: install python3-venv)"; exit 1; }
 "$dir/bin/python" -m pip install --quiet --upgrade pip
-"$dir/bin/python" -m pip install --editable ".[scan]"
+"$dir/bin/python" -m pip install --editable ".[scan,gpu]"
 "$dir/bin/python" -c 'import numpy, open3d, cv2, sys; print("ok: python", sys.version.split()[0], "numpy", numpy.__version__,
     "open3d", open3d.__version__, "opencv", cv2.__version__)'

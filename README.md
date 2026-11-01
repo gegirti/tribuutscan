@@ -267,10 +267,18 @@ The IR projector turns on by itself when the IR stream is opened.
   The mesh misses a thin band where the scanned area ends (a fused surface stops about a voxel
   before the last points); otherwise it covers the same. 95% of its area lies on the part; the rest
   is the stand the part leans on, which touches it. Only the keyframes are fused (the frames
-  Optimise corrects): with every frame the 90% figure was 0.53 mm. Fusing the marker scan's 206
-  keyframes takes under a minute on the CPU. On synthetic scans with known motion the fused surface
-  lies 0.02-0.03 mm (median) from the true one, and a 1.8 mm plate seen from both sides keeps both
-  faces (the truncation is kept under the plate's thickness for that).
+  Optimise corrects): with every frame the 90% figure was 0.53 mm. On synthetic scans with known
+  motion the fused surface lies 0.02-0.03 mm (median) from the true one, and a 1.8 mm plate seen from
+  both sides keeps both faces (the truncation is kept under the plate's thickness for that).
+- **On the GPU** (`gpu_wgpu.py`, WebGPU): set to Open3D's rules, the same volume voxel for voxel
+  (Open3D's mesh and ours lie 0.00003 mm apart), with the frames cleaned, masked and coloured on the
+  GPU too. The marker
+  scan's mesh takes 18-24 s instead of about a minute, most of it reading the recording; the GPU's
+  share is about 3 ms a frame, the mesh itself 0.2 s. Chosen over OpenCL by measuring both: the same
+  results, OpenCL faster on this Intel card, but only WebGPU runs on every stock desktop's driver.
+  One thing found on the way: Open3D takes each voxel's depth from the pixel it falls in rounded down,
+  half a pixel off along every slope (on a synthetic sphere 0.057 mm median from the true surface);
+  the GPU engine takes the nearest pixel (0.018 mm).
 
 ## Layout
 
@@ -283,7 +291,9 @@ The IR projector turns on by itself when the IR stream is opened.
 - Scanning: `cloud.py` (voxel cloud, the scanner), `track.py` (the joint solve), `features.py` (ORB),
   `markers.py` + `markermap.py`, `scene.py` (table plane, object region), `prep.py` (depth cleanup),
   `optimise.py` (loop closures, pose graph), `session.py` (continue or merge scans),
-  `fusion.py` (the mesh: frames fused into a TSDF volume), `fuse.py` (ICP helpers)
+  `fusion.py` (the mesh: frames fused into a TSDF volume), `gpu.py` + `gpu_wgpu.py` (the volume on
+  the GPU), `gpucheck.py` (a GPU self-check), `bakeoff.py` (how the GPU engine was chosen), `fuse.py`
+  (ICP helpers)
 - Camera: `calib.py` (the camera model), `calibrate.py` (board calibration)
 - Measuring: `evaluate.py` + `metrics.py` (tracking scores on saved and synthetic recordings),
   `synth.py` (synthetic scans with known motion), `measure.py` (depth flatness and noise),
@@ -300,9 +310,12 @@ The IR projector turns on by itself when the IR stream is opened.
 Next up:
 
 - [ ] **GPU pipeline** (the top priority): depth processing, fusion, tracking against the fused model
-      and meshing on the GPU, for live 20-30 fps and meshes in seconds. Vendor-neutral (any GPU with
-      stock drivers, plus a CPU fallback), so it runs for everyone; the engine (WebGPU through wgpu,
-      or OpenCL) is chosen by measuring both. Today's CPU path is the reference it must match.
+      and meshing on the GPU, for live 20-30 fps. Vendor-neutral (any GPU with stock drivers, plus a
+      CPU fallback), so it runs for everyone.
+  - [x] the engine, chosen by measuring WebGPU against OpenCL: WebGPU (`wgpu`)
+  - [x] meshes on the GPU: frame preparation, fusion, marching cubes (a scan's mesh in seconds)
+  - [ ] tracking against the fused model on the GPU
+  - [ ] live scanning at full rate
 - [ ] **Crop in the 3D view**: for what touches the object (a stand, a cable), which object
       separation keeps.
 - [ ] **Speed** (measured on the marker scan: 247 ms per frame, about 4 fps):
@@ -338,8 +351,8 @@ Done:
       loop closures, continuing a scan, merging two scans.
 - [x] **Markers**: detection, and tracking and alignment with them.
 - [x] **Browser 3D view** with export.
-- [x] **Meshes** fused from the frames (a TSDF volume on the CPU, Open3D), shown in the 3D view,
-      exported as PLY and STL.
+- [x] **Meshes** fused from the frames (a TSDF volume on the GPU, or Open3D on the CPU), shown in the
+      3D view, exported as PLY and STL.
 
 Later:
 
@@ -366,6 +379,21 @@ Possibly related, **untested**:
 Want to help? Plug your scanner in and send the output of `lsusb` and
 `for d in /sys/class/video4linux/video*; do echo "$d $(cat $d/name)"; done`, then try
 `python3 -m tribuutscan.viewer` and tell us which streams you get.
+
+**GPU**: meshes are fused on the GPU through WebGPU (`wgpu`), which runs on the graphics driver your
+system already has: Vulkan on Linux (Mesa's drivers for Intel, AMD and NVIDIA via nouveau come with a
+stock Ubuntu desktop; NVIDIA's own driver has Vulkan too), DirectX 12 / Vulkan on Windows, Metal on
+macOS. No CUDA, ROCm or driver upgrade is needed. Without a usable GPU it falls back to the CPU (Mesa's
+llvmpipe, or Open3D). Tested only on an Intel Arc A750 (Mesa 25.2) and on llvmpipe. **Have an AMD or
+NVIDIA card, or another Intel one?** No scanner needed:
+
+```
+./setup-venv.sh && .venv/bin/python -m tribuutscan.gpucheck --out gpucheck.json
+```
+
+It fuses a synthetic sphere on your GPU and on the CPU fallback, checks the mesh against the true
+sphere and times each step; please send us `gpucheck.json` (it names your OS, GPU and driver, nothing
+else).
 
 ## Alternatives
 

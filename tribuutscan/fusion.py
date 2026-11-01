@@ -13,11 +13,13 @@ unless --force. The base and the surroundings are cut at extraction with the clo
 
 `Engine` is the volume itself and knows nothing about the scanner: depth in mm on a pinhole grid,
 colour on the same grid, a camera -> world pose. This one is Open3D's VoxelBlockGrid on the CPU (the
-reference a GPU engine must match). Depth is fused as float mm (14-bit steps kept), after the lens
+reference); the GPU engine (gpu_wgpu.Engine, WebGPU) gives the same volume and mesh and is used when
+the machine has a GPU it can run on (`open_engine`; TRIBUUTSCAN_GPU=0 forces this one). Depth is fused as float mm (14-bit steps kept), after the lens
 distortion is taken out by a fixed nearest-pixel lookup (the board model has some; the factory
 model's depth is already pinhole) and after the merge's cleaning (prep.clean).
 """
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -32,7 +34,7 @@ from . import frames as fr
 from . import pointcloud as pc
 from . import prep
 from .calib import CAMERA
-from .image import yuyv_pixels
+from .image import yuyv_pixels, yuyv_to_rgb
 
 VOXEL_MM = 0.5  # close range: a pixel covers 0.26 mm at 25 cm
 TRUNC_VOXELS = 3.0  # truncation 1.5 mm: thinner than a 1.8 mm plate, so both its faces stay apart
@@ -143,10 +145,11 @@ def label_mask(labels, step, shape):
     return np.repeat(np.repeat(grown, step, 0), step, 1)[:shape[0], :shape[1]]
 
 
-def scan_frames(scanner, which="merged", check=None):
-    """(frame, pose, mask) for a scan's tracked frames ("all") or its merged ones, read from the source
-    recordings it notes (session.json "sources"); `check()` runs after the first frame is read (it set
-    the recording's depth mode)."""
+def scan_frames(scanner, which="merged", check=None, yuyv=False):
+    """(frame, pose, labels) for a scan's tracked frames ("all") or its merged ones, read from the source
+    recordings it notes (session.json "sources"; colour left as YUYV with `yuyv`); labels are the frame's
+    1/8 object/base labels (label_mask makes the pixel mask), or None. `check()` runs after the first
+    frame is read (it set the recording's depth mode)."""
     poses = dict(scanner.poses if which == "merged" else scanner.frame_poses())
     if not scanner.sources:
         raise ValueError("this scan does not note its recordings (saved before 2026-11-01, or without "
@@ -156,16 +159,14 @@ def scan_frames(scanner, which="merged", check=None):
         rec = Path(source["rec"])
         if not rec.exists():
             raise FileNotFoundError(f"recording {rec} is gone")
-        for i, frame in enumerate(fr.read_recording(rec)):
+        for i, frame in enumerate(fr.read_recording(rec, yuyv)):
             if k == 0 and i == 0 and check is not None:
                 check()
             index = source["first_index"] + i
             if end is not None and index >= end:
                 break
             if index in poses:
-                labels = scanner.labels.get(index)
-                mask = None if labels is None else label_mask(labels, cl.LABEL_STEP, frame["depth"].shape)
-                yield frame, poses[index], mask
+                yield frame, poses[index], scanner.labels.get(index)
 
 
 def check_camera(directory, force=False):
@@ -187,19 +188,59 @@ def cut(vertices, triangles, keep):
     return used, new[tri]
 
 
-def fuse(items, voxel_mm=VOXEL_MM, trunc_voxels=TRUNC_VOXELS, log=print):
-    """An Engine with every (frame, pose, mask) of `items` fused, and ms per frame by step."""
-    engine, pinhole = None, Pinhole()
+def open_engine(K, size, voxel_mm, trunc_voxels, far_mm, bounds=None, log=print):
+    """The GPU engine (WebGPU) over `bounds` ((lo, hi) world mm) when there are bounds and a GPU to run on,
+    else Open3D on the CPU. TRIBUUTSCAN_GPU: 0 = always the CPU, "cpu" = WebGPU on the CPU (llvmpipe)."""
+    choice = os.environ.get("TRIBUUTSCAN_GPU", "auto").lower()
+    if bounds is not None and choice not in ("0", "no", "off"):
+        try:
+            from . import gpu, gpu_wgpu
+            kind = "cpu" if choice == "cpu" else "gpu"
+            if kind in gpu_wgpu.adapters():
+                layout = gpu.Layout(*bounds, voxel_mm=voxel_mm, trunc_voxels=trunc_voxels)
+                engine = gpu_wgpu.Engine(layout, K, size, kind, far_mm)
+                engine.name = f"{engine.name} ({engine.device_name})"
+                return engine
+        except Exception as e:  # no WebGPU here, no usable adapter, a volume too big: the CPU engine does it
+            log(f"GPU fusion not available ({e}): fusing on the CPU")
+    return Engine(K, voxel_mm, trunc_voxels, far_mm)
+
+
+def scan_bounds(scanner, margin_mm=20.0):
+    """(lo, hi) world mm around everything the scan merged (object and base), for the GPU volume."""
+    with scanner.cloud_lock:
+        c = scanner.cloud
+        if not len(c):
+            return None
+        xyz = c.xyz / c.n[:, None]
+    return xyz.min(0) - margin_mm, xyz.max(0) + margin_mm
+
+
+def fuse(items, voxel_mm=VOXEL_MM, trunc_voxels=TRUNC_VOXELS, log=print, bounds=None):
+    """An Engine with every (frame, pose, mask) of `items` fused, and ms per frame by step. With `bounds`
+    the GPU engine may take it (open_engine)."""
+    engine, pinhole, on_gpu = None, Pinhole(), False
     timing = {"read": 0.0, "prepare": 0.0, "integrate": 0.0}
     t = time.perf_counter()
-    for frame, pose, mask in items:
+    for frame, pose, labels in items:
         if engine is None:  # after the first frame: its recording set the depth mode (the window)
-            engine = Engine(pinhole.K, voxel_mm, trunc_voxels, CAMERA.window_mm[1] + 20)
+            size = frame["depth"].shape[::-1]
+            engine = open_engine(pinhole.K, size, voxel_mm, trunc_voxels, CAMERA.window_mm[1] + 20, bounds, log)
+            if hasattr(engine, "set_camera") and "yuyv" in frame and CAMERA.colour is not None:
+                engine.set_camera(CAMERA, pinhole.index)  # the GPU prepares the frames itself
+                on_gpu = True
         t1 = time.perf_counter()
-        depth, rgb = frame_images(frame, mask)
-        depth, rgb = pinhole(depth), pinhole(rgb)
-        t2 = time.perf_counter()
-        engine.integrate(depth, rgb, pose)
+        if on_gpu:
+            t2 = t1
+            engine.fuse_frame(frame, labels, pose)
+        else:
+            mask = None if labels is None else label_mask(labels, cl.LABEL_STEP, frame["depth"].shape)
+            if "yuyv" in frame and "color" not in frame:
+                frame = {**frame, "color": yuyv_to_rgb(frame["yuyv"], *frame["depth"].shape[::-1])}
+            depth, rgb = frame_images(frame, mask)
+            depth, rgb = pinhole(depth), pinhole(rgb)
+            t2 = time.perf_counter()
+            engine.integrate(depth, rgb, pose)
         t3 = time.perf_counter()
         for key, dt in (("read", t1 - t), ("prepare", t2 - t1), ("integrate", t3 - t2)):
             timing[key] += dt
@@ -243,14 +284,21 @@ def fuse_scan(directory, which="merged", voxel_mm=VOXEL_MM, trunc_voxels=TRUNC_V
         scanner = cl.Scanner.restore(directory, log=lambda m: None)
     else:
         scanner.flush()
-    engine, ms = fuse(scan_frames(scanner, which, lambda: check_camera(directory, force)), voxel_mm, trunc_voxels, log)
+    bounds = scan_bounds(scanner)
+    engine, ms = fuse(scan_frames(scanner, which, lambda: check_camera(directory, force), yuyv=bounds is not None),
+                      voxel_mm, trunc_voxels, log, bounds)
     t1 = time.time()
-    vertices, triangles, colours = extract(engine, scanner.output_mask, min_weight)
+    try:
+        vertices, triangles, colours = extract(engine, scanner.output_mask, min_weight)
+        volume = engine.report() if hasattr(engine, "report") else {}
+    finally:
+        if hasattr(engine, "close"):
+            engine.close()
     report = {"frames": engine.frames, "empty_frames": engine.empty, "which": which, "engine": engine.name, "voxel_mm": voxel_mm,
               "trunc_mm": voxel_mm * trunc_voxels, "min_weight": min_weight, "blocks": engine.blocks(),
               "vertices": int(len(vertices)), "triangles": int(len(triangles)), "remove_base": scanner.remove_base,
               "camera": {"source": CAMERA.source, "fingerprint": CAMERA.fingerprint()}, "ms_per_frame": ms,
-              "fuse_s": round(t1 - t0, 1), "extract_s": round(time.time() - t1, 1)}
+              "fuse_s": round(t1 - t0, 1), "extract_s": round(time.time() - t1, 1), **volume}
     return vertices, triangles, colours, report
 
 

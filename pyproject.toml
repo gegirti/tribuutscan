@@ -16,6 +16,9 @@ dependencies = ["numpy>=1.24"]
 # Tested (2026-11-01, same results): Python 3.12 + numpy 1.26 + open3d 0.20.0 + opencv 4.10, and
 # Python 3.14 + numpy 2.5 + open3d 0.20.0 + opencv 5.0 (Tk 9.0).
 scan = ["open3d>=0.20", "opencv-python-headless>=4.10"]
+# The GPU engine (meshes in seconds; fusion.py falls back to Open3D on the CPU without it): WebGPU,
+# so any GPU with the system's stock Vulkan (or Metal / DirectX 12) driver, and llvmpipe on the CPU.
+gpu = ["wgpu>=0.32"]
 
 [tool.setuptools]
 packages = ["tribuutscan"]
