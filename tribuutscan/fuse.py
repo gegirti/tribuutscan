@@ -43,7 +43,7 @@ def images(frame):
     """(depth in mm as uint16, registered colour as uint8) for one frame set."""
     d = frame["depth"]
     mm = np.where(d > 0, pc.depth_to_mm(d), 0).astype(np.uint16)
-    return mm, np.ascontiguousarray(pc.register_color(frame["color"]))
+    return mm, np.ascontiguousarray(pc.register_color(frame["color"], d))
 
 
 def icp_clouds(mm, color, intr):

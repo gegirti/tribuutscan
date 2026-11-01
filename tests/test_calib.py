@@ -171,3 +171,26 @@ def test_note_factory_keeps_the_offsets_of_one_scanner():
             assert json.loads(path.read_text())["disp_offsets"] == {calib.CLOSE: 218.0}
     finally:
         calib.use(before)
+
+
+def test_register_color_with_a_colour_model():
+    from tribuutscan import pointcloud
+    before = calib.CAMERA.spec
+    try:
+        h, w = 800, 1280
+        yy, xx = np.mgrid[0:h, 0:w]
+        colour = np.stack([xx % 256, xx // 256, yy % 256], -1).astype(np.uint8)  # each pixel names itself
+        depth = np.zeros((h, w), np.float32)
+        depth[200:600, 300:1000] = 280.0  # ~25 cm
+        calib.use(calib.from_factory(FACTORY, calib.CLOSE))
+        reg = pointcloud.register_color(colour, depth)
+        assert reg.shape == (h, w, 3)
+        for u, v, raw in ((640, 400, 280.0), (310, 210, 280.0), (100, 700, 0.0)):
+            z = calib.CAMERA.depth_mm(raw) if raw else calib.DEFAULT_Z_MM
+            x, y = calib.CAMERA.colour_px(u, v, z)
+            assert tuple(reg[v, u]) == (int(round(x)) % 256, int(round(x)) // 256, int(round(y)) % 256)
+        calib.use(calib.ESTIMATES)  # the affine estimate: same as the old row/column resampling
+        sx, sy = pointcloud.color_source(np.arange(w), np.arange(h), w, h)
+        assert np.array_equal(pointcloud.register_color(colour), colour[sy][:, sx])
+    finally:
+        calib.use(before)

@@ -669,7 +669,7 @@ class App:
         hits = markers.detect(markers.luma(frames["color"]), rgb=frames["color"])
         out = fr.save(frames, extra={"controls": self.control_values(),
                                      "markers": [[round(x, 2), round(y, 2), round(r, 2)] for x, y, r, _ in hits]})
-        xyz, rgb = pointcloud.to_points(frames["depth"], pointcloud.register_color(frames["color"]))
+        xyz, rgb = pointcloud.to_points(frames["depth"], pointcloud.register_color(frames["color"], frames["depth"]))
         pointcloud.write_ply(out / "cloud.ply", xyz, rgb)
         self.log(f"saved {out.name} (with cloud.ply, {len(hits)} markers)")
 

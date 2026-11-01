@@ -31,11 +31,13 @@ def color_source(u, v, w, h, z_mm=None):
     return np.clip(np.round(x).astype(int), 0, w - 1), np.clip(np.round(y).astype(int), 0, h - 1)
 
 
-def register_color(color):
-    """Resample colour onto the depth pixel grid."""
-    h, w = color.shape[:2]
-    src_x, src_y = color_source(np.arange(w), np.arange(h), w, h)
-    return color[src_y][:, src_x]
+def register_color(color, depth=None):
+    """Resample colour onto the depth pixel grid, through each pixel's own distance when the raw
+    `depth` is given (the cameras sit apart, so the match moves with distance), else at DEFAULT_Z_MM."""
+    vv, uu = np.mgrid[0:CAMERA.height, 0:CAMERA.width]
+    z = None if depth is None else np.where(depth > 0, CAMERA.depth_mm(np.maximum(depth, 1)), calib.DEFAULT_Z_MM)
+    src_x, src_y = color_source(uu, vv, color.shape[1], color.shape[0], z)
+    return color[src_y, src_x]
 
 
 def depth_to_mm(v):
@@ -89,7 +91,7 @@ def main():
     else:
         frames = fr.grab()
         directory = fr.save(frames)
-    xyz, rgb = to_points(frames["depth"], register_color(frames["color"]))
+    xyz, rgb = to_points(frames["depth"], register_color(frames["color"], frames["depth"]))
     out = directory / "cloud.ply"
     write_ply(out, xyz, rgb)
     print(f"{len(xyz)} points -> {out}")
