@@ -217,6 +217,8 @@ def test_a_saved_scan_keeps_what_fusing_again_needs():
             assert session["sources"] == [{"rec": str(rec.resolve()), "first_index": 0}]
             assert session["camera"] == {"source": "estimate", "fingerprint": calib.CAMERA.fingerprint()}
             back = cl.Scanner.restore(out, log=lambda *a: None)
+            bases = {id(points.base) for points, _, _ in back.merged_data.values()}
+            assert len(bases) == 1  # every merged frame is a view of ONE loaded array, not its own full copy
             assert [i for i, _ in back.frame_poses()] == [i for i, _ in tracked]
             assert all(np.allclose(p, q, atol=1e-5) for (_, p), (_, q) in zip(back.frame_poses(), tracked))
             assert back.sources == sc.sources

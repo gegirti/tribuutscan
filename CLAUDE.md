@@ -552,6 +552,15 @@ centre piece, and the table connected the part to its surroundings.
 
 - The v4l2_format union starts at byte 8 on 64-bit; getting this wrong silently ignores the
   requested format.
+- `np.load` of an .npz decompresses the whole array again on EVERY `f["name"]`, and a slice of it
+  keeps that copy alive. `Scanner.restore` did this per merged frame (since P6): on the marker scan
+  (207 merged frames, 12.2M points) it grew past 8 GB. Read each array once (`cloud.load_npz`):
+  Optimise now peaks at 1.3 GB.
+- That 8 GB process ran inside VS Code's systemd scope, so the OOM killer's kill made systemd stop the
+  whole scope (OOMPolicy=stop) and VS Code died with it. Start heavy jobs from a session in their own
+  capped scope: `systemd-run --user --scope -q -p MemoryMax=6G -p MemorySwapMax=2G <cmd>` (pass
+  variables with `-E`). Note too that this machine's shells have `.venv` activated, so plain `python3`
+  is the venv: use `/usr/bin/python3` to test without Open3D.
 - Automatic colour/depth registration by edge correlation did not converge on a flat shelf scene
   of dark boxes; a calibration target or marker is the right way, not more tuning.
 - Hand-held distance readings (about +-1-2 cm) cannot tell `a/z+b` from `a/z^2+b`. A fixed rig is

@@ -375,6 +375,13 @@ def read_poses(path):
     return [(int(r[0]), r[1:].reshape(4, 4)) for r in rows]
 
 
+def load_npz(path):
+    """{name: array} of an .npz, each read once: indexing the open file decompresses the whole array
+    again every time (a slice of it kept that whole copy alive: restore once grew past 8 GB)."""
+    with np.load(path) as f:
+        return {name: f[name] for name in f.files}
+
+
 def scene_margin():
     from .scene import REGION_MARGIN_MM
     return REGION_MARGIN_MM
@@ -660,7 +667,7 @@ class Scanner:
         session = json.loads((directory / "session.json").read_text())
         sc = cls(session.get("preset", "small"), log=log, mode=session.get("mode", "still"),
                  remove_base=session.get("remove_base", True))
-        kf = np.load(directory / "keyframes.npz")
+        kf = load_npz(directory / "keyframes.npz")
         at = lambda name: kf[name + "_at"]
         for k, index in enumerate(kf["index"]):
             pts = kf["points"][at("points")[k]:at("points")[k + 1]]
@@ -669,7 +676,7 @@ class Scanner:
             mk = kf["markers"][at("markers")[k]:at("markers")[k + 1]]
             sc.keyframes.append((int(index), kf["pose"][k], pts, (fp, fd) if len(fd) else None, mk))
             sc.poses.append((int(index), kf["pose"][k]))
-        m = np.load(directory / "merged.npz")
+        m = load_npz(directory / "merged.npz")
         for k, index in enumerate(m["index"]):
             a, b = m["at"][k], m["at"][k + 1]
             sc.merged_data[int(index)] = (m["points"][a:b], m["rgb"][a:b], m["normals"][a:b])
@@ -684,7 +691,7 @@ class Scanner:
                     status[int(i)] = s
             sc.track_log = [(i, status.get(i, "tracked"), p) for i, p in read_poses(directory / "frame_poses.txt")]
         if (directory / "labels.npz").exists():
-            lab = np.load(directory / "labels.npz")
+            lab = load_npz(directory / "labels.npz")
             sc.labels = {int(i): m for i, m in zip(lab["index"], lab["labels"])}
         sc.scene.load(json.loads((directory / "scene.json").read_text()))
         sc.remerge({})
