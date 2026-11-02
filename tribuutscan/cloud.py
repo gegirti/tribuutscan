@@ -371,6 +371,38 @@ def table_normal(xyz, plane):
     return n, 4 * float(np.sqrt(max(w[1], 0.0)))
 
 
+def cleaned_frame(frame, stride, pix=None):
+    """The frame with prep.clean applied to every `stride`-th pixel; with `pix`, only inside their
+    bounding box (plus a margin): a merge needs nothing else."""
+    s, d = stride, frame["depth"]
+    out = np.zeros_like(d)
+    r0, r1, c0, c1 = 0, d.shape[0], 0, d.shape[1]
+    if pix is not None and len(pix):
+        m = 8 * s
+        c0, c1 = max(0, pix[:, 0].min() - m) // s * s, min(d.shape[1], pix[:, 0].max() + m + 1)
+        r0, r1 = max(0, pix[:, 1].min() - m) // s * s, min(d.shape[0], pix[:, 1].max() + m + 1)
+    out[r0:r1:s, c0:c1:s] = prep.clean(d[r0:r1:s, c0:c1:s], s, origin=(c0, r0))
+    return dict(frame, depth=out)
+
+
+def merge_points(frame, pix, step, stride, clean=True):
+    """A merge's camera points (mm), colours and camera normals: the frame's pixels inside the
+    step x step blocks of `pix`, every `stride`-th, cleaned first (prep.clean) when `clean`."""
+    h, w = frame["depth"].shape
+    kept = np.zeros(((h + step - 1) // step, (w + step - 1) // step), bool)  # merge these blocks
+    kept[pix[:, 1] // step, pix[:, 0] // step] = True
+    cxyz, crgb, cpix, cnrm = frame_points(cleaned_frame(frame, stride, pix) if clean else frame, stride, normals=True)
+    sel = kept[cpix[:, 1] // step, cpix[:, 0] // step]
+    return cxyz[sel], crgb[sel], cnrm[sel]
+
+
+def marker_list(frame):
+    """The markers in a frame's colour image, as stats["markers"] lists them."""
+    h, w = frame["depth"].shape
+    color = frame["color"] if "color" in frame else yuyv_to_rgb(frame["yuyv"], w, h)
+    return [[round(x, 1), round(y, 1)] for x, y, *_ in markers.detect_half(color)]
+
+
 def isolate(xyz, rgb, pix, shape, rng):
     """Cut a frame down to the object: drop the support plane, keep the piece at the centre."""
     keep, plane = isolate_mask(xyz, pix, shape, rng)
@@ -496,7 +528,8 @@ class Scanner:
 
     def __init__(self, preset="small", log=print, clean_depth="merge", gate_refind=True, motion_dt=True,
                  mode="still", track_with="joint", target="model", use_features=True, threaded_merge=True,
-                 remove_base=True, segment_stride=None, orb=None, merge_min_s=None, live_view=False):
+                 remove_base=True, segment_stride=None, orb=None, merge_min_s=None, live_view=False,
+                 merge_process=False):
         try:
             from . import fuse  # Open3D: frame-to-frame ICP
         except ImportError:
@@ -561,6 +594,14 @@ class Scanner:
         self.cloud_lock = threading.Lock()
         self.merger = concurrent.futures.ThreadPoolExecutor(1) if threaded_merge else None
         self.pending = []
+        self.merge_proc, self.orb_slot = None, None  # merger.MergeProcess (merge_process); the keyframe ORB it owes
+        if merge_process:  # the merges (and the keyframes' ORB) in a process of their own: not taken off tracking
+            try:
+                from .merger import MergeProcess
+                self.merge_proc = MergeProcess(self.cloud.point_mm, self.stride, clean_depth == "merge",
+                                               self.merged_reply)
+            except Exception as e:
+                log(f"merging on a thread: the merge process did not start ({e})")
         self.track_info = []  # per tracked frame: (index, info from track.solve); for evaluation
         self.last_t, self.motion_s, self.lost_run = None, None, 0  # time of the last tracked frame, of `motion`
         self.frame_table = None  # this frame's own table: (normal, narrower extent mm), for floor_agrees
@@ -584,6 +625,11 @@ class Scanner:
         index = stats["frames"] if index is None else index
         stats["frames"] += 1
         self.last_view, self.view_codes = None, None
+        if self.merge_proc is not None:
+            try:
+                self.merge_proc.poll()  # merges done meanwhile: counts, markers, keyframes' ORB
+            except RuntimeError as e:
+                self.merge_lost(e)
         if self.clean_depth is True:  # track on cleaned depth as well
             frame = self.cleaned(frame)
         shape = frame["depth"].shape
@@ -731,13 +777,15 @@ class Scanner:
             self.gpu_fused += 1
         if t is not None and self.merge_t is not None and t - self.merge_t < self.merge_min_s:
             return False  # the point cloud and Optimise's keyframes take one every MERGE_MIN_S at most
-        self.merge_t = t
+        self.merge_t, orb_job = t, None
         if self.gpu is not None:  # keyframe for Optimise / continuing a scan
             from .gputrack import grid_points
             self.keyframes.append((index, self.pose.copy(), grid_points(xyz), feat, marker_pts))
             if self.orb == "demand" and self.features is not None and feat is None:  # keyframes keep their ORB:
                 job = (len(self.keyframes) - 1, frame, None if scene.mode == "still" else pix, self.pose.copy())
-                if self.merger is None:  # extracted in the merge thread, in order (ORB releases the GIL)
+                if self.merge_proc is not None:  # extracted in the merge process, with this frame's merge
+                    orb_job, self.orb_slot = (job[0], job[2]), job[0]
+                elif self.merger is None:  # extracted in the merge thread, in order (ORB releases the GIL)
                     self.keyframe_orb(*job)
                 else:
                     self.orb_job = self.merger.submit(self.keyframe_orb, *job)
@@ -748,7 +796,9 @@ class Scanner:
         self.poses.append((index, self.pose.copy()))
         stats["merged"] += 1
         job = (frame, index, self.pose.copy(), pix, seg)
-        if self.merger is None:
+        if self.merge_proc is not None:
+            self.merge_proc.submit(*job, orb_job)
+        elif self.merger is None:
             self.merge(*job)
         else:  # merging runs beside tracking the next frame (numpy and Open3D release the GIL)
             self.pending.append(self.merger.submit(self.merge, *job))
@@ -764,14 +814,8 @@ class Scanner:
 
     def merge(self, frame, index, pose, pix, step=1):
         """Merge one tracked frame's object pixels (cleaned, with normals) into the cloud; `pix` sampled every
-        `step`-th pixel, each standing for its step x step block."""
-        h, w = frame["depth"].shape
-        kept = np.zeros(((h + step - 1) // step, (w + step - 1) // step), bool)  # merge these blocks
-        kept[pix[:, 1] // step, pix[:, 0] // step] = True
-        merge_frame = self.cleaned(frame, pix) if self.clean_depth == "merge" else frame
-        cxyz, crgb, cpix, cnrm = frame_points(merge_frame, self.stride, normals=True)
-        sel = kept[cpix[:, 1] // step, cpix[:, 0] // step]
-        mxyz, mrgb, mnrm = cxyz[sel], crgb[sel], cnrm[sel]
+        `step`-th pixel, each standing for its step x step block (merge_points)."""
+        mxyz, mrgb, mnrm = merge_points(frame, pix, step, self.stride, self.clean_depth == "merge")
         self.merged_data[index] = (mxyz.astype(np.float32), mrgb, mnrm.astype(np.float32))
         world = mxyz @ pose[:3, :3].T + pose[:3, 3] * 1000
         world_nrm = mnrm @ pose[:3, :3].T
@@ -781,8 +825,7 @@ class Scanner:
         if self.on_merge is not None:
             self.on_merge(index, world, mrgb, world_nrm, pose)
         if not self.stats["markers"]:
-            color = frame["color"] if "color" in frame else yuyv_to_rgb(frame["yuyv"], w, h)
-            self.stats["markers"] = [[round(x, 1), round(y, 1)] for x, y, *_ in markers.detect_half(color)]
+            self.stats["markers"] = marker_list(frame)
 
     def remerge(self, new_poses, point_mm=None):
         """Merge every merged frame again with corrected poses (dict index -> pose), e.g. after
@@ -880,10 +923,85 @@ class Scanner:
         return sc
 
     def flush(self):
-        """Wait for merges still running in the background (before reading or saving the cloud)."""
+        """Wait for merges still running in the background (before reading or saving the cloud). With a
+        merge process, the cloud and the merged frames come back here and the process ends (later
+        merges go to the thread)."""
         for job in self.pending:
             job.result()
         self.pending = []
+        if self.merge_proc is not None:
+            from .merger import CLOUD_ARRAYS
+            try:
+                arrays, merged = self.merge_proc.state()
+            except RuntimeError as e:
+                self.merge_lost(e)
+                return
+            self.merge_proc = None
+            cloud = VoxelCloud(self.cloud.point_mm)
+            for name in CLOUD_ARRAYS:
+                setattr(cloud, name, arrays[name])
+            cloud.frames, cloud.raw_points = arrays["frames"], arrays["raw_points"]
+            with self.cloud_lock:
+                self.cloud = cloud
+            self.merged_data.update(merged)
+
+    def sync_merges(self):
+        """Wait for the merges sent so far, wherever they run (the cloud stays where it is)."""
+        if self.merge_proc is not None:
+            try:
+                self.merge_proc.sync()
+                return
+            except RuntimeError as e:
+                self.merge_lost(e)
+        self.flush()
+
+    def merge_lost(self, error):
+        """The merge process went away mid-scan: what it merged is lost to the point cloud (not to the mesh,
+        which is fused again from the recording with the poses kept here); merging goes on in the thread."""
+        lost = self.merge_proc.sent
+        self.merge_proc, self.orb_slot = None, None
+        if self.merger is None:
+            import concurrent.futures
+            self.merger = concurrent.futures.ThreadPoolExecutor(1)
+        self.log(f"merge process lost ({error}): {lost} merged frames are missing from the point cloud; "
+                 "merging goes on beside tracking")
+
+    def merged_reply(self, reply):
+        """A merge done in the merge process: the cloud's counts, the markers, the keyframe's ORB."""
+        _, index, kept, raw, found, slot, feat = reply
+        self.points_kept, self.cloud.raw_points = kept, raw
+        if found and not self.stats["markers"]:
+            self.stats["markers"] = found
+        if slot is not None:
+            k = self.keyframes[slot]
+            self.keyframes[slot] = (k[0], k[1], k[2], feat, k[4])
+            self.prev_feat, self.feat_pose = feat, k[1].copy()
+
+    def cloud_points(self, min_seen=1):
+        """(xyz mm, rgb, seen) of the cloud with every merge sent so far."""
+        if self.merge_proc is not None:
+            try:
+                return self.merge_proc.points(min_seen)
+            except RuntimeError as e:
+                self.merge_lost(e)
+        with self.cloud_lock:
+            return self.cloud.points(min_seen)
+
+    def live_points(self, min_seen=1):
+        """What the 3D page shows while scanning: the cloud's points inside the object's region (output_mask,
+        no connectivity). With a merge process, its latest snapshot: a newer one is asked for, not waited on
+        (this runs on the page's thread)."""
+        if self.merge_proc is not None:
+            self.merge_proc.ask_points(min_seen)
+            pts = self.merge_proc.points_cache
+            if pts is None:
+                return np.empty((0, 3)), np.empty((0, 3), np.uint8), np.empty(0, np.int32)
+            xyz, rgb, seen = pts
+        else:
+            with self.cloud_lock:
+                xyz, rgb, seen = self.cloud.points(min_seen)
+        keep = self.output_mask(xyz, connect=False)
+        return xyz[keep], rgb[keep], seen[keep]
 
     def joint_step(self, levels, xyz, marker_pts, guess, index):
         """One frame with track.solve (shape + markers + prior), against the previous frame or the
@@ -937,6 +1055,9 @@ class Scanner:
         if self.orb_job is not None:
             self.orb_job.result()  # the last keyframe's ORB first (replays stay deterministic)
             self.orb_job = None
+        if self.merge_proc is not None and self.orb_slot is not None:
+            self.sync_merges()  # (the same, from the merge process: its replies come in order)
+            self.orb_slot = None
         feat = self.features.extract(self.features.luma_of(frame), frame["depth"],
                                      None if self.scene.mode == "still" else pix)
         if self.prev_feat is None or self.feat_pose is None:
@@ -1026,7 +1147,7 @@ class Scanner:
         if self.stats["merged"] < 2:
             return False
         if self.model_levels is None or self.stats["merged"] - self.model_at >= MODEL_EVERY:
-            self.flush()  # the model must not depend on how far background merges have got (replays match)
+            self.sync_merges()  # the model must not depend on how far background merges have got (replays match)
             xyz = self.model_points()
             if len(xyz) < 500:
                 return self.model_levels is not None
@@ -1122,17 +1243,8 @@ class Scanner:
         return (self.fuse.levels(xyz / 1000) if levels is None else levels), xyz
 
     def cleaned(self, frame, pix=None):
-        """The frame with prep.clean applied to the pixels tracking samples (every stride-th); with
-        `pix`, only inside their bounding box (plus a margin): the merge needs nothing else."""
-        s, d = self.stride, frame["depth"]
-        out = np.zeros_like(d)
-        r0, r1, c0, c1 = 0, d.shape[0], 0, d.shape[1]
-        if pix is not None and len(pix):
-            m = 8 * s
-            c0, c1 = max(0, pix[:, 0].min() - m) // s * s, min(d.shape[1], pix[:, 0].max() + m + 1)
-            r0, r1 = max(0, pix[:, 1].min() - m) // s * s, min(d.shape[0], pix[:, 1].max() + m + 1)
-        out[r0:r1:s, c0:c1:s] = prep.clean(d[r0:r1:s, c0:c1:s], s, origin=(c0, r0))
-        return dict(frame, depth=out)
+        """The frame with prep.clean applied to the pixels tracking samples (cleaned_frame)."""
+        return cleaned_frame(frame, self.stride, pix)
 
     def relock(self, levels, xyz, marker_pts=None):
         """Tracking failed: try to place the frame against the cloud so far, from the last known pose.
@@ -1144,10 +1256,10 @@ class Scanner:
         also pass the tracking solve's own checks (markers among them, which Open3D's ICP does not
         have): synth replayed with the region-seeded source re-found a box 8.3 mm off and merged it.
         """
-        if not len(self.cloud):
+        if not self.stats["merged"]:
             return False
         if self.model_merged != self.stats["merged"]:
-            self.flush()  # the model must not depend on how far background merges have got (replays match)
+            self.sync_merges()  # the model must not depend on how far background merges have got (replays match)
             self.model, self.model_merged = self.fuse.levels(self.model_points() / 1000), self.stats["merged"]
         result = self.fuse.icp(levels, self.model, self.pose)
         if result.fitness < RELOCK_FITNESS:
@@ -1170,8 +1282,7 @@ class Scanner:
     def model_points(self, min_seen=1):
         """The cloud so far without its base: what tracking matches against (the object only, as it
         was before the base was kept in the cloud)."""
-        with self.cloud_lock:
-            xyz, _, _ = self.cloud.points(min_seen)
+        xyz = self.cloud_points(min_seen)[0]
         scene = self.scene
         if scene.mode == "still" and scene.plane is not None:
             xyz = xyz[scene.height(xyz) > OBJECT_ABOVE_MM]

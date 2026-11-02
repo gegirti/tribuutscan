@@ -113,7 +113,7 @@ class LiveSource:
             key = (self.scan_id, s.stats["merged"], s.stats["tracking"], s.cue.get("flat"), self.phase,
                    id(s.cloud), s.cloud.point_mm)
             if key != self.built_key and time.time() - self.built_at >= PAYLOAD_EVERY_S:
-                xyz, rgb, seen = s.output_cloud(connect=False).points(LIVE_MIN_SEEN)  # region, base as chosen
+                xyz, rgb, seen = s.live_points(LIVE_MIN_SEEN)  # region, base as chosen
                 payload = view3d.pack_arrays(xyz @ cl.FLIP.T / 1000, rgb, seen)
                 info = {"name": self.name, "points": len(xyz), "phase": self.phase, "session": {
                     "preset": s.preset, "point_distance_mm": s.cloud.point_mm,
@@ -208,7 +208,8 @@ def run(commands, replies, port=view3d.PORT):
                     log(f"continuing {Path(continue_from).name}: show the scanner a part it has seen")
                 else:
                     source.scanner = cl.Scanner(preset, log=log, remove_base=remove_base,
-                                                track_with=tracker[0] if tracker else "gpu", live_view=True)
+                                                track_with=tracker[0] if tracker else "gpu", live_view=True,
+                                                merge_process=True)
                 source.scan_id += 1
                 source.name = f"live: {out_dir.name}"
                 source.phase, source.out_dir = "scanning", out_dir

@@ -88,6 +88,7 @@ TRACKERS = {  # name: Scanner options (the scan mode comes from the dataset)
     "gpu-p3": dict(track_with="gpu", segment_stride=2, orb="frame"),  # as Phase 3 left it
     "gpu-seg": dict(track_with="gpu", orb="frame"),  # coarse object search only
     "gpu-allmerge": dict(track_with="gpu", merge_min_s=0.0),  # merges not capped in time (before MERGE_MIN_S)
+    "gpu-proc": dict(track_with="gpu", merge_process=True),  # merged in a process of its own (the live worker's way)
     "baseline": dict(clean_depth=False, gate_refind=False, motion_dt=False, track_with="icp", mode="free"),
     "p2": dict(track_with="icp"),  # frame-to-frame ICP with P1/P2 (gate, cleanup, scan modes)
     "frame": dict(target="frame"),  # joint solve against the previous frame

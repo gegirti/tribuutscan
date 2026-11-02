@@ -1033,6 +1033,46 @@ cubes on the GPU; the CPU keeps the 6x6 solve, markers, base votes, pose graph, 
   - Next in item 3: the user prints it, measures MEASURE with calipers and scans it (close and long
     range). A tool then aligns the scan (compare.py's placement) and measures it against the sdf:
     distances, per-face offsets (step heights), best-fit scale.
+- LIVE SPEED, step 3 (2026-11-02, plan approved): the point-cloud merge and the keyframe ORB in a process of
+  their own (`merger.py`; `Scanner(merge_process=True)`, the live worker's scans; replays, evaluate and bench
+  keep the thread).
+  - The pieces:
+    - `cloud.merge_points` / `cleaned_frame` / `marker_list` are the merge's pure part, shared by both
+      paths;
+    - the process holds the VoxelCloud and merged_data and replies per merge (cubes kept, raw points,
+      markers, the keyframe slot's ORB);
+    - `Scanner.merged_reply` applies the replies;
+    - `sync_merges` waits mid-scan (relock, model_ready, orb_guess);
+    - `flush` pulls the full state at the end (save, Optimise, the mesh work unchanged);
+    - `cloud_points` gives relock a snapshot;
+    - `live_points` gives the 3D page the latest snapshot, never waited on (it runs on the page's
+      thread).
+  - FOUND 1: replays switch to the recording's depth mode only as its frames are read, after the
+    Scanner started. The process had the close law, so long-range hand frames were merged at the
+    wrong scale and tracking fell apart after its first loss (481 -> 48 tracked). Every job now
+    carries calib.CAMERA.mode.
+  - FOUND 2: the live worker is a daemonic process, and multiprocessing refuses those children: live
+    runs silently merged on the thread (the fallback logged it). Its flag is lifted around the start
+    only (`_config["daemon"]`, private, hence the fallback); the merge process ends by itself when its
+    parent goes (end of queue / parent check every 2 s).
+  - A "ready" handshake at start (60 s, else the thread). A process lost mid-scan is caught by any
+    wait or the per-frame poll: merging goes on in the thread, the lost merges are logged, and the
+    mesh is unaffected (fused from the recording with the poses kept in the tracking process).
+  - Pitfall hit: a script piped on stdin cannot spawn (the child re-runs the main script by path). The
+    test runner needs a `__main__` guard, or spawned children re-run all the tests.
+  - Equal: evaluate `gpu-proc` against `gpu` (captures/eval/20261102-155411-step3-proc2 against
+    20261102-152200-step3-thread): every metric identical on all 9 datasets. Tests compare cloud
+    arrays, merged_data, keyframe ORB, markers and poses bit for bit.
+  - Speed:
+    - in-process feed of the same 270 frames: thread 58-60 ms, process 42-43 ms, no merging 36.5 ms;
+    - bench --live on the second hand recording, alternating with edf02ae: 12.4 / 12.5 -> 15.0 /
+      15.5 fps (tracking 78 -> 63 ms a frame).
+  - End to end with the scanner (read-only, no window, through the real worker): 192 frames back in
+    16 s, the model view going grey, Stop saved (state pulled), Optimise ran, nothing left running.
+  - STILL BETWEEN LIVE AND IN-PROCESS (~20 ms a frame): the reader thread's decode (14 ms of numpy
+    beside tracking: GIL) and the frames' pickling. Next lever: send raw depth to the GPU (unpack
+    there) and to the merge process (decode there), with only a stride-4 decode for the object search
+    on the CPU.
 - LIVE SPEED, step 2 (2026-11-02, plan approved: ~/.claude/plans/happy-wobbling-journal.md).
   - Measured first, per frame, no profiler, hand frames: decode 8.1 ms; depth -> points 7.3 (6.2 of it
     a colour lookup feed never used); RANSAC table 6.9; kept-base re-fit in the masks 6.3; masks
