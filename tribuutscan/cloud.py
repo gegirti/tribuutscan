@@ -1,7 +1,8 @@
 """Merge many depth frames into one compact point cloud: the "point distance" rule real scanners use.
 
     python3 -m tribuutscan.cloud captures/<stamp>-rec [small|medium|large] [--keep-base]
-    .venv/bin/python -m tribuutscan.cloud ...      # with Open3D: tracks motion (ICP) between frames
+    .venv/bin/python -m tribuutscan.cloud ...      # with Open3D: tracks motion (on the GPU when there is one;
+                                                   # TRIBUUTSCAN_GPU=0: on the CPU)
     .venv/bin/python -m tribuutscan.cloud captures/<stamp>-rec --optimise --mesh   # then Optimise, fusion.py
 
 Space is cut into cubes of side `point distance`. Every point that lands in a cube is averaged into
@@ -411,6 +412,11 @@ def scene_transform(pose):
     return out
 
 
+def object_radius(xyz):
+    """The frame piece's size (mm, 90th percentile from its centre): turns this large are weighed as shifts."""
+    return float(np.percentile(np.linalg.norm(xyz - xyz.mean(0), axis=1), 90)) if len(xyz) else 60.0
+
+
 def turned(t):
     """(movement mm, rotation degrees) of a 4x4 rigid transform in metres."""
     return np.linalg.norm(t[:3, 3]) * 1000, np.degrees(np.arccos(np.clip((np.trace(t[:3, :3]) - 1) / 2, -1, 1)))
@@ -455,22 +461,31 @@ class Scanner:
         self.scene = Scene(mode, self.rng)
         self.stats["mode"] = mode
         from .markermap import MarkerMap
-        # "joint" (track.solve: shape + markers + motion prior, flat-face check; default), "jointnm"
-        # (joint without markers), "icp" (frame-to-frame point-to-plane, Open3D: P2), "markers" (only)
+        # "joint" (track.solve: shape + markers + motion prior, flat-face check; default), "gpu" (the same
+        # solve against a ray cast of a GPU volume: gputrack.py), "jointnm" (joint without markers), "icp"
+        # (frame-to-frame point-to-plane, Open3D: P2), "markers" (only)
         # Markers are weighted strictly (1 mm) and noisy ones are dropped inside the solve (3 sigma):
         # measured better than loose weighting (3 mm) even with the estimated colour registration,
         # where loose let marker noise pull poses off and the map drift (tilt doubling 16% vs 78%).
         # The marker check also catches sliding: on the tilt scan, poses whose shape fits well but
         # whose markers disagree are the flat-face slides; dropping the check took doubling 7% -> 26%.
         self.marker_sigma, self.marker_accept = 1.0, 2.0
+        self.gpu, self.gpu_kind = None, None  # gputrack.Tracker (made on the first frame) and its adapter
+        if track_with == "gpu":
+            from . import gputrack
+            self.gpu_kind = gputrack.kind()
+            if self.gpu_kind is None:
+                log("tracking on the CPU (no WebGPU adapter, or TRIBUUTSCAN_GPU=0)")
+                track_with = "joint"
         self.track_with, self.marker_map = track_with, MarkerMap(add_mm=3.0)
+        self.stats["tracker"] = track_with
         # joint solve against the "model" (cloud so far; default) or the previous "frame". Measured:
         # model + markers halved synthetic error (3.4 -> 1.7 mm, hard path 6.1 -> 1.5); the model
         # WITHOUT markers drifts (synthetic 25 mm): markers keep the model honest.
         self.target = target
         self.model_levels, self.model_at = None, -1
         self.features = None  # features module when OpenCV is available and use_features is on
-        if use_features and track_with in ("joint", "jointnm"):
+        if use_features and track_with in ("joint", "jointnm", "gpu"):
             try:
                 from . import features
                 self.features = features
@@ -529,13 +544,16 @@ class Scanner:
             status = "first" if self.prev is None else "tracked"
             self.prev = True
         elif fuse is not None:
-            joint = self.track_with in ("joint", "jointnm")
-            if joint:
+            joint = self.track_with in ("joint", "jointnm", "gpu")
+            if self.track_with == "gpu":
+                levels = None  # the GPU matches the frame's own maps (Open3D levels only to re-find)
+                self.gpu_source(frame, xyz, pix)
+            elif joint:
                 from . import track
                 levels = track.levels(xyz / 1000)
-                marker_pts = self.frame_markers(frame) if self.track_with == "joint" else np.empty((0, 3))
             else:
                 levels = fuse.levels(xyz / 1000)
+            marker_pts = self.frame_markers(frame) if self.track_with in ("joint", "gpu") else np.empty((0, 3))
             feat = None
             if joint and self.features is not None:  # colour features: a starting pose for big movements
                 feat = self.features.extract(self.features.luma_of(frame), frame["depth"],
@@ -558,7 +576,9 @@ class Scanner:
                 self.refind_needed, status = False, "re-found"
                 self.log(f"continuing: found my place in the saved scan at frame {index}")
             elif self.prev is not None:
-                if joint:
+                if self.track_with == "gpu":
+                    step, ok = self.gpu_step(xyz, marker_pts, guess, index)
+                elif joint:
                     step, ok = self.joint_step(levels, xyz, marker_pts, guess, index)
                 else:
                     result = fuse.icp(levels, self.prev, guess)
@@ -578,7 +598,7 @@ class Scanner:
                     self.track_log.append((index, "lost", None))
                     return False
             self.last_t, self.lost_run = t, 0
-            self.prev = levels
+            self.prev = True if levels is None else levels
             stats["tracking"] = True
             if joint and len(marker_pts):
                 self.marker_map.add(marker_pts, self.pose)
@@ -600,13 +620,18 @@ class Scanner:
             if fuse is not None and move < KEY_MOVE_MM and turn < KEY_TURN_DEG and self.since_merge < KEY_EVERY:
                 return False
         self.since_merge = 0
-        if self.prev is not None and self.prev is not True:  # keyframe for Optimise / continuing a scan
+        if self.gpu is not None:  # keyframe for Optimise / continuing a scan
+            from .gputrack import grid_points
+            self.keyframes.append((index, self.pose.copy(), grid_points(xyz), self.prev_feat, marker_pts))
+        elif self.prev is not None and self.prev is not True:
             self.keyframes.append((index, self.pose.copy(), np.asarray(self.prev[-1].points) * 1000,
                                    self.prev_feat, marker_pts if joint else np.empty((0, 3))))
         self.last_merged = self.pose.copy()
         self.poses.append((index, self.pose.copy()))
         stats["merged"] += 1
         job = (frame, index, self.pose.copy(), pix)
+        if self.gpu is not None:  # into the volume the next frame is tracked against (here, not in the merge thread)
+            self.gpu.fuse(frame, self.labels[index], self.pose)
         if self.merger is None:
             self.merge(*job)
         else:  # merging runs beside tracking the next frame (numpy and Open3D release the GIL)
@@ -748,18 +773,59 @@ class Scanner:
         from . import track
         use_model = self.target == "model" and self.model_ready()
         ref = np.eye(4) if use_model else self.pose  # the target's frame -> world
-        pairs = None
-        if len(marker_pts) and len(self.marker_map):
-            matched = self.marker_map.match_predicted(marker_pts, self.pose @ guess)
-            if matched:
-                to_ref = np.linalg.inv(scene_transform(ref))  # world (mm) -> target frame (mm)
-                dst = self.marker_map.pos[[m for _, m in matched]] @ to_ref[:3, :3].T + to_ref[:3, 3]
-                pairs = (marker_pts[[f for f, _ in matched]], dst)
-        radius = float(np.percentile(np.linalg.norm(xyz - xyz.mean(0), axis=1), 90)) if len(xyz) else 60.0
+        pairs = self.marker_pairs(marker_pts, guess, ref)
         init = self.pose @ guess if use_model else guess
         found, info = track.solve(levels, self.model_levels if use_model else self.prev, init, prior=init,
-                                  marker_pairs=pairs, radius_mm=radius, marker_sigma_mm=self.marker_sigma)
+                                  marker_pairs=pairs, radius_mm=object_radius(xyz), marker_sigma_mm=self.marker_sigma)
         step = np.linalg.inv(self.pose) @ found if use_model else found
+        return step, self.judge(index, info, step, xyz)
+
+    def gpu_step(self, xyz, marker_pts, guess, index):
+        """One frame on the GPU (gputrack: against a ray cast of the volume of merged frames, the base left
+        out by the kept plane as model_points does), with joint_step's marker pairs, prior and gates."""
+        init = self.pose @ guess
+        to_world = scene_transform(init)
+        base = None
+        if self.scene.mode == "still" and self.scene.plane is not None:
+            n, c = self.scene.plane
+            base = (n, c - OBJECT_ABOVE_MM)
+        found, info = self.gpu.solve(init, init, self.marker_pairs(marker_pts, guess, np.eye(4)), object_radius(xyz),
+                                     xyz.mean(0) @ to_world[:3, :3].T + to_world[:3, 3], base, self.marker_sigma)
+        step = np.linalg.inv(self.pose) @ found
+        return step, self.judge(index, info, step, xyz)
+
+    def gpu_source(self, frame, xyz, pix):
+        """Hand this frame's piece to the GPU tracker; the first frame makes it, its volume around this piece."""
+        if self.gpu is None:
+            from . import gputrack
+            to_world = scene_transform(self.pose)
+            self.gpu = gputrack.Tracker(CAMERA, frame["depth"].shape[::-1],
+                                        xyz.mean(0) @ to_world[:3, :3].T + to_world[:3, 3], self.gpu_kind)
+            self.log(f"tracking on the GPU: {self.gpu.engine.device_name}")
+        self.gpu.source(frame, pix, self.stride)
+
+    def close(self):
+        """Give the GPU tracker's memory back (after the last frame; the cloud and everything saved stay)."""
+        if self.gpu is not None:
+            self.stats["gpu_ms"] = self.gpu.report()
+            self.gpu.close()
+            self.gpu = None
+
+    def marker_pairs(self, marker_pts, guess, ref):
+        """(this frame's markers mm, their map positions in the target frame mm) for the markers matched
+        at the predicted pose, or None; ref: the target's frame -> world."""
+        if not len(marker_pts) or not len(self.marker_map):
+            return None
+        matched = self.marker_map.match_predicted(marker_pts, self.pose @ guess)
+        if not matched:
+            return None
+        to_ref = np.linalg.inv(scene_transform(ref))  # world (mm) -> target frame (mm)
+        dst = self.marker_map.pos[[m for _, m in matched]] @ to_ref[:3, :3].T + to_ref[:3, 3]
+        return marker_pts[[f for f, _ in matched]], dst
+
+    def judge(self, index, info, step, xyz):
+        """Note a solve's info (flat-face hint, cues) and say whether its pose is taken."""
+        from . import track
         self.track_info.append((index, info))
         flat = bool(info["degeneracy"] is not None and info["degeneracy"] < track.DEGENERATE and not info["markers_used"])
         self.stats["flat"] = self.stats.get("flat", 0) + flat
@@ -768,7 +834,7 @@ class Scanner:
         ok = (info["fitness"] >= JOINT_MIN_FITNESS and info["rmse_mm"] is not None
               and info["rmse_mm"] <= JOINT_MAX_RMSE_MM and plausible_step(step, xyz)
               and (info["marker_rmse_mm"] is None or info["marker_rmse_mm"] <= self.marker_accept))
-        return step, ok
+        return ok
 
     def model_ready(self):
         """Prepare the model target (levels of the cloud so far, world); False until it has enough points."""
@@ -819,10 +885,10 @@ class Scanner:
         """Points to re-find with. The cloud holds only the object, so in "still" mode (tracking on
         the whole scene) use the frame's object piece, not the scene."""
         if self.scene.mode != "still":
-            return levels, xyz
+            return (self.fuse.levels(xyz / 1000) if levels is None else levels), xyz
         obj = isolate_mask(all_xyz, all_pix, shape, self.rng)[0]
         if obj.sum() < 50:
-            return levels, xyz
+            return (self.fuse.levels(xyz / 1000) if levels is None else levels), xyz
         return self.fuse.levels(all_xyz[obj] / 1000), all_xyz[obj]
 
     def cleaned(self, frame, pix=None):
@@ -969,14 +1035,18 @@ class Scanner:
             self.cloud.keep(keep)
 
 
-def scan(directory, preset="small", log=print, remove_base=True):
-    """Merge a recording; returns the Scanner (its cloud, poses and stats; save() writes the result)."""
-    scanner = Scanner(preset, log, remove_base=remove_base)
+def scan(directory, preset="small", log=print, remove_base=True, track_with="gpu"):
+    """Merge a recording; returns the Scanner (its cloud, poses and stats; save() writes the result).
+    Tracks on the GPU (gputrack) when there is one, else on the CPU (track.solve)."""
+    scanner = Scanner(preset, log, remove_base=remove_base, track_with=track_with)
     scanner.add_source(Path(directory).resolve(), 0)
-    for i, frame in enumerate(fr.read_recording(directory)):
-        if scanner.feed(frame, i) and scanner.stats["merged"] % 10 == 1:
-            log(f"frame {i:4d}: merged {scanner.stats['merged']:3d}, cubes {len(scanner.cloud):7d}, "
-                f"raw points so far {scanner.cloud.raw_points:9d}")
+    try:
+        for i, frame in enumerate(fr.read_recording(directory)):
+            if scanner.feed(frame, i) and scanner.stats["merged"] % 10 == 1:
+                log(f"frame {i:4d}: merged {scanner.stats['merged']:3d}, cubes {len(scanner.cloud):7d}, "
+                    f"raw points so far {scanner.cloud.raw_points:9d}")
+    finally:
+        scanner.close()  # the GPU's memory back before Optimise and the mesh
     scanner.flush()
     return scanner
 

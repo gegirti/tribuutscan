@@ -142,7 +142,9 @@ def test_engine_matches_open3d_and_the_references():
         err = np.abs(mv[..., 3][hit] - wall(poses[1])[hit])
         # half a pixel off along the slope: the volume takes the depth of the pixel a voxel falls in
         # (rounded down, as Open3D does), 0.5 px x 0.83 mm x 0.2 = 0.083 mm on this wall
-        assert hit.mean() > 0.9 and abs(np.median(err) - 0.083) < 0.01 and err.max() < 0.2
+        # (at the rim of what was seen a sample averages only the seen voxels: a few hits up to ~0.3 mm)
+        assert hit.mean() > 0.9 and abs(np.median(err) - 0.083) < 0.01 and np.percentile(err, 99.9) < 0.2
+        assert err.max() < 0.5
         guess = poses[-1].copy()
         guess[0, 3] += 0.5
         sums = e.icp(guess, poses[1], (0, 0, 250))
@@ -207,6 +209,87 @@ def test_gpu_frame_preparation_is_fusions():
             ok = d_cpu > 0
             assert np.abs(d_cpu[ok] - d_gpu[ok]).max() < 1e-3
             assert (c_cpu[ok] != c_gpu[ok]).any(1).mean() < 0.01
+    finally:
+        calib.use(saved[0])
+        calib.use_mode(saved[1])
+
+
+def blur(depth, r, tol):
+    """numpy reference of the tracking source's blur: each depth the mean of its neighbours within r
+    pixels that lie within tol mm of it."""
+    h, w = depth.shape
+    out = np.zeros_like(depth)
+    pad = np.pad(depth, r)
+    total, count = np.zeros_like(depth), np.zeros_like(depth)
+    for dy in range(-r, r + 1):
+        for dx in range(-r, r + 1):
+            zz = pad[r + dy:r + dy + h, r + dx:r + dx + w]
+            same = (zz > 0) & (np.abs(zz - depth) < tol)
+            total += np.where(same, zz, 0)
+            count += same
+    ok = depth > 0
+    out[ok] = total[ok] / count[ok]
+    return out
+
+
+def test_the_tracking_source_and_icp_options_are_the_references():
+    """What tracking runs on the GPU equals numpy: the frame's kept cells (uncleaned, raw -> mm, onto the
+    pinhole grid), maps with wider-set normals, and the ICP sums with stride, footprint weights, reach and
+    the base left out of the model."""
+    try:
+        from tribuutscan import calib, fusion
+    except ImportError:
+        return
+    if not kinds():
+        return
+    w, h = 160, 96
+    spec = {"size": [w, h], "depth": {"fx": 150.0, "fy": 150.0, "cx": 79.5, "cy": 47.5, "dist": [0.05, -0.02, 0, 0, 0]},
+            "law": {"a_mm": 289570.0, "b": 873.4}, "window_mm": [150.0, 330.0],
+            "colour_from_depth": {"ax": 1.0, "bx": 0.0, "ay": 1.0, "by": 0.0}}
+    saved = calib.CAMERA.spec, calib.CAMERA.mode
+    try:
+        calib.use(spec)
+        cam = calib.CAMERA
+        v, u = np.mgrid[0:h, 0:w]
+        z = 240 + 0.002 * ((u - 80.0) ** 2 + (v - 48.0) ** 2) + 0.1 * u  # a tilted bowl
+        z[60:, :] = 300.0  # a floor-like step behind it
+        raw = cam.raw_from_mm(z).astype(np.float32)
+        raw[::17, ::13] = 0  # dropouts
+        keep = np.zeros((h // 2, w // 2), bool)
+        keep[5:40, 10:70] = True
+        pin = fusion.Pinhole()
+        kept = np.repeat(np.repeat(keep, 2, 0), 2, 1)
+        depth = pin(np.where(kept & (raw > 0), cam.depth_mm(np.maximum(raw, 1)), 0.0))
+        vref, nref = gpu.maps(depth, pin.K, step=2)
+        layout = gpu.Layout([-150, -100, 100], [150, 100, 400])
+        pose = np.eye(4)
+        pose[:3, 3] = [0.6, -0.4, 0.5]
+        base = (0.0, -0.2, -0.98, 0.98 * 290.0)  # n . q + c > 0: the part nearer than ~290 mm
+        options = dict(area=4 / (150.0 * 150.0 * 4.0), reach_mm=6.0, stride=2, base=base)
+        for kind in kinds():
+            e = wgpu_engine_or_none(kind).Engine(layout, pin.K, (w, h), kind, 350)
+            e.set_camera(cam, pin.index)  # no colour model: grey
+            e.fuse(pin(np.where(raw > 0, cam.depth_mm(np.maximum(raw, 1)), 0.0)), np.zeros((h, w, 3)), np.eye(4))
+            e.raycast(np.eye(4))
+            mv, mn = e.model_maps()
+            e.track_source(raw, keep, 2, normal_step=2)
+            vm, nm = e.frame_maps()
+            assert (vm[..., 3] > 0).sum() > 1500 and np.abs(vm - vref).max() < 1e-3 and np.abs(nm - nref).max() < 1e-4
+            sums = e.icp(pose, np.eye(4), (0, 0, 250), **options)
+            want = gpu.icp_sums(vref, nref, pose, mv.astype(float), mn.astype(float), np.eye(4), pin.K, (0, 0, 250),
+                                **options)
+            assert want[27] > 300 and want[31] < want[30]  # pairs, some beyond the base or out of reach
+            assert abs(sums[27] - want[27]) <= 2 and abs(sums[31] - want[31]) <= 2 and sums[30] == want[30]
+            assert np.abs(sums - want).max() < 1e-3 * np.abs(want[:27]).max()
+            e.track_source(raw, keep, 2, normal_step=2, blur_px=1, blur_mm=1.0)  # the same-surface mean
+            blurred = e.frame_maps()[0][..., 3]
+            assert np.abs(e.frame_maps()[0][..., 2] - blur(depth, 1, 1.0)).max() < 1e-3 and (blurred > 0).sum() > 1500
+            e.raycast(np.eye(4), normal_px=3)  # model normals from the hits 3 px apart, as the frame's maps
+            mv, mn = e.model_maps()
+            ok = mn[..., 3] > 0
+            want_n = gpu.maps(mv[..., 3], pin.K, step=3)[1]  # hits on the rays of the reference camera
+            assert ok.sum() > 50 and np.abs(mn[ok] - want_n[ok]).max() < 1e-3  # (needs all four neighbours hit)
+            e.close()
     finally:
         calib.use(saved[0])
         calib.use_mode(saved[1])

@@ -317,18 +317,19 @@ python3 -m tribuutscan.usbdepth [s] [--all] # 14-bit USB depth throughput check 
                                             # TRIBUUTSCAN_DEPTH=y10 forces 10-bit V4L2 depth anywhere
 python3 -m tribuutscan.markers captures/<stamp>   # find markers in a saved frame -> markers.png
 .venv/bin/python -m tribuutscan.cloud captures/<stamp>-rec [small|medium|large] [--keep-base]
-                                            # merged point cloud -> captures/<stamp>-scan/ (base removed)
+                                            # merged point cloud -> captures/<stamp>-scan/ (base removed);
+                                            # tracks on the GPU when there is one (TRIBUUTSCAN_GPU=0: CPU)
 python3 -m tribuutscan.view3d captures/<stamp>-scan    # browser 3D view at http://localhost:8765
 .venv/bin/python -m tribuutscan.optimise captures/<stamp>-scan   # loop closures + pose graph + merge again
 .venv/bin/python -m tribuutscan.session merge A-scan B-scan AB-scan   # merge two scans into one
 .venv/bin/python -m tribuutscan.calibrate board|capture [square_mm]|solve <dir> [square_mm]
                                             # ChArUco calibration -> captures/calibration.json
-.venv/bin/python -m tribuutscan.evaluate [datasets] [--label x] [--against report.json] [--mesh]
+.venv/bin/python -m tribuutscan.evaluate [datasets] [--tracker gpu] [--label x] [--against report.json] [--mesh]
                                             # tracking metrics on saved + synthetic recordings (--mesh:
                                             # also fuse, score against the true surface)
 .venv/bin/python -m tribuutscan.synth [out] [frames] [every] [hard] [--plate] [--pattern MM] [--y14]
                                             # synthetic scan, ground truth poses + true_surface.ply
-.venv/bin/python -m tribuutscan.bench [rec] [--frames N] [--label x] [--against captures/bench/<run>.json]
+.venv/bin/python -m tribuutscan.bench [rec] [--frames N] [--tracker gpu] [--label x] [--against captures/bench/<run>.json]
                                             # per-stage timing table (warm, disk apart) -> captures/bench/
 ./setup-venv.sh [dir]                       # build .venv from pyproject's "scan" extra (PYTHON=... to pick)
 .venv/bin/python -m tribuutscan.fusion captures/<stamp>-scan [--all] [--min-weight 4] [--force]
@@ -798,6 +799,60 @@ cubes on the GPU; the CPU keeps the 6x6 solve, markers, base votes, pose graph, 
     (inconclusive against another scan; the printed box decides).
   - Not done in Phase 2: S1 decode of the raw Y14/Y10 bytes and the garbled-row check stay on the CPU
     (decode_depth); GPU tracking (Phase 3) will use `raycast` / `icp` as they are.
+- PHASE 3 DONE (2026-11-02, the user asked for it "without testing": no scanner, offline data only):
+  tracking on the GPU. `gputrack.py` (Tracker: its own volume; `kind()`), Scanner track_with="gpu"
+  (`gpu_source`, `gpu_step`, `close()`; `judge` and `marker_pairs` now shared with joint_step), track.py's
+  solve split (`prior_weights`, `pose_terms`, `gauss_newton`, `summary`; CPU results identical: evaluate
+  equal to 1e-14), evaluate / bench `--tracker gpu`. cloud.py (so the viewer's `m`) tracks on the GPU
+  when there is one; the live worker and restored / continued scans stay on the CPU tracker (Phase 4;
+  session.refind needs Open3D levels). session.json notes "tracker" and "gpu_ms".
+  - Contract kept: source = the frame's centre piece (isolate_mask), uncleaned, on the pinhole grid
+    (kernel prep_source: raw -> mm where the stride-2 cells are kept, through the Pinhole lookup); model
+    = ray cast from the predicted pose of a volume of the MERGED frames, fused as for the mesh
+    (fuse_frame: cleaned, labels; colour grey without YUYV or a colour model), the base left out in the
+    ICP kernel by the kept plane (height <= 3 mm); markers, prior, LM, gates, ORB start and the Open3D
+    re-find unchanged; the VoxelCloud is still merged (doubling stays measurable, outputs unchanged).
+  - The solve: gputrack.LEVELS = fuse.ICP_LEVELS (reach 30/12/6 mm), source stride 4/2/1, track's
+    iterations; the GPU sums J about the object's centre (float32 stays accurate), the CPU turns them
+    into track.solve's origin-based twist and adds markers + prior. Each pixel weighs its footprint
+    z^2 / (fx fy) over the level's voxel area: the shape term ends up with about half the CPU's
+    information (projected, not surface area; normal gate), and the flat-face count is the same (12 on
+    the marker recording), so DEGENERATE and the fitness limits stay.
+  - Kernel changes: params 336 bytes (trk: footprint scale, reach, normal step, stride; base plane);
+    ICP_VALUES 32 (+ frame pixels, matched pixels; sum r^2 unweighted for the RMSE; 16 kB of work-group
+    memory, WebGPU's guaranteed limit); maps' normal step; set_camera works without a colour model.
+  - FOUND: after ONE fused frame the ray cast hit only 58% of it: prep.clean's edge-on test (+-1 px)
+    drops scattered pixels on noisy depth, erosion widens the holes, and the ray cast wanted all 8 voxels
+    seen. Samples now average the seen voxels when they hold >= half the trilinear weight: 100% (the
+    Phase 2 wall test: 99.9% within 0.2 mm, max 0.28 at the rim). Tracking volume truncation 3 mm
+    (gputrack.TRUNC_VOXELS 6; the mesh keeps 1.5): plate ATE 6.8 mm, 2 mm 19, 1.5 mm 36.
+  - Results (evaluate --tracker gpu --against the separation run, captures/eval/20261102-032851-phase3-gpu-final):
+    markers 581 tracked, 0 jumps, doubled 0.0001, marker scatter 0.947 -> 0.929 mm, keyframe scatter
+    0.868 -> 0.78, re-finds 2 -> 1; ATE synth 1.14 -> 0.37, synth7 1.27 -> 0.34, synthhard 0.93 -> 0.40,
+    synthfp 0.55 -> 0.34 mm: every Phase 3 mark met (the full-rate recording does not exist yet).
+    End to end on the marker recording (replay + Optimise + mesh, 12 seeds vs Creality): 222 s (was 314),
+    largest Optimise correction 4.1 -> 3.4 mm; cloud 98.5% on the part, 0.235 / 0.570 mm, 66.6 / 69.1%;
+    mesh 0.083 / 0.346 mm, 66.2 / 68.7% (separation run 0.236 / 0.576, 66.5 / 68.9; mesh 0.090 / 0.340,
+    66.1 / 68.5): the same. bench (captures/bench/20261102-024423-gpu-tracking-nostamps.json): 189 ms a
+    frame (259); GPU tracking step 20.6 (frame maps 3.1, ray cast 8.3 wall, ICP 8.5 for 9.2 passes, fuse
+    1.3; in evaluate's run ICP 10.1 for 9.4: the 10 ms mark is met only just, by wall clock);
+    alone a pass is 0.41-0.47 ms and the ray cast 2.7 ms, the rest is waiting on the GIL beside the
+    merge thread. Engine(timestamps=False) for tracking: each timestamped submission read the stamps
+    back (0.2 ms a pass). The CPU stages left (object piece 30, markers 25, ORB 37, base masks 24 ms)
+    are Phase 4's.
+  - OPEN: the thin plate (synthplate): while it holds the GPU is far closer (0.1-0.2 mm at the plate's
+    centre over frames 0-44, the CPU 0.2-1.1), but twice (frames 38, 48) a marker-map entry 2.9 mm off
+    made the marker check reject a correct pose (0.44 / 0.32 mm from the truth), the Open3D re-find then
+    took one 2.4 mm off, and at the edge-on turn (frames 78-89, the far face new surface) the re-finds
+    were up to 12 mm off and were merged: 157 tracked, ATE 6.8 (CPU 6.3), cloud 56% on the object (CPU
+    90%). Neither tracker holds that turn; markers on both faces are the way.
+  - OPEN: the sensor's fixed per-pixel error (synthfp): the GPU drifts ~0.7 mm over its first 16 frames
+    and keeps that offset (the CPU 0.13), so the cloud's p90 to the true surface is 0.70 mm (CPU 0.33);
+    with 0.05 mm noise and no fixed error the GPU is the better one (0.18 vs 0.23 mm). Not the
+    iterations (converged), not the frame normals' step, not the balance (the GPU's shape weighs less).
+    Measured, off by default (gputrack constants): depth blur in frame and fused frames 3 px -> p90 0.63;
+    model normals from ray-cast hits 8 px apart -> 0.42 but the noisy box 0.37 -> 1.74 mm. The real
+    marker recording (Y10) shows nothing of it; the full-rate Y14 recording (0.7) will say.
 
 ## The person you are working with
 

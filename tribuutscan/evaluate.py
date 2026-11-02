@@ -76,6 +76,7 @@ def cached_markers(name, directory):
 
 TRACKERS = {  # name: Scanner options (the scan mode comes from the dataset)
     "current": {},
+    "gpu": dict(track_with="gpu"),  # the joint solve against a ray cast of a GPU volume (gputrack.py, Phase 3)
     "baseline": dict(clean_depth=False, gate_refind=False, motion_dt=False, track_with="icp", mode="free"),
     "p2": dict(track_with="icp"),  # frame-to-frame ICP with P1/P2 (gate, cleanup, scan modes)
     "frame": dict(target="frame"),  # joint solve against the previous frame
@@ -160,6 +161,7 @@ def _run(name, tracker, preset, live_markers, optimise_after, mesh=False):
                 if loc is not None:
                     sightings.append(loc[0] @ pose[:3, :3].T + pose[:3, 3] * 1000)
     scanner.flush()
+    scanner.close()
     opt_report = None
     if optimise_after:
         from . import optimise
@@ -175,6 +177,7 @@ def _run(name, tracker, preset, live_markers, optimise_after, mesh=False):
         "frames": n, "tracked": len(tracked), "merged": scanner.stats["merged"],
         "lost": scanner.stats["lost"], "relocked": scanner.stats["relocked"],
         "ms_per_frame": round(1000 * elapsed / max(n, 1), 1),
+        "gpu_ms": scanner.stats.get("gpu_ms"),
         "points": int(len(xyz)),
         "pose_jumps": metrics.pose_jumps(tracked, centre),
         "flat_frames": scanner.stats.get("flat", 0),

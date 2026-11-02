@@ -32,7 +32,9 @@ NORMAL_GATE = 0.866  # ICP: frame and model normals within 30 degrees
 RAY_MIN_WEIGHT = 1.0  # ray cast: voxels seen at least this often
 RAY_STEPS = 1024
 ICP_GROUPS = 256  # work-groups of the ICP sums; each writes ICP_VALUES partial sums
-ICP_VALUES = 30  # 21 of the 6x6 J^T W J (upper triangle, row by row), 6 of J^T W r, count, sum w, sum w r^2
+ICP_VALUES = 32  # 21 of the 6x6 J^T W J (upper triangle, row by row), 6 of J^T W r, then: pairs used, sum w,
+                 # sum r^2 of those pairs, frame pixels taking part, pixels matched to the model (within reach)
+PARAMS_BYTES = 336
 
 
 class Layout:
@@ -82,19 +84,24 @@ def pose_mm(pose_m):
 
 
 def params(layout, K, size, pose=np.eye(4), ref_inv=np.eye(4), centre=(0, 0, 0), frame=0, far_mm=1000.0,
-           near_mm=50.0, min_weight=RAY_MIN_WEIGHT, limit=MAX_VISIBLE):
-    """The parameter block every kernel reads (304 bytes; matrices column by column)."""
+           near_mm=50.0, min_weight=RAY_MIN_WEIGHT, limit=MAX_VISIBLE, tukey=TUKEY_MM, gate=NORMAL_GATE,
+           area=0.0, reach_mm=1e9, normal_step=1, stride=1, base=(0.0, 0.0, 0.0, 1.0)):
+    """The parameter block every kernel reads (PARAMS_BYTES; matrices column by column). ICP (icp_sums):
+    tukey, gate, area (pixel footprint scale), reach_mm, stride, base; maps and model normals:
+    normal_step; ray cast: min_weight."""
     pose = np.asarray(pose, np.float64)
     mats = [pose, np.linalg.inv(pose), np.asarray(ref_inv, np.float64)]
     w, h = size
     out = b"".join(np.ascontiguousarray(m.T, np.float32).tobytes() for m in mats)
     out += struct.pack("<4f", K[0, 0], K[1, 1], K[0, 2], K[1, 2])
     out += struct.pack("<4f", *layout.origin, layout.voxel_mm)
-    out += struct.pack("<4f", layout.trunc_mm, near_mm, far_mm, TUKEY_MM)
-    out += struct.pack("<4f", *centre, NORMAL_GATE)
+    out += struct.pack("<4f", layout.trunc_mm, near_mm, far_mm, tukey)
+    out += struct.pack("<4f", *centre, gate)
     out += struct.pack("<4f", min_weight, 0.8, RAY_STEPS, 0)
     out += struct.pack("<4I", *layout.dims, layout.capacity)
     out += struct.pack("<4I", w, h, frame, limit)
+    out += struct.pack("<4f", area, reach_mm, normal_step, stride)
+    out += struct.pack("<4f", *base)
     return out
 
 
@@ -107,22 +114,24 @@ def rays(K, size):
     return np.stack([(u - K[0, 2]) / K[0, 0], (v - K[1, 2]) / K[1, 1], np.ones_like(u)], -1)
 
 
-def maps(depth, K):
+def maps(depth, K, step=1):
     """Vertex and normal maps of a depth image (mm): (H, W, 4) each, w = 1 where valid. Normals from the
-    four neighbours (cross product of the horizontal and vertical central differences, as
-    cloud.pixel_normals), facing the camera; none at the border or next to a pixel without depth."""
+    four neighbours `step` pixels away (cross product of the horizontal and vertical central
+    differences, as cloud.pixel_normals), facing the camera; none at the border or next to a pixel
+    without depth."""
     h, w = depth.shape
+    k = step
     d = np.asarray(depth, np.float64)
     v = rays(K, (w, h)) * d[..., None]
     ok = d > 0
     vmap = np.concatenate([np.where(ok[..., None], v, 0), ok[..., None].astype(np.float64)], -1)
     nmap = np.zeros((h, w, 4))
     inner = np.zeros_like(ok)
-    inner[1:-1, 1:-1] = ok[1:-1, 1:-1] & ok[1:-1, 2:] & ok[1:-1, :-2] & ok[2:, 1:-1] & ok[:-2, 1:-1]
+    inner[k:-k, k:-k] = ok[k:-k, k:-k] & ok[k:-k, 2 * k:] & ok[k:-k, :-2 * k] & ok[2 * k:, k:-k] & ok[:-2 * k, k:-k]
     dx = np.zeros_like(v)
     dy = np.zeros_like(v)
-    dx[1:-1, 1:-1] = v[1:-1, 2:] - v[1:-1, :-2]
-    dy[1:-1, 1:-1] = v[2:, 1:-1] - v[:-2, 1:-1]
+    dx[k:-k, k:-k] = v[k:-k, 2 * k:] - v[k:-k, :-2 * k]
+    dy[k:-k, k:-k] = v[2 * k:, k:-k] - v[:-2 * k, k:-k]
     n = np.cross(dx, dy)
     length = np.linalg.norm(n, axis=-1)
     good = inner & (length > 0)
@@ -134,16 +143,23 @@ def maps(depth, K):
     return vmap, nmap
 
 
-def icp_sums(vcur, ncur, pose, vref, nref, ref_inv, K, centre):
+def icp_sums(vcur, ncur, pose, vref, nref, ref_inv, K, centre, tukey=TUKEY_MM, gate=NORMAL_GATE, area=0.0,
+             reach_mm=1e9, stride=1, base=(0.0, 0.0, 0.0, 1.0)):
     """The ICP sums (ICP_VALUES, float64) of a frame's maps (camera) against a ray-cast model's maps
     (world, seen from the reference camera; world -> reference camera = ref_inv), the frame placed at
-    `pose` (camera -> world, mm). Each frame pixel is matched to the model pixel it projects to; the
-    residual is the model normal's distance r = n . (p - q), weighted (1 - (r / TUKEY_MM)^2)^2 inside
-    TUKEY_MM, with normals agreeing within NORMAL_GATE. J = ((p - centre) x n, n): a small twist
-    (rotation about `centre`, then translation) moves r by J . twist."""
+    `pose` (camera -> world, mm). Every `stride`-th frame pixel each way takes part; each is matched to
+    the model pixel it projects to, if that model point is above `base` (n . q + c > 0: the base
+    plane, raised by what counts as base) and within `reach_mm`. The residual is the model normal's
+    distance r = n . (p - q), used inside `tukey` with normals agreeing within `gate` (cos) and
+    weighted (1 - (r / tukey)^2)^2 (1 - (|p - q| / reach)^2)^2, times the pixel's footprint
+    z^2 * area when `area` > 0 (so a surface weighs the same seen near or far, densely or sparsely
+    sampled). J = ((p - centre) x n, n): a small twist (rotation about `centre`, then translation)
+    moves r by J . twist."""
     h, w = vcur.shape[:2]
-    ok = vcur[..., 3].ravel() > 0
-    pc, nc = vcur.reshape(-1, 4)[ok, :3], ncur.reshape(-1, 4)[ok]
+    sel = np.zeros((h, w), bool)
+    sel[::stride, ::stride] = True
+    ok = (vcur[..., 3] > 0) & (ncur[..., 3] > 0) & sel
+    pc, nc = vcur[ok][:, :3], ncur[ok]
     R, t = pose[:3, :3], pose[:3, 3]
     p = pc @ R.T + t
     q = p @ ref_inv[:3, :3].T + ref_inv[:3, 3]
@@ -154,18 +170,23 @@ def icp_sums(vcur, ncur, pose, vref, nref, ref_inv, K, centre):
     inside = front & (u >= 0) & (u <= w - 1) & (v >= 0) & (v <= h - 1)
     j = np.where(inside, v * w + u, 0).astype(np.int64)
     qr, nr = vref.reshape(-1, 4)[j], nref.reshape(-1, 4)[j]
+    base = np.asarray(base, np.float64)
+    reach = ((p - qr[:, :3]) ** 2).sum(1) / reach_mm ** 2
+    matched = inside & (qr[:, 3] > 0) & (nr[:, 3] > 0) & (qr[:, :3] @ base[:3] + base[3] > 0) & (reach < 1)
     ncw = nc[:, :3] @ R.T
-    keep = inside & (qr[:, 3] > 0) & (nr[:, 3] > 0) & (nc[:, 3] > 0) & ((ncw * nr[:, :3]).sum(1) >= NORMAL_GATE)
+    keep = matched & ((ncw * nr[:, :3]).sum(1) >= gate)
     r = (nr[:, :3] * (p - qr[:, :3])).sum(1)
-    keep &= np.abs(r) < TUKEY_MM
+    keep &= np.abs(r) < tukey
+    wgt = (1 - (r[keep] / tukey) ** 2) ** 2 * (1 - reach[keep]) ** 2
+    if area > 0:
+        wgt = wgt * pc[keep, 2] ** 2 * area
     p, n, r = p[keep], nr[keep, :3], r[keep]
-    wgt = (1 - (r / TUKEY_MM) ** 2) ** 2
     J = np.concatenate([np.cross(p - np.asarray(centre), n), n], 1)
     A = (J[:, :, None] * J[:, None, :] * wgt[:, None, None]).sum(0)
     out = np.zeros(ICP_VALUES)
     out[:21] = A[np.triu_indices(6)]
     out[21:27] = (J * (wgt * r)[:, None]).sum(0)
-    out[27:] = len(r), wgt.sum(), (wgt * r * r).sum()
+    out[27:] = len(r), wgt.sum(), (r * r).sum(), len(pc), matched.sum()
     return out
 
 

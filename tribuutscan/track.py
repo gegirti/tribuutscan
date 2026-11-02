@@ -70,9 +70,7 @@ def solve(source, target, init, prior=None, marker_pairs=None, radius_mm=60.0, m
     Returns (transform, info) with info: fitness, rmse_mm, degeneracy, markers_used, marker_rmse_mm.
     """
     t = init.copy()
-    w_prior = None
-    if prior is not None:
-        w_prior = np.r_[np.full(3, 1 / np.radians(PRIOR_DEG) ** 2), np.full(3, 1 / PRIOR_MM ** 2)]
+    w_prior = prior_weights(prior)
     last = None  # (h_shape, residuals, n correspondences, n source points, markers used, marker residuals)
     for level, ((voxel, max_dist), src, tgt, iters) in enumerate(zip(fuse.ICP_LEVELS, source, target, ITERATIONS)):
         gate_mm = (MARKER_GATE_SIGMAS[0] if level < len(ITERATIONS) - 1 else MARKER_GATE_SIGMAS[1]) * marker_sigma_mm
@@ -92,42 +90,69 @@ def solve(source, target, init, prior=None, marker_pairs=None, radius_mm=60.0, m
             j = np.c_[np.cross(x, n), n]  # d r / d(rotation rad, translation mm), left perturbation
             h_shape = (j * w[:, None]).T @ j
             h, g = h_shape.copy(), (j * (w * r)[:, None]).sum(0)
-            used, mres = 0, None
-            if marker_pairs is not None and len(marker_pairs[0]):
-                m = marker_pairs[0] @ t[:3, :3].T + t[:3, 3] * 1000
-                rm = m - marker_pairs[1]
-                ok = np.linalg.norm(rm, axis=1) < gate_mm
-                for xm, res in zip(m[ok], rm[ok]):
-                    jm = np.c_[-hat(xm), np.eye(3)]
-                    h += jm.T @ jm / marker_sigma_mm ** 2
-                    g += jm.T @ res / marker_sigma_mm ** 2
-                used, mres = int(ok.sum()), rm[ok]
-            if w_prior is not None:
-                d = np.linalg.inv(prior) @ t
-                e = np.r_[log_rot(d[:3, :3]), d[:3, 3] * 1000]
-                h += np.diag(w_prior)
-                g += w_prior * e
+            used, mres = pose_terms(t, h, g, marker_pairs, gate_mm, marker_sigma_mm, prior, w_prior)
             centre = x.mean(0)  # shape information about the object's centre, for the degeneracy measure
             jc = np.c_[np.cross(x - centre, n), n]
             last = ((jc * w[:, None]).T @ jc, r, len(corr), len(p), used, mres)
-            h += np.eye(6) * 1e-9 * max(np.trace(h), 1e-9)  # Levenberg-Marquardt damping: stays defined on a flat face
-            xi = -np.linalg.solve(h, g)
-            t = exp_se3(xi) @ t
-            if np.linalg.norm(xi[:3]) < 2e-5 and np.linalg.norm(xi[3:]) < 5e-3:  # < 0.005 mm / 0.001 deg
+            t, done = gauss_newton(t, h, g)
+            if done:
                 break
     return t, summarise(last, radius_mm)
+
+
+def prior_weights(prior):
+    """Diagonal weights of the motion prior (rotation rad, translation mm), or None without a prior."""
+    if prior is None:
+        return None
+    return np.r_[np.full(3, 1 / np.radians(PRIOR_DEG) ** 2), np.full(3, 1 / PRIOR_MM ** 2)]
+
+
+def pose_terms(t, h, g, marker_pairs, gate_mm, marker_sigma_mm, prior, w_prior):
+    """Add the marker terms and the motion prior at pose `t` to the shape's normal equations h, g (in
+    place; origin-based twist, as `solve`); returns (markers used, their residuals mm)."""
+    used, mres = 0, None
+    if marker_pairs is not None and len(marker_pairs[0]):
+        m = marker_pairs[0] @ t[:3, :3].T + t[:3, 3] * 1000
+        rm = m - marker_pairs[1]
+        ok = np.linalg.norm(rm, axis=1) < gate_mm
+        for xm, res in zip(m[ok], rm[ok]):
+            jm = np.c_[-hat(xm), np.eye(3)]
+            h += jm.T @ jm / marker_sigma_mm ** 2
+            g += jm.T @ res / marker_sigma_mm ** 2
+        used, mres = int(ok.sum()), rm[ok]
+    if w_prior is not None:
+        d = np.linalg.inv(prior) @ t
+        e = np.r_[log_rot(d[:3, :3]), d[:3, 3] * 1000]
+        h += np.diag(w_prior)
+        g += w_prior * e
+    return used, mres
+
+
+def gauss_newton(t, h, g):
+    """One damped step of the joint solve from `t`: (new t, converged)."""
+    h += np.eye(6) * 1e-9 * max(np.trace(h), 1e-9)  # Levenberg-Marquardt damping: stays defined on a flat face
+    xi = -np.linalg.solve(h, g)
+    return exp_se3(xi) @ t, bool(np.linalg.norm(xi[:3]) < 2e-5 and np.linalg.norm(xi[3:]) < 5e-3)  # < 0.005 mm / 0.001 deg
 
 
 def summarise(last, radius_mm):
     """Fitness, RMSE, degeneracy and marker use from the final iteration."""
     if last is None:
-        return {"fitness": 0.0, "rmse_mm": None, "degeneracy": None, "markers_used": 0, "marker_rmse_mm": None}
+        return summary(None, None, 0.0, 0, None, radius_mm)
     h_shape, r, n_corr, n_src, used, mres = last
+    inl = np.abs(r) < TUKEY_MM
+    return summary(h_shape, float(np.sqrt(np.mean(r[inl] ** 2))) if inl.any() else None, n_corr / max(n_src, 1),
+                   used, mres, radius_mm)
+
+
+def summary(h_shape, rmse_mm, fitness, used, mres, radius_mm):
+    """track.solve's info: fitness, RMSE, degeneracy (from the shape information h_shape about the
+    object's centre) and marker use."""
+    if h_shape is None:
+        return {"fitness": fitness, "rmse_mm": None, "degeneracy": None, "markers_used": 0, "marker_rmse_mm": None}
     scale = np.diag([1 / radius_mm] * 3 + [1.0] * 3)  # rotation as displacement at the object's edge
     ev = np.linalg.eigvalsh(scale @ h_shape @ scale)
-    inl = np.abs(r) < TUKEY_MM
-    return {"fitness": n_corr / max(n_src, 1),
-            "rmse_mm": float(np.sqrt(np.mean(r[inl] ** 2))) if inl.any() else None,
+    return {"fitness": fitness, "rmse_mm": rmse_mm,
             "degeneracy": float(max(ev[0], 0) / ev[-1]) if ev[-1] > 0 else 0.0,
             "markers_used": used,
             "marker_rmse_mm": float(np.sqrt(np.mean(np.sum(mres ** 2, 1)))) if used else None}

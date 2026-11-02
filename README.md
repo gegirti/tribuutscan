@@ -279,6 +279,17 @@ The IR projector turns on by itself when the IR stream is opened.
   One thing found on the way: Open3D takes each voxel's depth from the pixel it falls in rounded down,
   half a pixel off along every slope (on a synthetic sphere 0.057 mm median from the true surface);
   the GPU engine takes the nearest pixel (0.018 mm).
+- **Tracking on the GPU** (`gputrack.py`): each frame is matched against a view of the scan's own
+  volume rendered on the GPU from where the scanner is expected to be (KinectFusion's way), with the
+  markers, the motion guess and the checks of the CPU tracker. On synthetic scans with known motion
+  the camera path is 2-3 times closer to the truth (0.34-0.40 mm against 0.55-1.27 mm). On the marker
+  recording every frame is tracked, the markers agree better (0.93 mm scatter, was 0.95), and the
+  cloud and mesh score the same against Creality's scan, while the whole run (tracking, Optimise,
+  mesh) takes 222 s instead of 314. Replays (`cloud.py`, the viewer's `m`) use it when there is a GPU;
+  live scanning still tracks on the CPU until it is tried with the scanner. Two weak spots, both
+  measured on synthetic data: a 1.8 mm plate seen edge-on (neither tracker holds that turn), and a fixed
+  per-pixel depth error like the sensor's, which lets the GPU's estimate drift about 0.7 mm in the first
+  frames (the CPU's 0.13). A full-rate 14-bit recording will show whether the real sensor does that.
 
 ## Layout
 
@@ -292,7 +303,7 @@ The IR projector turns on by itself when the IR stream is opened.
   `markers.py` + `markermap.py`, `scene.py` (table plane, object region), `prep.py` (depth cleanup),
   `optimise.py` (loop closures, pose graph), `session.py` (continue or merge scans),
   `fusion.py` (the mesh: frames fused into a TSDF volume), `gpu.py` + `gpu_wgpu.py` (the volume on
-  the GPU), `gpucheck.py` (a GPU self-check), `bakeoff.py` (how the GPU engine was chosen), `fuse.py`
+  the GPU), `gputrack.py` (tracking against it), `gpucheck.py` (a GPU self-check), `bakeoff.py` (how the GPU engine was chosen), `fuse.py`
   (ICP helpers)
 - Camera: `calib.py` (the camera model), `calibrate.py` (board calibration)
 - Measuring: `evaluate.py` + `metrics.py` (tracking scores on saved and synthetic recordings),
@@ -314,7 +325,7 @@ Next up:
       CPU fallback), so it runs for everyone.
   - [x] the engine, chosen by measuring WebGPU against OpenCL: WebGPU (`wgpu`)
   - [x] meshes on the GPU: frame preparation, fusion, marching cubes (a scan's mesh in seconds)
-  - [ ] tracking against the fused model on the GPU
+  - [x] tracking against the fused model on the GPU (replays; live after a session with the scanner)
   - [ ] live scanning at full rate
 - [ ] **Crop in the 3D view**: for what touches the object (a stand, a cable), which object
       separation keeps.
@@ -380,12 +391,12 @@ Want to help? Plug your scanner in and send the output of `lsusb` and
 `for d in /sys/class/video4linux/video*; do echo "$d $(cat $d/name)"; done`, then try
 `python3 -m tribuutscan.viewer` and tell us which streams you get.
 
-**GPU**: meshes are fused on the GPU through WebGPU (`wgpu`), which runs on the graphics driver your
-system already has: Vulkan on Linux (Mesa's drivers for Intel, AMD and NVIDIA via nouveau come with a
-stock Ubuntu desktop; NVIDIA's own driver has Vulkan too), DirectX 12 / Vulkan on Windows, Metal on
-macOS. No CUDA, ROCm or driver upgrade is needed. Without a usable GPU it falls back to the CPU (Mesa's
-llvmpipe, or Open3D). Tested only on an Intel Arc A750 (Mesa 25.2) and on llvmpipe. **Have an AMD or
-NVIDIA card, or another Intel one?** No scanner needed:
+**GPU**: meshes are fused and recordings tracked on the GPU through WebGPU (`wgpu`), which runs on
+the graphics driver your system already has: Vulkan on Linux (Mesa's drivers for Intel, AMD and NVIDIA
+via nouveau come with a stock Ubuntu desktop; NVIDIA's own driver has Vulkan too), DirectX 12 / Vulkan
+on Windows, Metal on macOS. No CUDA, ROCm or driver upgrade is needed. Without a usable GPU it falls
+back to the CPU (Mesa's llvmpipe, or Open3D and the CPU tracker). Tested only on an Intel Arc A750
+(Mesa 25.2) and on llvmpipe. **Have an AMD or NVIDIA card, or another Intel one?** No scanner needed:
 
 ```
 ./setup-venv.sh && .venv/bin/python -m tribuutscan.gpucheck --out gpucheck.json

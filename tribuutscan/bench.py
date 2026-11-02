@@ -1,6 +1,6 @@
 """Time each stage of the scanning pipeline on a recording; compare runs.
 
-    .venv/bin/python -m tribuutscan.bench [recording] [--frames N] [--label x] [--against captures/bench/<run>.json]
+    .venv/bin/python -m tribuutscan.bench [recording] [--frames N] [--tracker gpu] [--label x] [--against captures/bench/<run>.json]
 
 The recording (default: the marker recording, evaluate's "markers") is replayed through cloud.Scanner
 as cloud.py does. Per stage: calls, ms per call and ms per frame, wall clock. Stages are timed
@@ -35,7 +35,7 @@ WARMUP = 10
 
 def stages():
     """(owner, attribute, label) of every timed step, in pipeline order."""
-    from . import features, fuse, scene, track
+    from . import features, fuse, gputrack, scene, track
     return [
         (cl.Scanner, "feed", "frame (all of feed)"),
         (cl, "frame_points", "depth -> points"),
@@ -49,6 +49,10 @@ def stages():
         (fuse, "levels", "model levels"),
         (cl.Scanner, "joint_step", "tracking step"),
         (track, "solve", "solve"),
+        (cl.Scanner, "gpu_source", "GPU: frame maps"),
+        (cl.Scanner, "gpu_step", "GPU: tracking step"),
+        (gputrack.Tracker, "solve", "GPU: solve (ray cast + ICP)"),
+        (gputrack.Tracker, "fuse", "GPU: fuse"),
         (cl.Scanner, "relock", "re-find"),
         (scene.Scene, "observe", "base: observe"),
         (scene.Scene, "masks", "base: masks"),
@@ -141,9 +145,10 @@ def machine():
     return {"system": platform.platform(), "cpu": cpu, "threads": os.cpu_count(), **versions}
 
 
-def run(directory, frames=None, log=print):
-    """Replay a recording with the stages timed; returns the report (dict)."""
-    scanner = cl.Scanner("small", log=lambda m: None)
+def run(directory, frames=None, log=print, tracker="joint"):
+    """Replay a recording with the stages timed; returns the report (dict). tracker: "joint" (the CPU
+    solve) or "gpu" (gputrack)."""
+    scanner = cl.Scanner("small", log=lambda m: None, track_with=tracker)
     reading, measured, n = 0.0, 0, 0
     with StageTimer(stages()) as timer:
         source = fr.read_recording(directory)
@@ -161,6 +166,7 @@ def run(directory, frames=None, log=print):
             if n % 100 == 0:
                 log(f"frame {n}")
         scanner.flush()
+    scanner.close()
     per_frame = max(measured, 1)
     rows = []
     for _, _, label in stages():
@@ -171,6 +177,7 @@ def run(directory, frames=None, log=print):
                              "ms_per_frame": round(1000 * timer.seconds[key] / per_frame, 2)})
     return {
         "recording": str(Path(directory).resolve()), "frames": n, "measured": measured, "warmup": WARMUP,
+        "tracker": scanner.track_with, "gpu_ms": scanner.stats.get("gpu_ms"),
         "camera": {"source": calib.CAMERA.source, "fingerprint": calib.CAMERA.fingerprint()},
         "tracked": sum(p is not None for _, _, p in scanner.track_log), "merged": scanner.stats["merged"],
         "read_ms_per_frame": round(1000 * reading / per_frame, 2),
@@ -200,7 +207,7 @@ def show(report, against=None):
 def main():
     args = sys.argv[1:]
     opt = lambda name, default=None: args[args.index(name) + 1] if name in args else default
-    values = {opt(f) for f in ("--frames", "--label", "--against")}
+    values = {opt(f) for f in ("--frames", "--label", "--against", "--tracker")}
     paths = [a for a in args if not a.startswith("--") and a not in values]
     if paths:
         directory = Path(paths[0])
@@ -209,7 +216,7 @@ def main():
         directory = dataset_path("markers")
     frames = int(opt("--frames")) if opt("--frames") else None
     against = json.loads(Path(opt("--against")).read_text()) if opt("--against") else None
-    report = run(directory, frames)
+    report = run(directory, frames, tracker=opt("--tracker", "joint"))
     show(report, against)
     BENCH.mkdir(parents=True, exist_ok=True)
     out = BENCH / f"{time.strftime('%Y%m%d-%H%M%S')}-{opt('--label', 'run')}.json"

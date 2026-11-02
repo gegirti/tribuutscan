@@ -24,6 +24,8 @@ struct Params {
   ray: vec4<f32>,   // ray cast: min weight, step factor, max steps
   dims: vec4<u32>,  // bricks x, y, z, pool capacity
   img: vec4<u32>,   // width, height, frame id, max visible bricks
+  trk: vec4<f32>,   // ICP: pixel footprint scale (0: none), reach mm, maps: normal step px; ICP: pixel stride
+  base: vec4<f32>,  // ICP: model points with dot(base.xyz, q) + base.w <= 0 are the base, left out
 }
 @group(0) @binding(0) var<uniform> P: Params;
 const EMPTY: u32 = 0xffffffffu;
@@ -56,11 +58,12 @@ fn main(@builtin(global_invocation_id) g: vec3<u32>) {
   let p = vertex(g.x, g.y);
   vmap[i] = p;
   var n = vec4<f32>(0.0);
-  if (p.w > 0.0 && g.x > 0u && g.y > 0u && g.x + 1u < w && g.y + 1u < h) {
-    let r = vertex(g.x + 1u, g.y);
-    let l = vertex(g.x - 1u, g.y);
-    let dn = vertex(g.x, g.y + 1u);
-    let up = vertex(g.x, g.y - 1u);
+  let k = max(u32(P.trk.z), 1u);  // neighbours this many pixels away
+  if (p.w > 0.0 && g.x >= k && g.y >= k && g.x + k < w && g.y + k < h) {
+    let r = vertex(g.x + k, g.y);
+    let l = vertex(g.x - k, g.y);
+    let dn = vertex(g.x, g.y + k);
+    let up = vertex(g.x, g.y - k);
     if (r.w * l.w * dn.w * up.w > 0.0) {
       var m = cross(r.xyz - l.xyz, dn.xyz - up.xyz);
       let len = length(m);
@@ -191,7 +194,7 @@ fn voxel(vi: vec3<i32>) -> vec2<f32> {
   if (slot >= P.dims.w) { return vec2<f32>(0.0); }
   return at(slot, vi - bc * 8);
 }
-fn sample(p: vec3<f32>) -> vec2<f32> {  // trilinear TSDF, and 1 if all eight voxels were seen enough
+fn sample(p: vec3<f32>) -> vec2<f32> {  // trilinear TSDF, and 1 if it is known (below)
   let g = (p - P.vol.xyz) / P.vol.w;
   let f = floor(g);
   let a = g - f;
@@ -229,10 +232,21 @@ fn sample(p: vec3<f32>) -> vec2<f32> {  // trilinear TSDF, and 1 if all eight vo
     c011 = voxel(i0 + vec3<i32>(0, 1, 1));
     c111 = voxel(i0 + vec3<i32>(1, 1, 1));
   }
-  if (min(min(min(c000.y, c100.y), min(c010.y, c110.y)), min(min(c001.y, c101.y), min(c011.y, c111.y))) < P.ray.x) { return vec2<f32>(0.0); }
-  let x00 = mix(c000.x, c100.x, a.x); let x10 = mix(c010.x, c110.x, a.x);
-  let x01 = mix(c001.x, c101.x, a.x); let x11 = mix(c011.x, c111.x, a.x);
-  return vec2<f32>(mix(mix(x00, x10, a.y), mix(x01, x11, a.y), a.z), 1.0);
+  // trilinear over the voxels seen enough; none where they hold less than half the weight (a single
+  // frame's band has one-voxel holes where cleaning dropped a pixel)
+  let b = vec3<f32>(1.0) - a;
+  let w000 = b.x * b.y * b.z * f32(c000.y >= P.ray.x);
+  let w100 = a.x * b.y * b.z * f32(c100.y >= P.ray.x);
+  let w010 = b.x * a.y * b.z * f32(c010.y >= P.ray.x);
+  let w110 = a.x * a.y * b.z * f32(c110.y >= P.ray.x);
+  let w001 = b.x * b.y * a.z * f32(c001.y >= P.ray.x);
+  let w101 = a.x * b.y * a.z * f32(c101.y >= P.ray.x);
+  let w011 = b.x * a.y * a.z * f32(c011.y >= P.ray.x);
+  let w111 = a.x * a.y * a.z * f32(c111.y >= P.ray.x);
+  let total = w000 + w100 + w010 + w110 + w001 + w101 + w011 + w111;
+  if (total < 0.5) { return vec2<f32>(0.0); }
+  return vec2<f32>((w000 * c000.x + w100 * c100.x + w010 * c010.x + w110 * c110.x + w001 * c001.x + w101 * c101.x
+                    + w011 * c011.x + w111 * c111.x) / total, 1.0);
 }
 @compute @workgroup_size(16, 16)
 fn main(@builtin(global_invocation_id) g: vec3<u32>) {
@@ -300,8 +314,8 @@ ICP = """
 @group(0) @binding(3) var<storage, read> vref: array<vec4<f32>>;
 @group(0) @binding(4) var<storage, read> nref: array<vec4<f32>>;
 @group(0) @binding(5) var<storage, read_write> partials: array<f32>;
-const NV: u32 = 30u;
-var<workgroup> sh: array<f32, 3840>;  // 128 threads x 30 values: 15 kB, under WebGPU's 16 kB
+const NV: u32 = 32u;
+var<workgroup> sh: array<f32, 4096>;  // 128 threads x 32 values: 16 kB, WebGPU's guaranteed limit
 @compute @workgroup_size(128)
 fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t: u32,
         @builtin(num_workgroups) nw: vec3<u32>) {
@@ -335,15 +349,22 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t
   var a27 = 0.0;
   var a28 = 0.0;
   var a29 = 0.0;
+  var a30 = 0.0;
+  var a31 = 0.0;
   let w = P.img.x;
   let h = P.img.y;
-  let n = w * h;
+  let s = max(u32(P.trk.w), 1u);  // every s-th pixel each way
+  let ws = (w + s - 1u) / s;
+  let n = ws * ((h + s - 1u) / s);
   let tk = P.lim.w;
-  for (var i = wg.x * 128u + t; i < n; i += nw.x * 128u) {
+  let reach2 = P.trk.y * P.trk.y;
+  for (var k = wg.x * 128u + t; k < n; k += nw.x * 128u) {
+    let i = (k / ws) * s * w + (k % ws) * s;
     let pc = vcur[i];
     if (pc.w == 0.0) { continue; }
     let nc = ncur[i];
     if (nc.w == 0.0) { continue; }
+    a30 += 1.0;
     let p = xform(P.pose, pc.xyz);
     let qc = xform(P.ref_inv, p);
     if (qc.z <= 0.0) { continue; }
@@ -354,12 +375,19 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t
     let q = vref[j];
     let nq = nref[j];
     if (q.w <= 0.0 || nq.w == 0.0) { continue; }
+    if (dot(P.base.xyz, q.xyz) + P.base.w <= 0.0) { continue; }
+    let dv = p - q.xyz;
+    let reach = dot(dv, dv) / reach2;
+    if (reach >= 1.0) { continue; }
+    a31 += 1.0;
     let ncw = (P.pose * vec4<f32>(nc.xyz, 0.0)).xyz;
     if (dot(ncw, nq.xyz) < P.icp.w) { continue; }
-    let r = dot(nq.xyz, p - q.xyz);
+    let r = dot(nq.xyz, dv);
     if (abs(r) >= tk) { continue; }
     let e = 1.0 - (r / tk) * (r / tk);
-    let wt = e * e;
+    let f = 1.0 - reach;
+    var wt = e * e * f * f;
+    if (P.trk.x > 0.0) { wt *= pc.z * pc.z * P.trk.x; }
     let a = cross(p - P.icp.xyz, nq.xyz);
     let j0 = a.x; let j1 = a.y; let j2 = a.z; let j3 = nq.x; let j4 = nq.y; let j5 = nq.z;
     a0 += wt * j0 * j0;
@@ -391,7 +419,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t
     a26 += wt * j5 * r;
     a27 += 1.0;
     a28 += wt;
-    a29 += wt * r * r;
+    a29 += r * r;
   }
   sh[t * NV + 0u] = a0;
   sh[t * NV + 1u] = a1;
@@ -423,12 +451,42 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t
   sh[t * NV + 27u] = a27;
   sh[t * NV + 28u] = a28;
   sh[t * NV + 29u] = a29;
+  sh[t * NV + 30u] = a30;
+  sh[t * NV + 31u] = a31;
   workgroupBarrier();
-  for (var s = 64u; s > 0u; s = s >> 1u) {
-    if (t < s) { for (var k = 0u; k < NV; k++) { sh[t * NV + k] += sh[(t + s) * NV + k]; } }
+  for (var s2 = 64u; s2 > 0u; s2 = s2 >> 1u) {
+    if (t < s2) { for (var k = 0u; k < NV; k++) { sh[t * NV + k] += sh[(t + s2) * NV + k]; } }
     workgroupBarrier();
   }
   if (t == 0u) { for (var k = 0u; k < NV; k++) { partials[wg.x * NV + k] = sh[k]; } }
+}
+"""
+
+MODEL_NORMALS = """
+@group(0) @binding(1) var<storage, read> vin: array<vec4<f32>>;        // the ray cast: world xyz, depth
+@group(0) @binding(2) var<storage, read_write> nout: array<vec4<f32>>;
+fn at(x: u32, y: u32) -> vec4<f32> { return vin[y * P.img.x + x]; }
+@compute @workgroup_size(16, 16)
+fn main(@builtin(global_invocation_id) g: vec3<u32>) {  // normals from the hits trk.z pixels away (as maps)
+  let w = P.img.x;
+  let h = P.img.y;
+  if (g.x >= w || g.y >= h) { return; }
+  let i = g.y * w + g.x;
+  nout[i] = vec4<f32>(0.0);
+  let p = vin[i];
+  let k = max(u32(P.trk.z), 1u);
+  if (p.w <= 0.0 || g.x < k || g.y < k || g.x + k >= w || g.y + k >= h) { return; }
+  let r = at(g.x + k, g.y);
+  let l = at(g.x - k, g.y);
+  let dn = at(g.x, g.y + k);
+  let up = at(g.x, g.y - k);
+  if (r.w * l.w * dn.w * up.w <= 0.0) { return; }
+  var m = cross(r.xyz - l.xyz, dn.xyz - up.xyz);
+  let len = length(m);
+  if (len <= 0.0) { return; }
+  m = m / len;
+  if (dot(m, p.xyz - P.pose[3].xyz) > 0.0) { m = -m; }  // facing the camera
+  nout[i] = vec4<f32>(m, 1.0);
 }
 """
 
@@ -510,7 +568,7 @@ def integrate_source(nearest):
     return consts + INTEGRATE
 
 
-KERNELS = {"maps": MAPS, "allocate": ALLOCATE, "clamp": CLAMP, "integrate": INTEGRATE, "raycast": RAYCAST, "icp": ICP,
+KERNELS = {"model_normals": MODEL_NORMALS, "maps": MAPS, "allocate": ALLOCATE, "clamp": CLAMP, "integrate": INTEGRATE, "raycast": RAYCAST, "icp": ICP,
            "mesh": MESH}
 # --- frame preparation (S1-S3): fusion.frame_images + Pinhole on the GPU ----------------------------------
 PREP_PRELUDE = """
@@ -523,8 +581,9 @@ struct Prep {
   d0: vec4<f32>,     // colour lens k1, k2, p1, p2
   d1: vec4<f32>,     // k3, k4, k5, k6
   box: vec4<u32>,    // the cut-out cleaned: first column, first row, end column, end row
-  size: vec4<u32>,   // depth width, height, colour width, height
+  size: vec4<u32>,   // depth width, height, colour width, height (0: no colour)
   cells: vec4<u32>,  // label step, label columns, label rows, labels used (1) or not (0)
+  blur: vec4<f32>,   // track_source: radius px (0: none), neighbours within this many mm
 }
 @group(0) @binding(0) var<uniform> Q: Prep;
 fn in_box(x: i32, y: i32) -> bool { return x >= i32(Q.box.x) && y >= i32(Q.box.y) && x < i32(Q.box.z) && y < i32(Q.box.w); }
@@ -642,7 +701,7 @@ fn main(@builtin(global_invocation_id) g: vec3<u32>) {
   let z = Q.law.x / (raw[i] + Q.law.y);
   zs[i] = z;
   let r = rays[i];
-  cs[i] = colour_at(vec3<f32>(r * z, z));
+  cs[i] = select(0x808080u, colour_at(vec3<f32>(r * z, z)), Q.size.z > 0u);  // no colour: grey
 }
 """
 
@@ -663,7 +722,54 @@ fn main(@builtin(global_invocation_id) g: vec3<u32>) {
 }
 """
 
-PREP = {"prep_clean": PREP_CLEAN, "prep_erode": PREP_ERODE, "prep_finish": PREP_FINISH, "prep_remap": PREP_REMAP}
+PREP_SOURCE = """
+@group(0) @binding(1) var<storage, read> raw: array<f32>;
+@group(0) @binding(2) var<storage, read> lookup: array<i32>;
+@group(0) @binding(3) var<storage, read> keep: array<u32>;  // one per cell of cells.x^2 sensor pixels
+@group(0) @binding(4) var<storage, read_write> depth: array<f32>;  // (zs: blurred into the frame's depth next)
+@compute @workgroup_size(16, 16)
+fn main(@builtin(global_invocation_id) g: vec3<u32>) {  // what tracking matches: the kept cells, uncleaned
+  if (g.x >= Q.size.x || g.y >= Q.size.y) { return; }
+  let i = g.y * Q.size.x + g.x;
+  depth[i] = 0.0;
+  let j = lookup[i];
+  if (j < 0) { return; }
+  let x = u32(j) % Q.size.x;
+  let y = u32(j) / Q.size.x;
+  if (keep[(y / Q.cells.x) * Q.cells.y + x / Q.cells.x] == 0u) { return; }
+  let r = raw[u32(j)];
+  if (r > 0.0) { depth[i] = Q.law.x / (r + Q.law.y); }
+}
+"""
+
+PREP_BLUR = """
+@group(0) @binding(1) var<storage, read> zs: array<f32>;
+@group(0) @binding(2) var<storage, read_write> depth: array<f32>;
+@compute @workgroup_size(16, 16)
+fn main(@builtin(global_invocation_id) g: vec3<u32>) {  // mean of the neighbours on the same surface
+  if (g.x >= Q.size.x || g.y >= Q.size.y) { return; }
+  let i = g.y * Q.size.x + g.x;
+  let z = zs[i];
+  depth[i] = z;
+  let r = i32(Q.blur.x);
+  if (z <= 0.0 || r == 0) { return; }
+  var sum = 0.0;
+  var n = 0.0;
+  for (var dy = -r; dy <= r; dy++) {
+    for (var dx = -r; dx <= r; dx++) {
+      let x = i32(g.x) + dx;
+      let y = i32(g.y) + dy;
+      if (x < 0 || y < 0 || x >= i32(Q.size.x) || y >= i32(Q.size.y)) { continue; }
+      let zz = zs[u32(y) * Q.size.x + u32(x)];
+      if (zz > 0.0 && abs(zz - z) < Q.blur.y) { sum += zz; n += 1.0; }
+    }
+  }
+  depth[i] = sum / n;
+}
+"""
+
+PREP = {"prep_blur": PREP_BLUR, "prep_clean": PREP_CLEAN, "prep_erode": PREP_ERODE, "prep_finish": PREP_FINISH, "prep_remap": PREP_REMAP,
+        "prep_source": PREP_SOURCE}
 
 S = wgpu.BufferUsage
 
@@ -684,18 +790,20 @@ def adapters():
 class Engine:
     """TSDF volume (gpu.Layout) on one WebGPU adapter; depth frames of `size` (w, h) on the pinhole K."""
 
-    def __init__(self, layout, K, size, kind="gpu", far_mm=1000.0, nearest=True):
+    def __init__(self, layout, K, size, kind="gpu", far_mm=1000.0, nearest=True, timestamps=True):
+        """timestamps: time each pass on the GPU (gpu_ms) where the adapter can; each submission then
+        reads the stamps back, ~0.2 ms (tracking runs ~10 ICP passes a frame without them)."""
         adapter = adapters()[kind]
         self.name = f"wgpu-{kind}"
         self.device_name = adapter.info["device"]
-        feats = ["timestamp-query"] if "timestamp-query" in adapter.features else []
+        feats = ["timestamp-query"] if timestamps and "timestamp-query" in adapter.features else []
         self.device = adapter.request_device_sync(required_features=feats)
         self.timestamps = bool(feats)
         self.layout, self.K, self.size, self.far_mm = layout, np.asarray(K, float), size, far_mm
         w, h = size
         dev = self.device
         buf = lambda n, usage=S.STORAGE | S.COPY_DST | S.COPY_SRC: dev.create_buffer(size=int(n), usage=usage)
-        self.uniform = {k: buf(304, S.UNIFORM | S.COPY_DST) for k in ("frame", "ray", "icp")}
+        self.uniform = {k: buf(gpu.PARAMS_BYTES, S.UNIFORM | S.COPY_DST) for k in ("frame", "ray", "icp")}
         self.depth, self.colour = buf(4 * w * h), buf(4 * w * h)
         self.vmap, self.nmap, self.rvmap, self.rnmap = (buf(16 * w * h) for _ in range(4))
         self.index, self.mark = buf(4 * layout.bricks), buf(4 * layout.bricks)
@@ -730,6 +838,7 @@ class Engine:
             "integrate": self._group("integrate", u["frame"], self.depth, self.colour, self.index, self.visible, self.tsdfw,
                                      self.colvox),
             "raycast": self._group("raycast", u["ray"], self.index, self.tsdfw, self.rvmap, self.rnmap),
+            "model_normals": self._group("model_normals", u["ray"], self.rvmap, self.rnmap),
             "icp": self._group("icp", u["icp"], self.vmap, self.nmap, self.rvmap, self.rnmap, self.partials),
             "mesh": self._group("mesh", u["ray"], self.index, self.tsdfw, self.colvox, self.bricks, self.table, self.out,
                                 self.tri_count),
@@ -742,11 +851,9 @@ class Engine:
         self.tick_ns = 1.0  # WebGPU timestamps should be ns; wgpu-native hands Vulkan's raw ticks (calibrate_ticks)
 
     def set_camera(self, camera, lookup=None):
-        """Prepare frames on the GPU from here on (fuse_frame), for `camera` (calib.Camera, in its current
-        depth mode) and the pinhole lookup (fusion.Pinhole.index, None when the lens has no distortion).
-        Needs a colour model (the board or factory calibration)."""
-        if camera.colour is None:
-            raise ValueError("GPU frame preparation needs a calibrated colour camera")
+        """Prepare frames on the GPU from here on (fuse_frame, track_source), for `camera` (calib.Camera, in
+        its current depth mode) and the pinhole lookup (fusion.Pinhole.index, None when the lens has no
+        distortion). Without a colour model (the estimated camera) the volume's colour is grey."""
         from . import prep as cpu_prep
         w, h = self.size
         dev, q = self.device, self.device.queue
@@ -754,11 +861,12 @@ class Engine:
         vv, uu = np.mgrid[0:h, 0:w]
         x, y = camera.normalised(uu.ravel(), vv.ravel())
         b = {"raw": buf(4 * w * h), "rays": buf(8 * w * h), "mask1": buf(4 * w * h), "mask2": buf(4 * w * h),
-             "labels": buf(4 * (w // 8 + 2) * (h // 8 + 2)), "yuyv": buf(2 * w * h), "zs": buf(4 * w * h), "cs": buf(4 * w * h),
-             "lookup": buf(4 * w * h), "uniform": dev.create_buffer(size=208, usage=S.UNIFORM | S.COPY_DST)}
+             "labels": buf(4 * (w // 8 + 2) * (h // 8 + 2)), "yuyv": buf(2 * w * h), "zs": buf(4 * w * h), "zt": buf(4 * w * h), "cs": buf(4 * w * h),
+             "lookup": buf(4 * w * h), "cells": buf(4 * w * h),
+             "uniform": dev.create_buffer(size=208, usage=S.UNIFORM | S.COPY_DST)}
         q.write_buffer(b["rays"], 0, np.stack([x, y], 1).astype(np.float32))
         q.write_buffer(b["lookup"], 0, (np.arange(w * h) if lookup is None else lookup).astype(np.int32))
-        c = camera.colour
+        c = camera.colour or {"dist": [], "R": np.eye(3), "T": np.zeros(3), "K": camera.intrinsic_matrix()}
         dist = (list(np.ravel(c["dist"])) + [0.0] * 8)[:8]
         R, T, Kc = np.asarray(c["R"], float), np.ravel(c["T"]), np.asarray(c["K"], float)
         near, far = camera.window_mm
@@ -767,19 +875,27 @@ class Engine:
                             cpu_prep.SPECKLE_MIN * cpu_prep.SPECKLE_WIN ** 2)
         head += b"".join(struct.pack("<4f", *R[k], 0) for k in range(3)) + struct.pack("<4f", *T, 0)
         head += struct.pack("<4f", Kc[0, 0], Kc[1, 1], Kc[0, 2], Kc[1, 2]) + struct.pack("<8f", *dist)
-        self.prep = {"buffers": b, "head": head, "colour_size": (w, h)}  # colour frames are the depth size
+        # colour frames are the depth size; (0, 0): no colour
+        self.prep = {"buffers": b, "head": head, "colour_size": (w, h) if camera.colour is not None else (0, 0)}
         g = lambda kernel, *names: self._group(kernel, b["uniform"], *(b[n] if isinstance(n, str) else n for n in names))
+        self.pipes.update({"prep_remap_blur": self.pipes["prep_remap"], "prep_blur_fused": self.pipes["prep_blur"]})
         self.groups.update({
             "prep_clean": g("prep_clean", "raw", "rays", "mask1"),
             "prep_erode": g("prep_erode", "mask1", "mask2"),
             "prep_finish": g("prep_finish", "raw", "rays", "mask2", "labels", "yuyv", "zs", "cs"),
-            "prep_remap": g("prep_remap", "lookup", "zs", "cs", self.depth, self.colour)})
+            "prep_remap": g("prep_remap", "lookup", "zs", "cs", self.depth, self.colour),
+            "prep_remap_blur": g("prep_remap", "lookup", "zs", "cs", "zt", self.colour),  # then blurred into depth
+            "prep_blur_fused": g("prep_blur", "zt", self.depth),
+            "prep_source": g("prep_source", "raw", "lookup", "cells", "zs"),
+            "prep_blur": g("prep_blur", "zs", self.depth)})
 
-    def fuse_frame(self, frame, labels, pose_m, step=8):
+    def fuse_frame(self, frame, labels, pose_m, step=8, blur_px=0, blur_mm=1.0):
         """Prepare one recorded frame set on the GPU (as fusion.frame_images + Pinhole: cleaned, only on
         its labelled pixels, colour per pixel through the colour camera) and fuse it. `frame` holds
-        "depth" (raw, Y10 scale) and "yuyv"; `labels` its 1/step labels or None; pose camera -> world in
-        metres. Returns False (and counts it empty) when nothing of it is left to fuse."""
+        "depth" (raw, Y10 scale) and "yuyv" (without it, or without a colour model: grey); `labels` its
+        1/step labels or None; pose camera -> world in metres; blur_px, blur_mm: as track_source (after
+        the cleaning; for a tracking volume, not a mesh). Returns False (and counts it empty) when nothing
+        of it is left to fuse."""
         w, h = self.size
         p, q = self.prep, self.device.queue
         if labels is not None:  # the cut-out fusion.frame_images cleans: the grown label cells + 8 px
@@ -798,18 +914,39 @@ class Engine:
             cells = (step, labels.shape[1], labels.shape[0], 1)
         else:
             r0, r1, c0, c1, cells = 0, h, 0, w, (step, 0, 0, 0)
-        cw, ch = p["colour_size"]
+        cw, ch = p["colour_size"] if "yuyv" in frame else (0, 0)
         q.write_buffer(p["buffers"]["uniform"], 0, p["head"] + struct.pack("<4I", c0, r0, c1, r1)
-                       + struct.pack("<4I", w, h, cw, ch) + struct.pack("<4I", *cells))
+                       + struct.pack("<4I", w, h, cw, ch) + struct.pack("<4I", *cells)
+                       + struct.pack("<4f", blur_px, blur_mm, 0, 0))
         q.write_buffer(p["buffers"]["raw"], 0, np.ascontiguousarray(frame["depth"], np.float32))
-        q.write_buffer(p["buffers"]["yuyv"], 0, np.frombuffer(frame["yuyv"], np.uint8, 2 * cw * ch))
+        if cw:
+            q.write_buffer(p["buffers"]["yuyv"], 0, np.frombuffer(frame["yuyv"], np.uint8, 2 * cw * ch))
         self._params("frame", pose=gpu.pose_mm(pose_m), frame=self.frames)
         q.write_buffer(self.args, 0, np.array([0, 1, 1], np.uint32))
         img = self._image_groups()
-        self._run([("prep_clean", img), ("prep_erode", img), ("prep_finish", img), ("prep_remap", img), ("maps", img),
+        remap = [("prep_remap_blur", img), ("prep_blur_fused", img)] if blur_px else [("prep_remap", img)]
+        self._run([("prep_clean", img), ("prep_erode", img), ("prep_finish", img), *remap, ("maps", img),
                    ("allocate", self._image_groups(gpu.ALLOC_STRIDE)), ("clamp", (1,)), ("integrate", "indirect")])
         self.frames += 1
         return True
+
+    def track_source(self, raw, keep, step, normal_step=1, blur_px=0, blur_mm=1.0):
+        """Make the maps tracking matches (icp) from a frame's raw depth (Y10 scale, sensor grid): only
+        where `keep` ((H / step, W / step) bool, one per cell of step x step sensor pixels: the frame's
+        piece) is set, uncleaned, on the pinhole grid; each depth the mean of its neighbours within
+        `blur_px` that lie within `blur_mm` of it; normals from neighbours `normal_step` pixels away."""
+        w, h = self.size
+        p, q = self.prep, self.device.queue
+        cells = np.zeros(((h + step - 1) // step, (w + step - 1) // step), np.uint32)
+        cells[:keep.shape[0], :keep.shape[1]] = keep
+        q.write_buffer(p["buffers"]["uniform"], 0, p["head"] + struct.pack("<4I", 0, 0, w, h)
+                       + struct.pack("<4I", w, h, 0, 0) + struct.pack("<4I", step, cells.shape[1], cells.shape[0], 1)
+                       + struct.pack("<4f", blur_px, blur_mm, 0, 0))
+        q.write_buffer(p["buffers"]["raw"], 0, np.ascontiguousarray(raw, np.float32))
+        q.write_buffer(p["buffers"]["cells"], 0, cells)
+        self._params("frame", normal_step=normal_step)
+        img = self._image_groups()
+        self._run([("prep_source", img), ("prep_blur", img), ("maps", img)])
 
     def prepared(self):
         """The last frame as fused: (depth mm, colour RGB) on the pinhole grid (for checks)."""
@@ -889,15 +1026,19 @@ class Engine:
                    ("integrate", "indirect")])
         self.frames += 1
 
-    def raycast(self, pose, min_weight=gpu.RAY_MIN_WEIGHT):
-        """Ray cast the volume from `pose` (camera -> world, mm) into the model maps (kept on the GPU)."""
-        self._params("ray", pose=pose, min_weight=min_weight)
-        self._run([("raycast", self._image_groups())])
+    def raycast(self, pose, min_weight=gpu.RAY_MIN_WEIGHT, normal_px=0):
+        """Ray cast the volume from `pose` (camera -> world, mm) into the model maps (kept on the GPU);
+        normals from the TSDF's gradient, or with `normal_px` from the hits that many pixels away (as
+        the frame's maps)."""
+        self._params("ray", pose=pose, min_weight=min_weight, normal_step=normal_px)
+        img = self._image_groups()
+        self._run([("raycast", img)] + ([("model_normals", img)] if normal_px else []))
 
-    def icp(self, pose, ref_pose, centre):
+    def icp(self, pose, ref_pose, centre, **options):
         """ICP sums (gpu.icp_sums) of the last fused/uploaded frame's maps at `pose` against the last ray
-        cast, which was made from `ref_pose` (both camera -> world, mm)."""
-        self._params("icp", pose=pose, ref_inv=np.linalg.inv(ref_pose), centre=centre)
+        cast, which was made from `ref_pose` (both camera -> world, mm). `options`: gpu.icp_sums's tukey,
+        gate, area, reach_mm, stride, base."""
+        self._params("icp", pose=pose, ref_inv=np.linalg.inv(ref_pose), centre=centre, **options)
         self._run([("icp", (gpu.ICP_GROUPS,))])
         return gpu.reduce_icp(np.frombuffer(self.device.queue.read_buffer(self.partials), np.float32))
 
