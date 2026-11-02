@@ -107,6 +107,11 @@ right: Scanner, Capture, Scan, IMU and View.
   about 10 s while the scanner switches.
 - **IMU** shows the scanner's tilt (a small horizon) and how fast it turns, from its built-in
   accelerometer and gyroscope (`tribuutscan/imu.py`; needs the udev rule).
+- Under the images, **Status** says what the viewer is doing (scanning with frames a second,
+  recording, meshing, switching range), how the scanner runs (14- or 10-bit depth, range, which
+  calibration), the streams' rates, the scan worker and the GPU it tracks on, and what each process
+  uses: CPU, memory, GPU memory and busy time, free disk. **Messages** keeps everything the viewer
+  and its helpers report (also in `captures/viewer.log`), including a meshing job's output as it runs.
 
 If the scanner is unplugged, the viewer asks you to plug it in and press Retry. If it goes away while
 the viewer runs, the bar under the depth view turns red, it retries every 10 s, and *Retry now* tries at

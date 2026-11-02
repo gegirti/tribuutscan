@@ -201,6 +201,13 @@ is simply getting colour, IR and depth out of the scanner on Linux.
   range switches ~10 s each with the IMU back, and after close the IMU switches read 0 and hidraw
   returned. Recordings: imu.csv (host_t monotonic at arrival, device_us, accel g, gyro deg/s, temp),
   `frames.read_imu`; info.json "imu" has the rates and ranges.
+- Status and Messages boxes (2026-11-02, the user's request): plain text in the room under the previews.
+  Status (every 0.5 s): what runs, the scanner's depth / range / calibration, stream rates, the worker
+  (GPU from its "tracking on the GPU" line, merge process found as its spawn_main child), and per process
+  CPU, memory and GPU from /proc (`sysinfo.py`, stdlib; reading the worker's DRM fdinfo from the viewer
+  works, ~1 ms). Messages: everything `App.log` gets, plus the meshing job's output line by line (a
+  reader thread: it also never fills the pipe). ("TkFixedFont", 9) is NOT monospace here (a family name:
+  Noto Sans); the boxes use a sized copy of the named font. Window 1491 x 971 with every panel open.
 - Viewer robustness (2026-10-31, after the user's first session with v2):
   - Two viewers ran at once and the second silently took the scanner. The USB claims now use
     DISCONNECT_CLAIM with EXCEPT_DRIVER "usbfs" (`usbdepth.claim`): they unbind uvcvideo/usbhid
@@ -308,6 +315,7 @@ python3 -m tribuutscan.viewer               # depth (middle), colour + IR (left)
                                             # Scan: `c` live scan (worker process), Open 3D view
                                             # IMU: tilt horizon, turn rate; View: Find markers
                                             # events: message line, console, captures/viewer.log
+                                            # Status / Messages boxes under the previews (sysinfo.py)
 python3 -m tribuutscan.vendor [modes|factory|scan|switch "<mode>"]   # depth modes, factory calibration
                                             # (switch WRITES); TRIBUUTSCAN_CAMERA=board|factory|estimate
 python3 -m tribuutscan.imu [seconds]         # switch the IMU on, read it, switch it off

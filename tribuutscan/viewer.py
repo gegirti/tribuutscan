@@ -21,6 +21,7 @@ connection (it does so on its own now and then), the viewer reconnects by itself
 """
 import collections
 import fcntl
+import itertools
 import multiprocessing
 import os
 import queue
@@ -29,6 +30,7 @@ import subprocess
 import threading
 import time
 import tkinter as tk
+import tkinter.font
 import tkinter.messagebox
 import webbrowser
 from pathlib import Path
@@ -36,7 +38,7 @@ from pathlib import Path
 import numpy as np
 
 from . import frames as fr
-from . import calib, cloud, imu, livescan, markers, panels, pointcloud, usbdepth, v4l2, vendor
+from . import calib, cloud, imu, livescan, markers, panels, pointcloud, sysinfo, usbdepth, v4l2, vendor
 from .depth import decode_depth, garbled
 from .image import depth_to_rgb, ppm, yuyv_pixels
 
@@ -157,6 +159,9 @@ class Stream(threading.Thread):
         self.cap.close()
 
 
+INFO_EVERY_S = 0.5  # the Status box's refresh
+LABEL_W = 12  # its label column (characters)
+MESSAGES_KEPT = 300  # lines the Messages box keeps
 MARKER_HZ = 5  # marker search rate; one search takes ~0.1 s at half resolution
 MARKER_RADII = (3, 4, 5, 7)  # dot radius in half-resolution pixels (smaller ones were glints)
 found_markers = {"on": True, "list": [], "stamp": 0.0}  # list in full-resolution pixels
@@ -329,6 +334,9 @@ class App:
 
     def __init__(self, root):
         self.root, self.message = root, ""
+        self.messages = collections.deque(maxlen=MESSAGES_KEPT)  # (number, line): the Messages box
+        self.message_count, self.messages_shown = itertools.count(1), 0
+        self.rates, self.info_at = sysinfo.Rates(), 0.0  # the Status box: CPU / GPU rates, when it was refreshed
         self.nodes = v4l2.discover()
         ir_exposure_by_hand(self.nodes, self.log)
         opened = []  # closed again if a later one fails, so a retry finds the scanner free
@@ -354,7 +362,9 @@ class App:
         self.record_rate = tk.StringVar(value=next(iter(RECORD_RATES)))
         self.job = {"process": None, "dir": None}
         self.live = {"proc": None, "commands": None, "replies": None, "url": None, "open": False,
-                     "inflight": 0, "sent": 0.0, "raw": {}}  # raw: depth buffers in work, by capture time
+                     "inflight": 0, "sent": 0.0, "raw": {},  # raw: depth buffers in work, by capture time
+                     "done": collections.deque(maxlen=60), "last": None, "name": "", "gpu": "", "merging": ""}
+        # (done: when frames came back; last: (merged, frames, points, tracking); gpu / merging: from its log)
         self.scan_state = "idle"  # idle | scanning | saving | optimising
         self.imu, self.imu_note, self.imu_want = None, "", usbdepth.available()
         self.retry_at = 0.0  # time.monotonic() before which a lost scanner is not reconnected again
@@ -371,10 +381,30 @@ class App:
     def build_window(self):
         root = self.root
         root.title("triBUUTSCAN (Ferret Pro)")
-        left, middle, right = tk.Frame(root), tk.Frame(root), tk.Frame(root)
-        left.grid(row=0, column=0, sticky="n", padx=(8, 4), pady=8)
-        middle.grid(row=0, column=1, sticky="n", padx=4, pady=8)
+        main, right = tk.Frame(root), tk.Frame(root)  # main: the previews, and the Status / Messages boxes under them
+        main.grid(row=0, column=0, columnspan=2, sticky="nsew", padx=(8, 4), pady=8)
         right.grid(row=0, column=2, sticky="n", padx=(4, 8), pady=8)
+        root.rowconfigure(0, weight=1)
+        left, middle = tk.Frame(main), tk.Frame(main)
+        left.grid(row=0, column=0, sticky="n", padx=(0, 4))
+        middle.grid(row=0, column=1, sticky="n", padx=(4, 0))
+        boxes = tk.Frame(main)  # (they take the room the right-hand panels leave under the previews)
+        boxes.grid(row=1, column=0, columnspan=2, sticky="nsew", pady=(2, 0))
+        main.rowconfigure(1, weight=1)
+        self.info = {}
+        mono = tkinter.font.nametofont("TkFixedFont").copy()  # (("TkFixedFont", 9) is not monospace: a family name)
+        mono.configure(size=9)
+        for col, (name, indent) in enumerate((("Status", " " * LABEL_W), ("Messages", "[00:00:00] "))):
+            box = tk.Frame(boxes)
+            box.grid(row=0, column=col, sticky="nsew", padx=(0, 8) if col == 0 else 0)
+            boxes.columnconfigure(col, weight=1, uniform="info")
+            tk.Label(box, text=name, font=panels.BOLD).pack(anchor="w")
+            text = tk.Text(box, width=40, height=9, wrap="word", font=mono, relief="flat", padx=6, pady=4,
+                           state="disabled", takefocus=0)
+            text.tag_configure("hang", lmargin2=mono.measure(indent))  # wrapped lines start under the text
+            text.pack(fill="both", expand=True)
+            self.info[name] = text
+        boxes.rowconfigure(0, weight=1)
         self.views = {}
         for name, parent, width in (("Colour", left, SIDE_W), ("IR (flipped)", left, SIDE_W), ("Depth", middle, DEPTH_W)):
             title = tk.Label(parent, text=depth_title(self.depth.cap) if name == "Depth" else name, font=panels.BOLD)
@@ -417,9 +447,11 @@ class App:
         self.tick()
 
     def log(self, text):
-        """Show a message in the window, print it, and append it to captures/viewer.log."""
+        """Show a message in the window (the line at the bottom and the Messages box), print it, and
+        append it to captures/viewer.log."""
         self.message = text
         line = f"[{time.strftime('%H:%M:%S')}] {text}"
+        self.messages.append((next(self.message_count), line))
         print(line, flush=True)
         try:
             LOG.parent.mkdir(exist_ok=True)
@@ -473,7 +505,108 @@ class App:
         self.note.configure(text=self.message)
         for panel in self.panels:
             panel.refresh()
+        if time.monotonic() - self.info_at >= INFO_EVERY_S:
+            self.info_at = time.monotonic()
+            self.refresh_info()
         self.root.after(33, self.tick)
+
+    # --- the Status and Messages boxes ---------------------------------------------------------------
+    def refresh_info(self):
+        """The Status box (rewritten when it changed) and the Messages box (new lines added; it follows
+        them unless it was scrolled back)."""
+        status, messages = self.info["Status"], self.info["Messages"]
+        text = "\n".join(self.status_lines())
+        if text != status.get("1.0", "end-1c"):
+            status.configure(state="normal")
+            status.delete("1.0", "end")
+            status.insert("1.0", text, "hang")
+            status.configure(state="disabled")
+        fresh = [(n, line) for n, line in list(self.messages) if n > self.messages_shown]
+        if fresh:
+            self.messages_shown = fresh[-1][0]
+            at_end = messages.yview()[1] > 0.999
+            messages.configure(state="normal")
+            empty = messages.compare("end-1c", "==", "1.0")
+            messages.insert("end", ("" if empty else "\n") + "\n".join(line for _, line in fresh), "hang")
+            surplus = int(messages.index("end-1c").split(".")[0]) - MESSAGES_KEPT
+            if surplus > 0:
+                messages.delete("1.0", f"{surplus + 1}.0")
+            messages.configure(state="disabled")
+            if at_end:
+                messages.see("end")
+
+    def doing(self):
+        """What the viewer and its helpers are busy with, in words."""
+        live, now = self.live, []
+        if self.lost:
+            now.append("the scanner is gone: reconnecting")
+        elif self.switching["busy"]:
+            now.append("switching the depth range (the images pause)")
+        if self.scan_state == "scanning":
+            merged, frames, points, tracking = live["last"] or (0, 0, 0, True)
+            done = list(live["done"])
+            fps = (len(done) - 1) / (done[-1] - done[0]) if len(done) > 1 and done[-1] > done[0] else 0.0
+            now.append(f"scanning {live['name']}: {frames} frames ({fps:.1f} a second), {merged} merged, {points:,} points"
+                       + ("" if tracking else ", TRACKING LOST"))
+        elif self.scan_state in ("saving", "optimising"):
+            now.append(f"{self.scan_state} the scan {live['name']}")
+        recorder = self.rec["recorder"]
+        if recorder:
+            now.append(f"recording {recorder.dir.name}: {recorder.count} sets, {recorder.megabytes:.0f} MB, "
+                       f"{self.rec['missed']} missed")
+        if self.job["process"] is not None:
+            now.append(f"meshing {self.job['dir'].name}")
+        if self.auto["running"]:
+            now.append("finding the IR exposure (Auto IR)")
+        return "; ".join(now) or "idle: showing the scanner's images"
+
+    def status_lines(self):
+        """The Status box: what runs and what it uses of the machine, as plain text."""
+        live, rates = self.live, self.rates
+        on_usb = isinstance(self.depth.cap, usbdepth.DepthCapture)
+        mode = calib.CAMERA.mode
+        rows = [("Now", self.doing()),
+                ("Scanner", f"depth {'14-bit over USB' if on_usb else '10-bit (V4L2)'}, {self.range_names.get(mode, mode)}"),
+                ("Camera", SOURCES.get(calib.CAMERA.source, calib.CAMERA.source)
+                 + (", distances are estimates" if calib.CAMERA.law_estimate else ""))]
+        streams = ", ".join(f"{name.split()[0].lower()} {s.fps:.0f}" for name, s in self.streams.items())
+        imu = self.imu.state() if self.imu is not None else None
+        rows.append(("Streams", f"{streams} fps; " + (f"IMU {imu['rate']:.0f} Hz, {imu['temp']:.1f} C" if imu else
+                                                      "IMU starting" if self.imu is not None else
+                                                      self.imu_note or "IMU off")))
+        procs = [("viewer", os.getpid())]
+        worker = live["proc"]
+        if worker is not None and worker.is_alive():
+            procs.append(("worker", worker.pid))
+            merge = [pid for pid, cmd in sysinfo.children(worker.pid) if "spawn_main" in cmd]
+            if merge:
+                procs.append(("merge", merge[0]))
+            how = (f"tracks on {live['gpu']}" if live["gpu"] else "tracks when a scan starts") + ", " + (
+                f"merges in pid {merge[0]}" if merge else "merges beside tracking" if live["merging"] == "thread"
+                else "merges in a process of its own while scanning")
+            rows.append(("Scan worker", f"pid {worker.pid}, {how}" + (f"; 3D view {live['url']}" if live["url"] else "")))
+        else:
+            rows.append(("Scan worker", "not started (it starts with the first scan or the 3D view)"))
+        if self.job["process"] is not None:
+            procs.append(("meshing", self.job["process"].pid))
+        cpu = [(name, rates.cpu(pid)) for name, pid in procs]
+        use = ", ".join(f"{name} {pct:.0f}%" for name, pct in cpu if pct is not None)
+        rows.append(("CPU", f"load {os.getloadavg()[0]:.1f} of {os.cpu_count()} threads"
+                            + (f"; {use} (100% = one core)" if use else "")))
+        rss = [(name, sysinfo.rss_mb(pid)) for name, pid in procs]
+        free, total = sysinfo.memory_mb()
+        rows.append(("Memory", ", ".join(f"{name} {mb:.0f} MB" for name, mb in rss if mb is not None)
+                               + (f"; {free / 1024:.1f} of {total / 1024:.1f} GB free" if free else "")))
+        gpu = []
+        for name, pid in procs[1:]:
+            usage = sysinfo.gpu_usage(pid)
+            busy = rates.gpu_busy(pid, usage)
+            if usage and usage["memory_mib"]:
+                gpu.append(f"{name} {sum(usage['memory_mib'].values()):.0f} MB"
+                           + (f", busy {busy:.0f}%" if busy is not None else ""))
+        rows.append(("GPU", "; ".join(gpu) if gpu else "not in use (scans and meshes use it)"))
+        rows.append(("Disk", f"{fr.free_gb(fr.CAPTURES):.0f} GB free for captures/"))
+        return [f"{label:{LABEL_W}s}{text}" for label, text in rows]
 
     def close(self):
         if garbled["frames"]:
@@ -803,15 +936,25 @@ class App:
         job["process"] = subprocess.Popen(
             scope + [str(VENV_PYTHON), "-m", "tribuutscan.cloud", str(directory), "--optimise", "--mesh"], cwd=REPO,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-        job["dir"] = directory
+        job["dir"], job["lines"] = directory, []
+        job["reader"] = threading.Thread(target=self.job_output, args=(job["process"], job["lines"]), daemon=True)
+        job["reader"].start()
         self.log(f"meshing {directory.name}: tracking, optimising, fusing (a few minutes) ...")
+
+    def job_output(self, process, lines):
+        """The meshing job's output, line by line as it comes (its own thread), into the Messages box."""
+        for line in process.stdout:
+            if line.strip():
+                lines.append(line.rstrip())
+                self.log(f"mesh job: {line.rstrip()}")
 
     def check_mesh(self):
         job = self.job
         process = job["process"]
         if process is None or process.poll() is None:
             return
-        lines = [ln for ln in process.stdout.read().splitlines() if ln.startswith(("mesh:", "Traceback"))]
+        job["reader"].join(timeout=2)  # its last lines
+        lines = [ln for ln in job["lines"] if ln.startswith(("mesh:", "Traceback"))]
         if process.returncode == 0:
             summary = lines[-1].split(" -> ")[0] if lines else "done"
             scan = job["dir"].name.removesuffix("-rec") + "-scan"
@@ -843,6 +986,8 @@ class App:
             self.start_worker()
         out = fr.CAPTURES / (time.strftime("%Y%m%d-%H%M%S") + "-scan")
         self.scan_state, live["inflight"] = "scanning", 0
+        live["name"], live["last"], live["merging"] = out.name, None, ""
+        live["done"].clear()
         scan_view.update(keep_base=not self.remove_base.get(), lost=False, model=None)
         self.live["raw"] = {}
         live["commands"].put(("start", self.preset.get(), out, self.keep_raw.get(), continue_from, calib.CAMERA.mode,
@@ -893,11 +1038,19 @@ class App:
                     webbrowser.open(rest[0])
             elif kind == "log":
                 self.log(rest[0])
+                if rest[0].startswith("tracking on the GPU: "):
+                    live["gpu"] = rest[0].split(": ", 1)[1]
+                elif rest[0].startswith("tracking on the CPU"):
+                    live["gpu"] = "the CPU"
+                elif rest[0].startswith("merging on a thread"):
+                    live["merging"] = "thread"
             elif kind == "frame_done":
                 live["inflight"] = max(0, live["inflight"] - 1)
                 merged, frames, points, tracking, cue, view, model, model_t = (list(rest) + [None] * 8)[:8]
                 raw = live["raw"].pop(model_t, None)
                 if self.scan_state == "scanning" and cue is not None:
+                    live["done"].append(time.monotonic())  # (the Status box: frames back a second)
+                    live["last"] = (merged, frames, points, tracking)
                     scan_view.update(mask=view, t=time.monotonic(), lost=not tracking,
                                      model=None if model is None or raw is None else (model, raw))
                     held = ", ".join(([f"{cue['markers']} markers"] if cue.get("markers") else [])

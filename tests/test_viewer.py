@@ -109,3 +109,63 @@ def test_depth_preview_paints_the_live_model_of_the_tracked_frame():
     assert (shown[:200, 410:590] == want).all()
     assert (shown[:200, 610:] == plain[:200, 610:]).all()  # the tracked frame's depth, not the newest's
     assert viewer.MODEL_LEGEND in stats["text"]
+
+
+def test_status_box_says_what_runs_and_what_it_uses():
+    """The Status box's text from the viewer's state, without a scanner or a window: idle, then a scan
+    (two sleeping processes stand in for the worker and a meshing job) beside a recording."""
+    import re
+    import subprocess
+    import sys
+    import types
+    from collections import deque
+    from pathlib import Path
+
+    class Proc:
+        def __init__(self):
+            self.child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+            self.pid = self.child.pid
+
+        def is_alive(self):
+            return self.child.poll() is None
+
+    app = viewer.App.__new__(viewer.App)  # the state only
+    app.live = {"proc": None, "url": None, "done": deque(maxlen=60), "last": None, "name": "", "gpu": "", "merging": ""}
+    app.rates, app.depth = viewer.sysinfo.Rates(), types.SimpleNamespace(cap=None)
+    app.streams = {name: types.SimpleNamespace(fps=fps) for name, fps in
+                   (("Colour", 30.0), ("IR (flipped)", 29.6), ("Depth", 30.2))}
+    app.imu, app.imu_note = None, "IMU needs udev/70-tribuutscan.rules (see README)"
+    app.job, app.scan_state, app.lost = {"process": None, "dir": None}, "idle", False
+    app.switching, app.auto, app.rec = {"busy": False}, {"running": False}, {"recorder": None, "missed": 0}
+    app.range_names = {mode: label for label, mode in viewer.RANGES.items()}
+    lines = app.status_lines()
+    assert [line[:viewer.LABEL_W].strip() for line in lines] == \
+        ["Now", "Scanner", "Camera", "Streams", "Scan worker", "CPU", "Memory", "GPU", "Disk"]
+    assert all(line[viewer.LABEL_W - 1] == " " for line in lines)  # the labels' column
+    text = "\n".join(lines)
+    assert "idle" in lines[0] and "10-bit (V4L2)" in text and "colour 30, ir 30, depth 30 fps" in text
+    assert "udev" in text and "not started" in text and "not in use" in text and "GB free for captures/" in text
+
+    worker, job = Proc(), Proc()
+    try:
+        app.scan_state = "scanning"
+        app.live.update(proc=worker, name="20261102-170723-scan", gpu="Intel(R) Arc(tm) A750 Graphics (DG2)",
+                        last=(12, 80, 30411, False), url="http://localhost:8765/")
+        app.live["done"].extend([10.0, 10.5, 11.0])  # three frames back in a second
+        app.rec["recorder"] = types.SimpleNamespace(dir=Path("20261102-171000-rec"), count=40, megabytes=120.4)
+        app.job = {"process": job, "dir": Path("20261102-160000-rec")}
+        app.status_lines()
+        lines = app.status_lines()  # (the CPU rates need a reading before)
+        text = "\n".join(lines)
+        assert lines[0].split(None, 1)[1] == ("scanning 20261102-170723-scan: 80 frames (2.0 a second), 12 merged, "
+                                              "30,411 points, TRACKING LOST; recording 20261102-171000-rec: 40 sets, "
+                                              "120 MB, 0 missed; meshing 20261102-160000-rec")
+        assert f"pid {worker.pid}, tracks on Intel(R) Arc(tm) A750 Graphics (DG2)" in text and "localhost:8765" in text
+        cpu = next(line for line in lines if line.startswith("CPU"))
+        assert all(re.search(rf"{name} \d+%", cpu) for name in ("viewer", "worker", "meshing")), cpu
+        memory = next(line for line in lines if line.startswith("Memory"))
+        assert "viewer" in memory and "worker" in memory and "meshing" in memory
+    finally:
+        for p in (worker, job):
+            p.child.kill()
+            p.child.wait()

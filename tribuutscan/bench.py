@@ -32,6 +32,7 @@ from pathlib import Path
 import numpy as np
 
 from . import calib
+from .sysinfo import gpu_usage, parse_fdinfo  # (kept here by name: tests and older notes use bench's)
 from . import cloud as cl
 from . import frames as fr
 
@@ -100,41 +101,6 @@ class StageTimer:
                 self.seconds[key] += time.perf_counter() - t0
                 self.calls[key] += 1
         return timed
-
-
-def parse_fdinfo(texts):
-    """GPU memory (MiB per region) and busy time (s per engine) from DRM fdinfo texts, one entry per
-    client (fds sharing a client are counted once). None when no fd is a DRM client."""
-    clients = {}
-    for text in texts:
-        fields = dict(line.split(":", 1) for line in text.splitlines() if ":" in line)
-        fields = {k.strip(): v.strip() for k, v in fields.items()}
-        if "drm-client-id" in fields:
-            clients[(fields.get("drm-pdev"), fields["drm-client-id"])] = fields
-    if not clients:
-        return None
-    units = {"": 1 / 2 ** 20, "KiB": 1 / 1024, "MiB": 1.0, "GiB": 1024.0}
-    memory, busy = defaultdict(float), defaultdict(float)
-    for fields in clients.values():
-        for key, value in fields.items():
-            number, _, unit = value.partition(" ")
-            if key.startswith(("drm-total-", "drm-memory-")) and number.isdigit():
-                memory[key.split("-", 2)[2]] += int(number) * units.get(unit, 0)
-            elif key.startswith("drm-engine-") and not key.startswith("drm-engine-capacity-") and unit == "ns":
-                busy[key[len("drm-engine-"):]] += int(number) / 1e9
-    return {"driver": next(iter(clients.values())).get("drm-driver"),
-            "memory_mib": {k: round(v, 1) for k, v in memory.items()},
-            "busy_s": {k: round(v, 3) for k, v in busy.items()}}
-
-
-def gpu_usage():
-    texts = []
-    for fd in os.listdir("/proc/self/fdinfo") if os.path.isdir("/proc/self/fdinfo") else []:
-        try:
-            texts.append(Path(f"/proc/self/fdinfo/{fd}").read_text())
-        except OSError:
-            pass
-    return parse_fdinfo(texts)
 
 
 def machine():
