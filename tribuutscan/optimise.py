@@ -8,7 +8,10 @@ seen, a loop closure says where it really is, and the pose graph spreads the cor
 keyframe. Candidates come from markers seen in both keyframes, ORB feature matches, and keyframes
 whose poses are close; each is checked with the joint solve (track.solve) before it is used, and
 the graph's line process drops loops that disagree with the rest (preference 2.0: on a synthetic
-loop it kept the true closure and pruned a 30 mm false one; at 1.0 it pruned both).
+loop it kept the true closure and pruned a 30 mm false one; at 1.0 it pruned both). A loop whose views
+the shape cannot pin (track.DEGENERATE) is not used unless markers held it: on the first platform scan
+such loops between edge-on views of the hand were 8-44 degrees off (degeneracy 0.0003-0.004, the good
+ones 0.013 and up), and the graph kept them all.
 """
 import json
 import sys
@@ -89,7 +92,8 @@ def find_loops(kfs, levels, rng, log=print):
         for _, _, i, start, kind, pairs in cands[:MAX_PER_KEYFRAME]:
             t, info = track.solve(levels[j], levels[i], start, marker_pairs=pairs)
             if (info["fitness"] >= LOOP_FITNESS and info["rmse_mm"] is not None and info["rmse_mm"] <= LOOP_RMSE_MM
-                    and (info["marker_rmse_mm"] is None or info["marker_rmse_mm"] <= LOOP_MARKER_MM)):
+                    and (info["marker_rmse_mm"] is None or info["marker_rmse_mm"] <= LOOP_MARKER_MM)
+                    and (info["markers_used"] or (info["degeneracy"] or 0.0) >= track.DEGENERATE)):
                 loops.append((i, j, t, info_matrix(levels[j][-1], levels[i][-1], t), kind))
     log(f"loop closures: {len(loops)} verified")
     return loops
@@ -122,11 +126,25 @@ def optimise_poses(kfs, rng, log=print):
                                                        "loops_kept": kept, "loop_kinds": kinds}
 
 
+def object_features(feat, scene, pose):
+    """A keyframe's colour features (points mm in its camera, descriptors) on the object only (scene.on_object
+    at the keyframe's pose), for scans whose room stood still while the object turned: there the room's
+    features say "nothing moved" (the first platform scan closed 102 loops on them, largest correction 196 mm)."""
+    if feat is None or feat[1] is None or not len(feat[0]):
+        return feat
+    from .cloud import scene_transform
+    keep = scene.on_object(np.asarray(feat[0], float), scene_transform(pose))
+    return feat[0][keep], feat[1][keep]
+
+
 def optimise(scanner, log=print):
     """Optimise a Scanner's keyframes and merge its cloud again with the corrected poses."""
     scanner.flush()
     kfs = [{"index": i, "pose": pose, "points": pts, "feat": feat, "markers": mk}
            for i, pose, pts, feat, mk in scanner.keyframes]
+    if getattr(scanner, "object_turns", False):
+        for k in kfs:
+            k["feat"] = object_features(k["feat"], scanner.scene, k["pose"])
     new_poses, report = optimise_poses(kfs, scanner.rng, log)
     moved = [np.linalg.norm((np.linalg.inv(a["pose"]) @ b)[:3, 3]) * 1000 for a, b in zip(kfs, new_poses)]
     report["largest_correction_mm"] = round(float(max(moved)), 2) if moved else 0.0

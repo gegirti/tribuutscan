@@ -88,8 +88,18 @@ right: Scanner, Capture, Scan, IMU and View.
   dims everything that is not the object and, with a GPU, paints the scan so far over it, as seen
   from where the scanner is: **grey** where the mesh will have the surface, **yellow** where it needs
   more views, **orange** where the scanner sees the object but the scan has nothing yet. A red frame
-  means tracking is lost: aim at a part already scanned. Tick *keep raw frames* to keep the frames
-  the scan used, for replays. *Continue last* goes on with the last saved scan.
+  means tracking is lost. The depth view then shows the scan so far where it was last seen. Move (or
+  turn the object) back until the live view lines up with that grey shape, and the scan goes on. It
+  also finds its place again by itself, by shape, when the scanner sees a part already scanned.
+  Tick *keep raw frames* to keep the frames the scan used, for replays. *Continue last* goes on
+  with the last saved scan.
+- **Scanning on a platform**: the scanner can also stand still while you turn the object on a
+  platform.
+  - The scan notices this after a few seconds, because the room behind stays put ("object turning,
+    scanner standing").
+  - From then on it ignores the room's colour features: they would say nothing moved.
+  - Turn slowly where the object looks thin (THIN VIEW): there its shape barely shows how far it
+    turned.
 - **Open 3D view**: the scan in the browser. *Process* has Optimise again, merge again at
   0.5 / 1 / 2 mm point distance, Make mesh, and Remove base / Keep base; *Show* switches between
   the cloud and the mesh (*Colour: Grey* shows its shape); *Export* downloads `cloud.ply`,

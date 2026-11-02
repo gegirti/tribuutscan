@@ -167,6 +167,16 @@ class Tracker:
         self.timing["preview"] += time.perf_counter() - t0
         return out
 
+    def ghost(self, pose, base=None, min_weight=4.0):
+        """The live view from `pose` (camera -> world, metres): the volume ray cast over the whole view, not only
+        the piece's window, with the frame source() was last given in orange where the model has nothing
+        (preview's codes). While tracking is lost, from the last good pose: the scan so far where it was."""
+        t0 = time.perf_counter()
+        self.ref = gpu.pose_mm(pose)
+        self.engine.raycast(self.ref, normal_px=MODEL_NORMAL_PX, rect=None)
+        self.timing["raycast"] += time.perf_counter() - t0
+        return self.preview(base, min_weight)
+
     def fuse(self, frame, labels, pose_m):
         """Fuse a merged frame (its 1/8 labels; pose camera -> world, metres) into the volume."""
         t0 = time.perf_counter()

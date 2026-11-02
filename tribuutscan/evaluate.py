@@ -48,23 +48,38 @@ DATASETS = {  # name: (path or glob under captures/, notes, scan mode)
                 "(0.14 mm RMS at 20 cm, growing with z^2; its pattern an estimate) and 0.05 mm frame noise", "still"),
     "synthplate": ("synth/plate-rec", "synthetic 1.8 mm plate standing on the table, seen from both sides; "
                    "14-bit with the fixed error of synthfp", "still"),
+    "platform": ("20261102-170723-scan/*-rec", "the hand on a platform turned by hand (briskly, ~1 turn), the "
+                 "scanner standing, the room still behind; long range ~30 cm, no markers; the white platform top "
+                 "gives no depth. Live: lost at the edge-on view, re-found from the room, 9.2% doubled", "still"),
+    "platform2": ("20261102-174213-scan/*-rec", "the same, turned slowly (~123 degrees in 94 s, 1109 frames); live: "
+                  "all tracked, FLAT near the edge-on view", "still"),
+    "synthturn": ("synth/turntable-rec", "synthetic: the test block on a platform turning ~400 degrees at 3-23 "
+                  "deg/s, the scanner standing at ~35 cm in a still room (table, wall, boxes), long range, 10 fps, "
+                  "14-bit with the fixed error of synthfp; the platform gives no depth", "still"),
 }
 GAPS = {  # name: (dataset, frames left out): a stretch skipped as if tracking had been lost while the scanner moved
     "markersgap": ("markers", range(250, 330)),
     "handgap": ("hand", range(150, 250)),
+    "synthturngap": ("synthturn", range(150, 175)),  # 2.5 s, the block turned ~40 degrees on
 }
 DATASETS.update({name: (DATASETS[base][0], f"{base} with frames {gap.start}-{gap.stop - 1} left out: tracking "
                         "must find its place again after a jump", DATASETS[base][2]) for name, (base, gap) in GAPS.items()})
 SENSOR = dict(pattern_mm=0.144, noise_mm=0.05, bits=14)  # synth.py: closer to the real sensor
 SYNTH = {"synth": dict(every=1), "synth7": dict(every=3), "synthhard": dict(every=2, hard=True),
-         "synthfp": dict(every=1, **SENSOR), "synthplate": dict(every=1, kind="plate", **SENSOR)}
+         "synthfp": dict(every=1, **SENSOR), "synthplate": dict(every=1, kind="plate", **SENSOR),
+         "synthturn": dict(n_frames=600, every=2, kind="turntable", **SENSOR)}
 PRIVATE = set()  # datasets never rendered (none at the moment)
+
+
+def base_of(name):
+    """The dataset a gap variant leaves frames out of (the name itself otherwise)."""
+    return GAPS.get(name, (name,))[0]
 
 
 def dataset_path(name):
     pattern = DATASETS[name][0]
-    if name in SYNTH and not (fr.CAPTURES / pattern).exists():
-        synth.generate(fr.CAPTURES / pattern, **SYNTH[name])
+    if base_of(name) in SYNTH and not (fr.CAPTURES / pattern).exists():
+        synth.generate(fr.CAPTURES / pattern, **SYNTH[base_of(name)])
     hits = sorted(fr.CAPTURES.glob(pattern))
     if not hits:
         raise FileNotFoundError(f"{name}: no recording at captures/{pattern}")
@@ -89,6 +104,7 @@ TRACKERS = {  # name: Scanner options (the scan mode comes from the dataset)
     "gpu-seg": dict(track_with="gpu", orb="frame"),  # coarse object search only
     "gpu-allmerge": dict(track_with="gpu", merge_min_s=0.0),  # merges not capped in time (before MERGE_MIN_S)
     "gpu-proc": dict(track_with="gpu", merge_process=True),  # merged in a process of its own (the live worker's way)
+    "gpu-noverify": dict(track_with="gpu", verify_gap=False),  # no shape check of the first frame after a gap
     "baseline": dict(clean_depth=False, gate_refind=False, motion_dt=False, track_with="icp", mode="free"),
     "p2": dict(track_with="icp"),  # frame-to-frame ICP with P1/P2 (gate, cleanup, scan modes)
     "frame": dict(target="frame"),  # joint solve against the previous frame
@@ -111,7 +127,7 @@ def run(name, tracker="baseline", preset="small", live_markers=False, optimise_a
     being handed the cached reference detections. Synthetic sets run with the estimated camera they
     were rendered with."""
     calibrated = CAMERA.spec
-    if name in SYNTH:
+    if base_of(name) in SYNTH:
         calib.use(calib.ESTIMATES)
     try:
         return _run(name, tracker, preset, live_markers, optimise_after, mesh)
@@ -145,7 +161,7 @@ def mesh_result(name, directory, scanner):
     vertices, triangles, _ = fusion.extract(engine, scanner.output_mask)
     out = {"frames": engine.frames, "triangles": int(len(triangles)), "s": round(time.perf_counter() - t, 1),
            "integrate_ms": ms["integrate"]}
-    if name in SYNTH:
+    if base_of(name) in SYNTH:
         out["tracked"] = surface_check(directory, vertices, triangles)
         truth = synth.read_truth(directory)
         engine, _ = fusion.fuse(((f, truth[i], None) for i, f in enumerate(fr.read_recording(directory)) if i in truth),
@@ -197,6 +213,8 @@ def _run(name, tracker, preset, live_markers, optimise_after, mesh=False):
         "region_mm": None if scanner.scene.radius is None else round(float(scanner.scene.radius)),
         "pose_jumps": metrics.pose_jumps(tracked, centre),
         "flat_frames": scanner.stats.get("flat", 0),
+        "object_turns": scanner.object_turns, "room_votes": dict(scanner.room_votes),
+        "shape_refinds": scanner.stats.get("shape_refinds", 0),
         "feature_starts": scanner.feature_starts,
         "double_surface_ratio": round(metrics.double_surface_ratio(xyz, normals), 4),
         "marker_scatter": metrics.marker_scatter(sightings),
@@ -207,7 +225,7 @@ def _run(name, tracker, preset, live_markers, optimise_after, mesh=False):
     }
     if mesh:
         result["mesh"] = mesh_result(name, directory, scanner)
-    if name in SYNTH:
+    if base_of(name) in SYNTH:
         truth = synth.read_truth(directory)
         result["ground_truth"] = {k: (round(v, 3) if isinstance(v, float) else v)
                                   for k, v in metrics.ate_rpe(dict(tracked), truth).items()}
@@ -265,7 +283,8 @@ def show(results, against=None):
             ("keyframe_marker_scatter.scatter_mm", "kf mk mm"), ("loop_gap.mm", "gap mm"),
             ("ground_truth.ate_mm", "ATE mm"), ("keyframe_ground_truth.ate_mm", "kf ATE"), ("truth_mm.median", "truth mm"),
             ("mesh.tracked.median", "mesh mm"), ("mesh.true_poses.median", "fused mm"),
-            ("optimise.loops_kept", "loops"), ("region_mm", "region mm"), ("ms_per_frame", "ms")]
+            ("optimise.loops_kept", "loops"), ("optimise.largest_correction_mm", "corr mm"), ("region_mm", "region mm"),
+            ("ms_per_frame", "ms")]
     print(f"{'dataset':9s} " + " ".join(f"{h:>14s}" for _, h in cols))
     for r in results:
         o = old.get(r["dataset"])

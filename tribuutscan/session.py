@@ -33,9 +33,19 @@ def shape_pose(source_mm, target_mm, seed=0):
     """Coarse transform (4x4, metres) placing source points on target points by shape alone, or None."""
     if len(source_mm) < 200 or len(target_mm) < 200:
         return None
+    return shape_match(shape_features(source_mm), shape_features(target_mm), seed)
+
+
+def shape_features(points_mm):
+    """What shape_match compares: the points (mm) thinned to FPFH_VOXEL_M, with normals and FPFH features
+    (a scan's model is described once, not on every try: cloud.Scanner.refind_shape)."""
+    return _fpfh(np.asarray(points_mm) / 1000)  # (as shape_pose always did: the same numbers)
+
+
+def shape_match(source, target, seed=0):
+    """Coarse transform (4x4, metres) placing `source` on `target` (shape_features of each), or None."""
+    (src, src_f), (tgt, tgt_f) = source, target
     o3d.utility.random.seed(seed)  # RANSAC: the same answer on a replay
-    src, src_f = _fpfh(source_mm / 1000)
-    tgt, tgt_f = _fpfh(target_mm / 1000)
     d = FPFH_VOXEL_M * 1.5
     result = reg.registration_ransac_based_on_feature_matching(
         src, tgt, src_f, tgt_f, True, d, reg.TransformationEstimationPointToPoint(False), 3,

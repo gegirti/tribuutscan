@@ -337,7 +337,7 @@ python3 -m tribuutscan.view3d captures/<stamp>-scan    # browser 3D view at http
                                             # tracking metrics on saved + synthetic recordings (--mesh:
                                             # also fuse, score against the true surface; datasets in
                                             # evaluate.DATASETS, "hand", "markersgap", "handgap" among them)
-.venv/bin/python -m tribuutscan.synth [out] [frames] [every] [hard] [--plate] [--pattern MM] [--y14]
+.venv/bin/python -m tribuutscan.synth [out] [frames] [every] [hard] [--plate | --turntable] [--pattern MM] [--y14]
                                             # synthetic scan, ground truth poses + true_surface.ply
 .venv/bin/python -m tribuutscan.bench [rec] [--frames N] [--tracker gpu] [--label x] [--against captures/bench/<run>.json]
                                             # per-stage timing table (warm, disk apart) -> captures/bench/
@@ -1065,6 +1065,89 @@ cubes on the GPU; the CPU keeps the 6x6 solve, markers, base votes, pose graph, 
       frames 900-999 and for all frames from 1000, so the viewer showed FLAT AREA.
     - Cloud doubled 0.45% (first platform scan 9.2%, the 12:13 hand-held one 0.62%). Optimise kept 468 feature
       loops, largest correction 24 mm.
+- BRING BACK THE SHAPE (2026-11-02 evening; the user's idea after the platform scans, plan approved): "when tracking
+  is lost, bring back the shape: the program fits the already scanned points".
+  - Measured first, on replays of the first platform scan, fitting lost frames to the shape so far:
+    - edge-on frames fit anywhere (fitness 1.00 at contradictory angles);
+    - the hand's unscanned back was placed 10-15 degrees off (0.52-0.68 fitness, 1.4-1.6 mm);
+    - in the thin view the weakest direction IS the platform's turn (overlap 0.85-0.92), so tying the motion
+      to the platform's axis would not help. Not done.
+  - `Scanner.refind_shape` (GPU tracker), after relock and the colour re-find fail:
+    - `session.shape_match` (FPFH + RANSAC; `shape_pose` split into `shape_features` / `shape_match`, the
+      model's features computed once per merge) against the object so far, refined by the GPU solve;
+    - checks: solve_ok, RELOCK_FITNESS, degeneracy >= track.DEGENERATE (edge-on views refused), floor_agrees,
+      reachable; then REFIND_HOLD;
+    - at most one try per SHAPE_EVERY_S 0.25 s while lost; status "re-found by shape", stats "shape_refinds",
+      the worker's end line ("lost N, found again M (K by shape)").
+    - The coarse RANSAC placement is 1.7-2.5 mm / 0.9-3.7 degrees (test block); the solve refines it.
+  - FOUND: a turn about a vertical axis hides in horizontal faces.
+    - The synthetic test block on a platform with 3 s left out (38 degrees): the next frame's solve started at
+      the last pose and was ACCEPTED 37 degrees off, and so was every later frame (synthturngap: ATE 50.8 mm,
+      17.7% doubled).
+    - Fix: the first frame tracked after GAP_S 0.5 s without one is checked by shape (`shape_candidate`, no
+      throttle). A candidate that fits clearly better (`fits_better`) and lies elsewhere (`same_pose`)
+      replaces the solve.
+    - `verify_gap=False` (evaluate tracker "gpu-noverify") leaves the check out: every other dataset came out
+      the same, and synthturngap got worse (ATE 110 mm).
+  - `Scanner.check_room` ("still" mode, at a keyframe, at most once per second of frame time): is the room
+    (neither object nor base, on an 8-pixel grid) of an earlier keyframe found again where it was (it stood),
+    or where the tracked motion takes it?
+    - `room_verdict`: Open3D nearest distances, ROOM_TOL_MM 4. Only points the two hypotheses tell apart count:
+      a point landing on the room as it was says nothing. Without that, a table under a turntable (a plane that a
+      vertical turn maps onto itself) let "moved" match half the points of a still room.
+    - Sampling: the reference is thinned to 5000 points, the current room is kept whole, both on the same pixel
+      grid. Thinning both by index made "still" depend on which samples survived.
+    - Cost: run at every keyframe on the whole stride-4 room, it took 10-25% of the live worker's frame rate on
+      the hand-held hand2 recording (the camera moves, so nearly every keyframe gave a verdict). After the fix,
+      hand2 live (alternating, load 6-14): 12.7 / 12.6 fps against the old code's 12.3 / 11.5; 441 tracked
+      against 420.
+    - 3 "still" verdicts set `object_turns`:
+      - `orb_mask` takes colour features on the object's pixels (keyframe ORB, the ORB start/retry,
+        refind_anywhere, whose "away" rule goes too);
+      - Optimise matches features on the object only (`optimise.object_features`, `Scene.on_object`: the
+        cylinder, or the ball when no base was found);
+      - session.json gets "object_turns", and it is restored with the scan;
+      - the viewer shows "object turning, scanner standing", and FLAT becomes "THIN VIEW: turn slowly here".
+    - Both platform recordings: 3 still / 0 moved verdicts. The hand-held box: no "still" verdict.
+  - Optimise refuses loops the shape cannot pin, unless markers held them.
+    - On the first platform scan the "near" loops between edge-on views were 8-44 degrees off tracking, at
+      degeneracy 0.0003-0.004; the 42 good ones were 0.013 and up. The graph had kept them all.
+    - The "largest correction" Optimise reports is the CAMERA's move: with the platform's hand ~330 mm away,
+      22 mm there is a ~3.7 degree turn.
+  - The shape while lost:
+    - `gputrack.Tracker.ghost`: a full-view ray cast at a pose, with the preview codes.
+    - `Scanner.show_ghost` on lost frames, including "too few points" ones (their small piece is sourced).
+    - After a gap check, the preview is ray cast at the accepted pose.
+    - Hint: "TRACKING LOST: turn (or move) back until the live view lines up with the grey shape".
+    - Correction to the plan: frames with too few points showed NO model (view_codes cleared), not stale codes.
+  - synth kind "turntable" (`--turntable`): two scenes cast from one camera, the nearer hit kept; the platform
+    is NO_DEPTH like the real one; long range (the estimated law's window ~204-600 mm); the turn tied to time
+    (TURN_DEG in TURN_S). The old sets regenerate byte for byte (box, plate checked).
+  - evaluate datasets: platform, platform2, synthturn, and synthturngap (frames 150-174 left out). Gap
+    variants of synthetic sets keep their truth (`base_of`). New "corr mm" column.
+  - Results: evaluate --tracker gpu --optimise, captures/eval/20261102-195748-turn-final3 against
+    20261102-182449-turn-before.
+
+    | dataset | tracked | doubled | Optimise's largest correction | other |
+    |---|---|---|---|---|
+    | platform (17:07) | 456 -> 325 | 6.0 -> 0.40% | 80.9 -> 0.84 mm | marker scatter 2.86 -> 1.61 mm |
+    | platform2 (17:42) | 1109 = | 0.19 -> 0.20% | 24.1 -> 10.9 mm | |
+    | synthturngap | 275 = | 17.7 -> 1.5% | 195 -> 2.5 mm | ATE 50.8 -> 1.67 mm, truth 0.50 -> 0.19 mm |
+    | synthturn | 300 = | 1.54 -> 1.49% | 2.4 -> 2.6 mm | ATE 1.74 -> 1.68 mm, truth 0.21 -> 0.19 mm |
+    | handgap | 315 -> 382 | 0.27 -> 0.39% | 1.7 -> 2.2 mm | the shape re-find comes back sooner |
+
+    - Everything else (markers, hand, the five older synthetic sets, markersgap) is identical in tracking.
+    - The loop check drops loops on markers (580 -> 508) and markersgap (493 -> 442), with marker scatter and
+      corrections unchanged (2.93 -> 2.85, 2.49 -> 2.55 mm).
+    - platform tracks fewer frames because the old code went on with the room's features, at wrong poses.
+      The back of the hand stays missing: it was turned past while tracking was lost.
+    - Room verdicts:
+      - the hand-held sets got "moved" only (markers 32, hand 37, synth sets 6-7);
+      - synthplate got 1 "still" and 1 "moved";
+      - all three platform sets got 3 "still" against 0.
+    - Live worker (bench --live) on the first platform recording: 330 of 505 tracked at 8.7 fps (lost frames
+      cost relock, the re-finds and the full-view ghost), Optimise 42 loops, 0.9 mm. The old code: 485 tracked
+      at 12.1 fps, 69 mm.
 - LIVE SPEED, step 4 (2026-11-02, plan approved): a live frame's depth decoded where it is used.
   - The decode paths:
     - `depth.decode_strided`: the first pixel of each packed group, every 4th row, plus the

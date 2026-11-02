@@ -188,6 +188,16 @@ class Scene:
         r = np.linalg.norm(world - np.outer((world - self.axis) @ n, n) - self.axis, axis=1)
         return (r > self.radius + REGION_MARGIN_MM) | (self.height(world) > self.top + REGION_MARGIN_MM)
 
+    def on_object(self, xyz_cam, cam_to_region):
+        """Which points (camera coordinates) lie in the object's region: its cylinder plus REGION_MARGIN_MM
+        (not `away`), or while no base is known its ball plus that margin; all, before either exists."""
+        if self.plane is not None and self.axis is not None:
+            return ~self.away(xyz_cam, cam_to_region)
+        if self.ball is None:
+            return np.ones(len(xyz_cam), bool)
+        world = xyz_cam @ cam_to_region[:3, :3].T + cam_to_region[:3, 3]
+        return np.linalg.norm(world - self.ball[0], axis=1) <= self.ball[1] + REGION_MARGIN_MM
+
     def object_mask(self, xyz_cam, pix, shape, cam_to_region):
         """Which points (camera coordinates) are the object (see `masks`)."""
         return self.masks(xyz_cam, pix, shape, cam_to_region)[0]

@@ -10,7 +10,8 @@ Commands:  ("start", preset, out_dir, keep_raw, continue_from or None, depth mod
            | ("stop",) | ("quit",)   (times: camera capture times, seconds)
 Replies:   ("ready", url) | ("log", text)
            | ("frame_done", merged, frames, points, tracking, cue, view, model, t_depth) | ("saved", path, points)
-           cue: {"markers": used, "features": ORB start, "flat": shape alone slides, "base": base found}
+           cue: {"markers": used, "features": ORB start, "flat": shape alone slides, "base": base found,
+                 "turning": the object turns and the scanner stands (Scanner.check_room)}
            view: what the frame was, at 1/VIEW_STEP of its size (uint8: 0 other, 1 base, 2 object), or None
            model: the live model view of that frame (gpu.preview_codes at 1/gputrack.PREVIEW_STEP: its piece
            against the model built so far), or None without the GPU tracker; t_depth: the frame's depth time
@@ -244,7 +245,8 @@ def run(commands, replies, port=view3d.PORT):
             timing["feed"] += time.perf_counter() - t2
             timing["frames"] += 1
             replies.put(("frame_done", s.stats["merged"], s.stats["frames"], points, s.stats["tracking"],
-                         dict(s.cue, base=s.scene.plane is not None), view_mask(s.last_view), s.view_codes, t_d))
+                         dict(s.cue, base=s.scene.plane is not None, turning=s.object_turns), view_mask(s.last_view),
+                         s.view_codes, t_d))
         elif kind == "frame":
             replies.put(("frame_done", 0, 0, 0))
         elif kind == "stop" and source.scanner is not None:
@@ -262,6 +264,8 @@ def run(commands, replies, port=view3d.PORT):
                                 f"raw copy {1000 * timing['raw'] / n:.0f} ms, waiting for frames "
                                 f"{1000 * timing['wait'] / n:.0f} ms, decode beside tracking "
                                 f"{1000 * (reader.decode_s - decoded_at_start) / n:.0f} ms"
+                                f"; lost {source.scanner.stats['lost']}, found again {source.scanner.stats['relocked']} "
+                                f"({source.scanner.stats['shape_refinds']} by shape)"
                                 + (f"; GPU {source.scanner.stats['gpu_ms']}" if source.scanner.stats.get("gpu_ms") else "")))
             try:  # Optimise right away (user decision): loop closures, pose graph, merge again
                 from . import optimise

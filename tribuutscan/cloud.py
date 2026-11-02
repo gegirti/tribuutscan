@@ -65,6 +65,19 @@ REFIND_MM_S, REFIND_DEG_S, REFIND_SLACK = 300.0, 60.0, (50.0, 15.0)  # ...and mu
     # a full circle round the object in 6 s is a fast walk; a faster turn only delays the re-find. The plate's
     # mirrored re-find turned 136 degrees in 1.35 s (truly ~45); the real ones 18-31 degrees after 19-27 s
 REFIND_HOLD = 2  # frames tracked after a pose found anywhere before merging resumes
+SHAPE_EVERY_S = 0.25  # refind_shape: at most one try per this much frame time while lost (~50-150 ms each)
+GAP_S = 0.5  # the first frame tracked after this long without one (lost frames, or none came) is checked by shape:
+    # its solve began at the last good pose, and a turn about a vertical axis hides in horizontal faces (the
+    # synthetic block on a platform, 3 s left out: "tracked" 37 degrees off)
+ROOM_EVERY_S, ROOM_GRID_PX, ROOM_POINTS = 1.0, 8, 5000  # check_room: once per second of frame time, on the room's
+    # pixels on an 8-pixel grid (the same pixels in every frame: a still room's samples stay where they were), at most
+    # ROOM_POINTS of a keyframe's looked for in a later one. At every keyframe on the full stride-4 room it cost the
+    # live worker 10-25% of its frame rate on the hand-held hand scan
+ROOM_SHIFT_MM, ROOM_MIN, ROOM_TOL_MM, ROOM_CLEAR, ROOM_VERDICTS = 10.0, 300, 4.0, 0.5, 3
+    # points the tracked motion moves ROOM_SHIFT_MM or more count (ROOM_MIN of them for a verdict); a point is where a
+    # hypothesis puts it within ROOM_TOL_MM; a verdict needs ROOM_CLEAR of the points and twice the other
+    # hypothesis's share; ROOM_VERDICTS "still" ones set object_turns (the room stands while the object turns: a
+    # platform, the scanner standing)
 MARKER_IDLE_FRAMES, MARKER_IDLE_EVERY = 15, 4  # no markers seen for this long: look on every 4th frame only
 GPU_MAX_RMSE_MM, GPU_RMSE_Z_MM = 1.0, 450.0  # the GPU solve's residual limit, growing with the piece's distance
     # squared beyond 450 mm (depth noise does; long range reaches 720 mm: 2.6 mm there). synthhard's jerk frame
@@ -417,6 +430,43 @@ def isolate(xyz, rgb, pix, shape, rng):
     return xyz[keep], rgb[keep], plane is not None
 
 
+def fits_better(a, b):
+    """Does the solve info `a` fit the frame clearly better than `b`: more of it matched, or as much with a
+    clearly smaller residual?"""
+    if a["rmse_mm"] is None:
+        return False
+    if b["rmse_mm"] is None:
+        return True
+    return a["fitness"] >= b["fitness"] + 0.05 or (a["fitness"] >= b["fitness"] - 0.02 and a["rmse_mm"] <= 0.8 * b["rmse_mm"])
+
+
+def same_pose(a, b, xyz, mm=3.0, deg=1.5):
+    """Do two steps (from the same pose) place the frame's piece within `mm` (at its centre) and `deg`?"""
+    d = np.linalg.inv(a) @ b
+    c = xyz.mean(0) / 1000
+    return np.linalg.norm(d[:3, :3] @ c + d[:3, 3] - c) * 1000 <= mm and turned(d)[1] <= deg
+
+
+def room_verdict(still_pts, moved_pts, room, tol_mm=ROOM_TOL_MM):
+    """Scanner.check_room's verdict: "still" if the room's points are found again where they were in the view
+    (still_pts) rather than where the tracked motion would have taken them (moved_pts), "moved" for the
+    opposite, None when neither clearly wins. room: this frame's room points (camera mm). Only points the two
+    tell apart count: a point that lands on the room as it was says nothing (a plane the motion maps onto
+    itself, as a table under a turntable: with it "moved" matched half the points of a still room)."""
+    import open3d as o3d
+    cloud = lambda pts: o3d.geometry.PointCloud(o3d.utility.Vector3dVector(np.asarray(pts, float)))
+    near = lambda a, b: np.asarray(cloud(a).compute_point_cloud_distance(cloud(b))) < tol_mm
+    tell = ~near(moved_pts, still_pts) & ~near(still_pts, moved_pts)
+    if tell.sum() < ROOM_MIN:
+        return None
+    still, moved = float(near(still_pts[tell], room).mean()), float(near(moved_pts[tell], room).mean())
+    if still >= ROOM_CLEAR and still >= 2 * moved:
+        return "still"
+    if moved >= ROOM_CLEAR and moved >= 2 * still:
+        return "moved"
+    return None
+
+
 def plausible_step(t, xyz, scale=1.0):
     """Is a frame-to-frame motion believable? Judged at the object's centre, not the camera.
 
@@ -537,7 +587,7 @@ class Scanner:
     def __init__(self, preset="small", log=print, clean_depth="merge", gate_refind=True, motion_dt=True,
                  mode="still", track_with="joint", target="model", use_features=True, threaded_merge=True,
                  remove_base=True, segment_stride=None, orb=None, merge_min_s=None, live_view=False,
-                 merge_process=False):
+                 merge_process=False, verify_gap=True):
         try:
             from . import fuse  # Open3D: frame-to-frame ICP
         except ImportError:
@@ -551,7 +601,7 @@ class Scanner:
         self.poses = []
         self.model, self.model_merged = None, -1  # cloud-so-far, prepared for relocking
         self.stats = {"frames": 0, "merged": 0, "lost": 0, "relocked": 0, "plane_frames": 0, "markers": [],
-                      "tracking": True}
+                      "tracking": True, "shape_refinds": 0, "object_turns": False}
         self.clean_depth, self.gate_refind, self.motion_dt = clean_depth, gate_refind, motion_dt
         from .scene import Scene
         self.scene = Scene(mode, self.rng)
@@ -614,6 +664,11 @@ class Scanner:
         self.last_t, self.motion_s, self.lost_run = None, None, 0  # time of the last tracked frame, of `motion`
         self.frame_table = None  # this frame's own table: (normal, narrower extent mm), for floor_agrees
         self.hold, self.refind_feat = 0, None  # refind_anywhere's state
+        self.shape_model, self.shape_t = None, None  # refind_shape's: (merged count, the model's shape features), last try
+        self.verify_gap = verify_gap  # the first frame tracked after GAP_S is checked by shape (shape_candidate)
+        self.object_turns = False  # the room stands still while the object turns (check_room): its features left out
+        self.room_ref, self.room_votes, self.room_t = None, {"still": 0, "moved": 0}, None  # check_room's reference,
+        # verdicts and the frame time it last looked
         self.merge_t = None  # frame time of the last merge
         self.merge_min_s = MERGE_MIN_S if merge_min_s is None else merge_min_s
         self.no_markers = 0  # frames since markers were last seen (frame_markers)
@@ -674,6 +729,9 @@ class Scanner:
             stats["tracking"] = False
             self.lost_run += 1
             self.track_log.append((index, "too few points", None))
+            if self.gpu is not None:
+                self.gpu_source(frame, xyz, pix)  # (what little there is, in orange over the shape)
+                self.show_ghost()
             return False
         status = "first" if self.prev is None else "tracked"
         if self.track_with == "markers":
@@ -694,8 +752,7 @@ class Scanner:
             marker_pts = self.frame_markers(frame) if self.track_with in ("joint", "gpu") else np.empty((0, 3))
             feat = None
             if joint and self.features is not None and self.orb == "frame":  # colour features: a starting pose
-                feat = self.features.extract(self.features.luma_of(frame), frame["depth"],
-                                             None if scene.mode == "still" else pix)
+                feat = self.features.extract(self.features.luma_of(frame), frame["depth"], self.orb_mask(pix))
                 if self.prev is not None and self.prev_feat is not None:
                     found, _ = self.features.relative_pose(feat, self.prev_feat, self.rng)
                     self.cue = {"features": bool(found is not None and plausible_step(found, xyz))}
@@ -725,8 +782,17 @@ class Scanner:
                             step, info = self.gpu_step(xyz, marker_pts, retry)
                             ok = self.accepted(info, step, xyz)
                             self.feature_starts += 1
+                    alt = None
+                    if ok and self.verify_gap and self.after_gap(t):  # a second opinion by shape (GAP_S)
+                        alt = self.shape_candidate(xyz, marker_pts, t, every_s=0.0)  # (once per gap)
+                        if alt is not None and fits_better(alt[1], info) and not same_pose(alt[0], step, xyz):
+                            step, info, status = alt[0], alt[1], "re-found by shape"
+                            stats["relocked"] += 1
+                            stats["shape_refinds"] += 1
                     self.note(index, info)
-                    if self.live_view:
+                    if self.live_view and alt is not None:  # (the last ray cast was the candidate's: one at the pose)
+                        self.view_codes = self.gpu.ghost(self.pose @ step, self.gpu_base(), self.preview_weight())
+                    elif self.live_view:
                         self.view_codes = self.gpu.preview(self.gpu_base(), self.preview_weight())
                 elif joint:
                     step, ok = self.joint_step(levels, xyz, marker_pts, guess, index)
@@ -734,7 +800,9 @@ class Scanner:
                     result = fuse.icp(levels, self.prev, guess)
                     step = result.transformation
                     ok = result.fitness >= fuse.MIN_FITNESS and plausible_step(step, xyz)
-                if ok:
+                if ok and status != "tracked":  # (re-found by shape after a gap: no motion to go on from)
+                    self.pose, self.motion, self.motion_s = self.pose @ step, np.eye(4), None
+                elif ok:
                     self.motion = step
                     self.motion_s = (t - self.last_t) if (t is not None and self.last_t is not None) else None
                     self.pose = self.pose @ self.motion
@@ -745,11 +813,15 @@ class Scanner:
                     stats["relocked"] += 1
                     status = "re-found"
                     feat = self.refind_feat
+                elif self.refind_shape(xyz, marker_pts, t):
+                    stats["relocked"] += 1
+                    status = "re-found by shape"
                 else:
                     stats["lost"] += 1
                     stats["tracking"] = False
                     self.lost_run += 1
                     self.track_log.append((index, "lost", None))
+                    self.show_ghost()
                     return False
             self.last_t, self.lost_run = t, 0
             self.prev = True if levels is None else levels
@@ -769,7 +841,7 @@ class Scanner:
             self.last_view = (all_pix, keep, np.zeros(len(keep), bool), shape)
         self.labels[index] = view_mask(self.last_view)
         stats["plane_frames"] += scene.plane is not None
-        if status == "re-found" and self.track_with == "gpu":
+        if status.startswith("re-found") and self.track_with == "gpu":
             self.hold = REFIND_HOLD + 1
         if self.hold:  # a pose found anywhere is merged only once the frames after it have tracked from it
             self.hold -= 1
@@ -780,6 +852,11 @@ class Scanner:
             if fuse is not None and move < KEY_MOVE_MM and turn < KEY_TURN_DEG and self.since_merge < KEY_EVERY:
                 return False
         self.since_merge, self.last_merged = 0, self.pose.copy()
+        if scene.mode == "still" and fuse is not None and not self.object_turns \
+                and (t is None or self.room_t is None or not 0 <= t - self.room_t < ROOM_EVERY_S):
+            self.room_t = t
+            room = ~(obj | base) & np.all(all_pix % ROOM_GRID_PX == 0, axis=1)  # (neither object nor base)
+            self.check_room(all_xyz[room])
         if self.gpu is not None:  # into the volume the next frame is tracked against: every such frame (cheap)
             self.gpu.fuse(frame, self.labels[index], self.pose)
             self.gpu_fused += 1
@@ -790,7 +867,7 @@ class Scanner:
             from .gputrack import grid_points
             self.keyframes.append((index, self.pose.copy(), grid_points(xyz), feat, marker_pts))
             if self.orb == "demand" and self.features is not None and feat is None:  # keyframes keep their ORB:
-                job = (len(self.keyframes) - 1, frame, None if scene.mode == "still" else pix, self.pose.copy())
+                job = (len(self.keyframes) - 1, frame, self.orb_mask(pix), self.pose.copy())
                 if self.merge_proc is not None:  # extracted in the merge process, with this frame's merge
                     orb_job, self.orb_slot = (job[0], job[2]), job[0]
                 elif self.merger is None:  # extracted in the merge thread, in order (ORB releases the GIL)
@@ -908,7 +985,8 @@ class Scanner:
             a, b = m["at"][k], m["at"][k + 1]
             sc.merged_data[int(index)] = (m["points"][a:b], m["rgb"][a:b], m["normals"][a:b])
         sc.pose = sc.last_merged = sc.poses[-1][1]
-        sc.stats.update({k: session[k] for k in ("frames", "merged", "lost", "relocked") if k in session})
+        sc.stats.update({k: session[k] for k in ("frames", "merged", "lost", "relocked", "shape_refinds") if k in session})
+        sc.object_turns = sc.stats["object_turns"] = bool(session.get("object_turns", False))
         sc.sources = list(session.get("sources", []))
         if (directory / "frame_poses.txt").exists():  # every tracked frame (scans saved before 2026-11-01: none)
             status = {}
@@ -1068,8 +1146,7 @@ class Scanner:
         if self.merge_proc is not None and self.orb_slot is not None:
             self.sync_merges()  # (the same, from the merge process: its replies come in order)
             self.orb_slot = None
-        feat = self.features.extract(self.features.luma_of(frame), self.depth_of(frame),
-                                     None if self.scene.mode == "still" else pix)
+        feat = self.features.extract(self.features.luma_of(frame), self.depth_of(frame), self.orb_mask(pix))
         if self.prev_feat is None or self.feat_pose is None:
             return feat, None
         found, _ = self.features.relative_pose(feat, self.prev_feat, self.rng)
@@ -1226,7 +1303,7 @@ class Scanner:
             return False
         if feat is None:
             feat = self.refind_feat = self.features.extract(self.features.luma_of(frame), self.depth_of(frame),
-                                                            None if self.scene.mode == "still" else pix)
+                                                            self.orb_mask(pix))
         pick = sorted(set(np.linspace(0, len(kfs) - 1, min(REFIND_KEYFRAMES, len(kfs))).round().astype(int))
                       | set(range(max(0, len(kfs) - 4), len(kfs))))
         counts = sorted(((len(self.features.good_matches(feat, kfs[j][3])), j) for j in pick), reverse=True)
@@ -1238,7 +1315,8 @@ class Scanner:
             if found is None or inliers < REFIND_MIN_INLIERS:
                 continue
             pose = kfs[j][1] @ found
-            if self.scene.mode == "still" and self.scene.away(pts[0], scene_transform(pose)).sum() < REFIND_MIN_AWAY:
+            if self.scene.mode == "still" and not self.object_turns \
+                    and self.scene.away(pts[0], scene_transform(pose)).sum() < REFIND_MIN_AWAY:
                 continue  # held by the object alone: a symmetric one matches itself turned round
             step, info = self.gpu_step(xyz, marker_pts, np.linalg.inv(self.pose) @ pose)
             if self.solve_ok(info, xyz) and info["fitness"] >= RELOCK_FITNESS and self.floor_agrees(step) \
@@ -1259,6 +1337,92 @@ class Scanner:
         moved_mm = np.linalg.norm(step[:3, :3] @ c + step[:3, 3] - c) * 1000
         return (moved_mm <= REFIND_MM_S * dt + REFIND_SLACK[0]
                 and turned(step)[1] <= REFIND_DEG_S * dt + REFIND_SLACK[1])
+
+    def orb_mask(self, pix):
+        """Where colour features are taken: the whole image in "still" mode, where the room stands for the
+        scanner's motion, unless check_room found it standing while the object turns; else the object's pixels."""
+        return None if self.scene.mode == "still" and not self.object_turns else pix
+
+    def refind_shape(self, xyz, marker_pts, t):
+        """Lost, and neither back near the last good pose (relock) nor found by colour (refind_anywhere): fit
+        the frame's piece to the object scanned so far, anywhere on it, by shape (session.shape_match, as
+        continuing a scan does), refined and checked by the tracking solve: solve_ok, RELOCK_FITNESS, the
+        shape pinning the pose (an edge-on hand "fits" anywhere: fitness 1.00 at contradictory angles on the
+        first platform scan, so a flat-face view is refused), floor_agrees and reachable. It works where the
+        view overlaps what is scanned (the live view shows the scan so far while lost: show_ghost). At most
+        one try per SHAPE_EVERY_S of frame time. GPU tracker only."""
+        found = self.shape_candidate(xyz, marker_pts, t)
+        if found is None:
+            return False
+        self.pose, self.motion, self.motion_s = self.pose @ found[0], np.eye(4), None
+        self.stats["shape_refinds"] += 1
+        return True
+
+    def shape_candidate(self, xyz, marker_pts, t, every_s=SHAPE_EVERY_S):
+        """refind_shape's search: (step from the last good pose, its solve info) placing the frame's piece on the
+        object scanned so far by shape and passing the checks, or None (also between tries: every_s)."""
+        if self.gpu is None or self.fuse is None or not self.stats["merged"] or len(xyz) < 200:
+            return None
+        if t is not None and self.shape_t is not None and 0 <= t - self.shape_t < every_s:
+            return None
+        self.shape_t = t
+        from . import session, track
+        if self.shape_model is None or self.shape_model[0] != self.stats["merged"]:
+            self.sync_merges()
+            model = self.model_points(min_seen=2)
+            if len(model) < 200:
+                return None
+            self.shape_model = (self.stats["merged"], session.shape_features(model))
+        found = session.shape_match(session.shape_features(xyz), self.shape_model[1])
+        if found is None:
+            return None
+        step, info = self.gpu_step(xyz, marker_pts, np.linalg.inv(self.pose) @ found)
+        if not (self.solve_ok(info, xyz) and info["fitness"] >= RELOCK_FITNESS
+                and (info["degeneracy"] or 0.0) >= track.DEGENERATE and self.floor_agrees(step)
+                and self.reachable(step, xyz, t)):
+            return None
+        return step, info
+
+    def after_gap(self, t):
+        """Is this the first frame after GAP_S without a tracked one (or after lost frames, without stamps)?"""
+        if t is None or self.last_t is None:
+            return self.lost_run > 0
+        return t - self.last_t > GAP_S
+
+    def check_room(self, room):
+        """Does the room (this keyframe's points that are neither object nor base, camera mm) stand still in
+        the view while tracking says the view of the object moved: the object turns (a platform) and the
+        scanner stands? Then the room's colour features say "nothing moved" and must not be used: the first
+        platform scan was re-found from the shelves behind the hand and Optimise closed 102 loops on them.
+        Compared with the room of an earlier keyframe once the tracked motion moves ROOM_MIN of its points
+        ROOM_SHIFT_MM (room_verdict); ROOM_VERDICTS "still" verdicts (and more than "moved" ones) set
+        object_turns for the rest of the scan. `room`: on the ROOM_GRID_PX pixel grid (feed)."""
+        query = room[::max(1, len(room) // ROOM_POINTS)]  # (thinned only where it is looked for: found again in the
+        if self.room_ref is None:                          # whole room, a still one is not lost between samples)
+            self.room_ref = (self.pose.copy(), query)
+            return
+        ref_pose, ref_room = self.room_ref
+        move = np.linalg.inv(self.pose) @ ref_pose  # the reference camera -> this camera (metres)
+        moved = ref_room @ move[:3, :3].T + move[:3, 3] * 1000
+        far = np.linalg.norm(moved - ref_room, axis=1) >= ROOM_SHIFT_MM
+        if far.sum() < ROOM_MIN or len(room) < ROOM_MIN:
+            return
+        self.room_ref = (self.pose.copy(), query)
+        verdict = room_verdict(ref_room[far], moved[far], room)
+        if verdict is None:
+            return
+        self.room_votes[verdict] += 1
+        if verdict == "still" and self.room_votes["still"] >= ROOM_VERDICTS \
+                and self.room_votes["still"] > self.room_votes["moved"]:
+            self.object_turns = self.stats["object_turns"] = True
+            self.log("the object turns and the scanner stands (a platform): the room's colour features are left out")
+
+    def show_ghost(self):
+        """While lost, the live view shows the scan so far where it was last seen (the last good pose, over
+        the whole view), with this frame's piece in orange where it does not match: turn (or move) back until
+        they line up, and relock or refind_shape takes over."""
+        if self.live_view and self.gpu is not None and self.stats["merged"]:
+            self.view_codes = self.gpu.ghost(self.pose, self.gpu_base(), self.preview_weight())
 
     def relock_source(self, levels, xyz):
         """Levels to re-find with: the frame's object piece, as tracked (the cloud holds only the object)."""

@@ -1055,10 +1055,13 @@ class App:
                                      model=None if model is None or raw is None else (model, raw))
                     held = ", ".join(([f"{cue['markers']} markers"] if cue.get("markers") else [])
                                      + (["features"] if cue.get("features") else [])) or "shape"
-                    hint = ("   TRACKING LOST: aim at a part already scanned, or move back to where it was"
-                            if not tracking else
+                    turning = cue.get("turning")
+                    hint = ("   TRACKING LOST: turn " + ("" if turning else "(or move) ") + "back until the live view "
+                            "lines up with the grey shape" if not tracking else
+                            "   THIN VIEW: turn slowly here" if cue.get("flat") and turning else
                             "   FLAT AREA: aim at an edge, a corner or markers" if cue.get("flat") else "")
-                    base = "base found" if cue.get("base") else "looking for the base"
+                    base = ("object turning, scanner standing | " if turning else "") + \
+                        ("base found" if cue.get("base") else "looking for the base")
                     self.message = f"SCAN {merged} of {frames} frames merged, {points:,} points | held by {held} | {base}{hint}"
             elif kind == "saved":
                 path, points = rest

@@ -521,3 +521,105 @@ def test_frames_as_the_live_worker_gets_them_are_tracked_and_merged():
                 assert done[0] == 0 and thin[0] > 20000 and done[-1] > 4 * thin[-1] and done[-1] > 30000
     finally:
         calib.use(before)
+
+
+def test_room_verdict_tells_a_still_room_from_a_moving_one():
+    """check_room's verdict on a room (a wall, a floor and a box, camera mm), found again in the next keyframe
+    as it was (a platform turned, the scanner stood) or where the tracked motion takes it (the scanner went
+    round a still object); a wall sliding along itself tells nothing."""
+    try:
+        import open3d  # noqa: F401
+    except ImportError:  # needs Open3D (.venv)
+        return
+    from tribuutscan import track
+    rng = np.random.default_rng(3)
+    u = lambda lo, hi, n=3000: rng.uniform(lo, hi, n)
+    room = np.r_[np.c_[u(-300, 300), u(-250, 100), np.full(3000, 600.0)],  # wall
+                 np.c_[u(-300, 300), np.full(3000, 100.0), u(350, 600)],  # floor
+                 np.c_[np.full(1500, -150.0), u(-60, 100, 1500), u(450, 530, 1500)]]  # a box's side
+    centre = np.array([0.0, 0.0, 330.0])  # the object, which the view turned round by 8 degrees
+    move = track.exp_se3(np.r_[0.0, np.radians(8.0), 0.0, 0.0, 0.0, 0.0])[:3, :3]
+    moved = (room - centre) @ move.T + centre
+    noise = lambda pts: pts + rng.normal(0, 0.3, pts.shape)
+    assert cl.room_verdict(room, moved, noise(room)) == "still"
+    assert cl.room_verdict(room, moved, noise(moved)) == "moved"
+    wall = room[:3000]  # the view slid 30 mm along the wall: it looks the same either way (new samples of it)
+    resampled = np.c_[u(-300, 300, 30000), u(-250, 100, 30000), np.full(30000, 600.0)]
+    assert cl.room_verdict(wall, wall + [30.0, 0, 0], noise(resampled)) is None
+
+
+def turntable_set(tmp, n_frames):
+    from pathlib import Path
+    from tribuutscan import synth
+    return synth.generate(Path(tmp) / "turn-rec", n_frames=n_frames, every=2, kind="turntable", pattern_mm=0.144,
+                          noise_mm=0.05, bits=14)
+
+
+def test_a_turning_platform_is_noticed_and_a_jump_is_found_again_by_shape():
+    """The test block on a turning platform in a still room (synth "turntable"): the room's standing is
+    noticed (object_turns: its colour features are left out from then on), and the frame 3 s later (the
+    block turned ~38 degrees) is found again by shape, close to the truth. A hand-held scan of the box is
+    not taken for a turning platform."""
+    try:
+        from tribuutscan import synth
+        from tribuutscan import gputrack
+    except ImportError:  # needs Open3D and wgpu (.venv)
+        return
+    if not gputrack.kind():
+        return
+    import tempfile
+    from pathlib import Path
+    from tribuutscan import calib
+    from tribuutscan import frames as fr
+    before = calib.CAMERA.spec
+    calib.use(calib.ESTIMATES)
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            rec = turntable_set(tmp, 160)  # 80 frames at 10 fps, ~107 degrees of turn
+            truth = synth.read_truth(rec)
+            sc = cl.Scanner(log=lambda *a: None, track_with="gpu")
+            turned_at, later = None, None
+            for i, frame in enumerate(fr.read_recording(rec)):
+                if i < 40:
+                    sc.feed(frame, i)
+                    if sc.object_turns and turned_at is None:
+                        turned_at = i
+                elif i == 70:
+                    later = frame
+            assert turned_at is not None and sc.stats["lost"] == 0, (turned_at, sc.stats)
+            # (fed in turn, that frame is "tracked" 37 degrees off: its solve starts at the last pose, and a turn
+            # about the vertical axis hides in the block's horizontal faces)
+            all_xyz, _, all_pix = cl.frame_points(later, sc.seg_stride, colour=False)
+            keep, _ = cl.isolate_mask(all_xyz, all_pix, cl.frame_shape(later), sc.rng)
+            xyz, pix = all_xyz[keep], all_pix[keep]
+            sc.gpu_source(later, xyz, pix)
+            assert sc.refind_shape(xyz, np.empty((0, 3)), later["t"]) and sc.stats["shape_refinds"] == 1
+            err = np.linalg.inv(truth[70]) @ sc.pose
+            assert np.linalg.norm(err[:3, 3]) * 1000 < 3.0 and np.degrees(np.arccos(np.clip((np.trace(err[:3, :3]) - 1) / 2, -1, 1))) < 1.0
+            sc.close()
+            box = synth.generate(Path(tmp) / "box-rec", n_frames=40)
+            sc = cl.Scanner(log=lambda *a: None, track_with="gpu")
+            for i, frame in enumerate(fr.read_recording(box)):
+                sc.feed(frame, i)
+            sc.close()
+            assert not sc.object_turns and sc.room_votes["still"] == 0, sc.room_votes
+    finally:
+        calib.use(before)
+
+
+def test_shape_match_finds_a_shape_turned_and_moved():
+    """session.shape_pose (shape features + RANSAC, now shape_features / shape_match): the test block's
+    surface found again turned by 40 degrees and moved by 60 mm, to within a few mm."""
+    try:
+        from tribuutscan import session
+    except ImportError:  # needs Open3D (.venv)
+        return
+    from tribuutscan import testblock, track
+    v, _ = testblock.build(1.0)
+    move = track.exp_se3(np.r_[np.radians([5.0, 40.0, -10.0]), [0.06, -0.02, 0.03]])  # metres
+    moved = v @ move[:3, :3].T + move[:3, 3] * 1000
+    found = session.shape_pose(v, moved)
+    assert found is not None
+    err = np.linalg.inv(move) @ found
+    # coarse (RANSAC on 3 mm features: 1.7-2.5 mm, 0.9-3.7 degrees over seeds); the tracking solve refines it
+    assert np.linalg.norm(err[:3, 3]) * 1000 < 5.0 and np.degrees(np.arccos(np.clip((np.trace(err[:3, :3]) - 1) / 2, -1, 1))) < 6.0

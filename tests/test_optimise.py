@@ -41,3 +41,18 @@ def test_loop_closure_pulls_drift_back():
     after = np.linalg.norm(poses[-1][:3, 3] - truth[-1][:3, 3]) * 1000
     assert report["loops_kept"] >= 1
     assert after < before / 2
+
+
+def test_object_features_leave_the_room_out():
+    """For a scan whose room stood while the object turned, Optimise matches keyframes' colour features on the
+    object only (its ball here: no base was found), not the room's."""
+    if optimise is None:
+        return
+    from tribuutscan.scene import Scene
+    scene = Scene("still")
+    scene.ball = (np.array([0.0, 0.0, 300.0]), 80.0, 80.0)
+    pts = np.array([[0.0, 10.0, 290.0], [30.0, -20.0, 320.0], [250.0, 0.0, 600.0], [-200.0, 50.0, 550.0]])
+    desc = np.arange(4 * 32, dtype=np.uint8).reshape(4, 32)
+    kept = optimise.object_features((pts, desc), scene, np.eye(4))
+    assert len(kept[0]) == 2 and np.array_equal(kept[1], desc[:2])
+    assert optimise.object_features(None, scene, np.eye(4)) is None

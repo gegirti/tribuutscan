@@ -1,6 +1,6 @@
 """Synthetic scans with known motion: a flat-faced box on a table, with markers, along a tilting path.
 
-    .venv/bin/python -m tribuutscan.synth [out_dir] [frames] [every] [hard] [--plate] [--pattern MM] [--y14]
+    .venv/bin/python -m tribuutscan.synth [out_dir] [frames] [every] [hard] [--plate | --turntable] [--pattern MM] [--y14]
 
 Rendered with Open3D's RaycastingScene into the viewer's raw recording format (YUYV colour, packed
 depth through the estimated depth law, blank IR), always with the estimated camera (a pinhole; it
@@ -20,6 +20,10 @@ Closer to the real sensor (options; the defaults render the first datasets byte 
 - `bits=14`: 14-bit depth (usbdepth.py), on the same law.
 - scene "plate": a 1.8 mm plate standing on the table, markers on both faces, seen from both sides
   (a path half way round it): fusion must keep both faces apart.
+- scene "turntable": the test block (testblock.py) on a platform that turns ~400 degrees at 3-23 deg/s
+  while the scanner stands (long range, ~35 cm away) in a still room (table, wall, boxes, printed with
+  features). Two scenes, the turning one and the room, are cast from the same camera and the nearer hit
+  kept. The platform gives no depth, as the user's white one did not (glossy, seen at a grazing angle).
 Every set also gets true_surface.ply: the object (without the table) in the first camera's frame,
 in cloud.ply's convention (metres, y up, z toward the scanner), so outputs can be measured in place.
 """
@@ -42,9 +46,16 @@ NOISE_MM = 0.5  # depth noise (estimate of the scanner's)
 TOP_MARKERS = [(-0.042, 0.021), (0.031, -0.026), (0.047, 0.029), (-0.013, -0.031), (0.004, 0.012)]
 SIDE_MARKERS = [(0.02, 0.035), (-0.03, 0.018)]  # on the +x face: (y, z)
 TABLE_MARKERS = [(-0.11, 0.07), (0.1, -0.08), (0.13, 0.05), (-0.09, -0.09)]
-ALBEDO = {"table": 185, "box": 45, "ring": 15, "dot": 245}
+ALBEDO = {"table": 185, "box": 45, "ring": 15, "dot": 245, "room": 150, "platform": 225}
 PLATE = np.array([0.0018, 0.10, 0.07])  # thin plate standing on the table: thickness (x), width (y), height (z)
 PLATE_MARKERS = [(-0.03, 0.045), (0.025, 0.02), (0.035, 0.055)]  # (y, z) on each face, mirrored on the back
+TURN_PLATFORM = (0.10, 0.012)  # the turning platform's radius and thickness (m); its top is z = 0
+TURN_EYE, TURN_TARGET = np.array([0.0, -0.30, 0.19]), np.array([0.0, 0.0, 0.012])  # the scanner, standing
+TURN_DEG, TURN_S, TURN_WOBBLE_DEG, TURN_WOBBLE_S = 400.0, 29.95, 12.0, 7.5  # it turns TURN_DEG in TURN_S (the
+    # evaluate set: 600 frames at 20 fps), its speed wobbling between 3 and 23 deg/s; shorter sets turn as far as their time
+TURN_GRID_MM = 0.5  # the test block's mesh (testblock.build)
+CAMERA_FPS = 20.0  # synthetic stamps: frame i of the full rate at i / CAMERA_FPS
+NO_DEPTH = {"platform"}  # materials seen in colour but without depth
 
 
 def disc(radius, height, centre, normal):
@@ -61,6 +72,12 @@ def disc(radius, height, centre, normal):
 
 def object_parts(kind="box"):
     """[(mesh, material)] of the object and the markers on it (world, metres), and the marker places."""
+    if kind == "turntable":
+        from . import testblock
+        v, f = testblock.build(TURN_GRID_MM)
+        body = o3d.geometry.TriangleMesh(o3d.utility.Vector3dVector((v - (40.0, 27.5, 0.0)) / 1000),
+                                         o3d.utility.Vector3iVector(f))
+        return [(body, "box")], []
     if kind == "plate":
         body = o3d.geometry.TriangleMesh.create_box(*PLATE)
         body.translate((-PLATE[0] / 2, -PLATE[1] / 2, 0))
@@ -83,8 +100,16 @@ def marker_meshes(places):
 
 
 def build_scene(kind="box"):
-    """RaycastingScene plus a map from geometry id to material name, and marker centres (world, metres)."""
+    """RaycastingScene plus a map from geometry id to material name, and marker centres (world, metres).
+    For "turntable" the turning part only (platform and block, in the platform's frame); room_scene() is
+    the rest."""
     scene, material = o3d.t.geometry.RaycastingScene(), {}
+    if kind == "turntable":
+        platform = o3d.geometry.TriangleMesh.create_cylinder(TURN_PLATFORM[0], TURN_PLATFORM[1], resolution=96)
+        platform.translate((0, 0, -TURN_PLATFORM[1] / 2))
+        for mesh, name in [(platform, "platform")] + object_parts(kind)[0]:
+            material[scene.add_triangles(o3d.t.geometry.TriangleMesh.from_legacy(mesh))] = name
+        return scene, material, np.empty((0, 3))
     table = o3d.geometry.TriangleMesh.create_box(0.6, 0.6, 0.01)
     table.translate((-0.3, -0.3, -0.01))
     parts, places = object_parts(kind)
@@ -92,6 +117,35 @@ def build_scene(kind="box"):
     for mesh, name in [(table, "table"), parts[0]] + parts[1:] + marker_meshes(table_places):
         material[scene.add_triangles(o3d.t.geometry.TriangleMesh.from_legacy(mesh))] = name
     return scene, material, np.array([c for c, _ in places + table_places], float)
+
+
+def room_scene():
+    """The still room around the turntable (the room's frame: z up, the platform's axis at the origin): the
+    table it stands on, a wall behind and two boxes, all printed with features."""
+    scene, material = o3d.t.geometry.RaycastingScene(), {}
+    parts = [((0.9, 0.7, 0.02), (-0.45, -0.35, -TURN_PLATFORM[1] - 0.02)),  # table
+             ((1.2, 0.02, 0.6), (-0.6, 0.2, -TURN_PLATFORM[1])),  # wall
+             ((0.08, 0.08, 0.09), (-0.24, 0.06, -TURN_PLATFORM[1])), ((0.1, 0.07, 0.06), (0.15, 0.08, -TURN_PLATFORM[1]))]
+    for size, corner in parts:
+        box = o3d.geometry.TriangleMesh.create_box(*size)
+        box.translate(corner)
+        material[scene.add_triangles(o3d.t.geometry.TriangleMesh.from_legacy(box))] = "room"
+    return scene, material
+
+
+def turntable_path(n):
+    """[(camera -> platform frame, camera -> room)] for n frames at CAMERA_FPS: the scanner stands (0.3 mm
+    of hand shake), the platform turns TURN_DEG about z at a speed that wobbles."""
+    t = np.arange(n) / CAMERA_FPS
+    angle = np.radians(TURN_DEG * t / TURN_S + TURN_WOBBLE_DEG * np.sin(2 * np.pi * t / TURN_WOBBLE_S))
+    shake = 0.0003 * np.stack([np.sin(23 * t), np.sin(31 * t + 1), np.sin(19 * t + 2)], 1)
+    out = []
+    for a, s in zip(angle, shake):
+        room = look_at(TURN_EYE + s, TURN_TARGET)
+        turn = np.eye(4)
+        turn[:2, :2] = [[np.cos(a), -np.sin(a)], [np.sin(a), np.cos(a)]]  # the platform turned by a
+        out.append((np.linalg.inv(turn) @ room, room))
+    return out
 
 
 def look_at(eye, target):
@@ -151,15 +205,18 @@ def texture(material_name, hit):
         cell = np.floor(hit[:, :2] / 0.004).astype(np.int64)
         noise = ((cell[:, 0] * 73856093) ^ (cell[:, 1] * 19349663)) % 61 - 30
         return base + noise
+    if material_name == "room":  # 6 mm cells of random grey, in 3D: walls and box sides too
+        cell = np.floor(hit / 0.006).astype(np.int64)
+        return base + ((cell[:, 0] * 73856093 ^ cell[:, 1] * 19349663 ^ cell[:, 2] * 83492791) % 81 - 40)
     if material_name == "box":
         cell = np.floor(hit / 0.001).astype(np.int64)
         return base + ((cell[:, 0] * 73856093 ^ cell[:, 1] * 19349663 ^ cell[:, 2] * 83492791) % 13 - 6)
     return np.full(len(hit), base, float)
 
 
-def render(scene, material, cam_to_world, rng, noise_mm=NOISE_MM, pattern=None, bits=10):
-    """(raw depth (H, W) uint16, colour RGB (H, W, 3) uint8 in colour-camera pixels) for one view.
-    pattern: fixed raw offsets (fixed_pattern) or None; bits 14: raw is Y14 ((Y10 x 16) + 8)."""
+def cast(scene, material, cam_to_world):
+    """(hit, z mm along the camera axis, grey, depth) per pixel of one view of `scene`: depth is False for
+    NO_DEPTH materials (and where nothing is hit)."""
     world_to_cam = np.linalg.inv(cam_to_world)
     K = o3c.Tensor(CAMERA.intrinsic_matrix(), o3c.float64)
     rays = o3d.t.geometry.RaycastingScene.create_rays_pinhole(K, o3c.Tensor(world_to_cam), W, H)
@@ -173,9 +230,26 @@ def render(scene, material, cam_to_world, rng, noise_mm=NOISE_MM, pattern=None, 
     shade = np.abs(np.einsum("hwc,hwc->hw", ans["primitive_normals"].numpy(), r[..., 3:] /
                              np.linalg.norm(r[..., 3:], axis=-1, keepdims=True)))
     grey = np.full((H, W), 120.0)
+    depth = valid.copy()
     for gid, name in material.items():
         sel = valid & (ids == gid)
         grey[sel] = texture(name, hit[sel]) * (0.35 + 0.65 * shade[sel])
+        if name in NO_DEPTH:
+            depth[sel] = False
+    return valid, z, grey, depth
+
+
+def render(scene, material, cam_to_world, rng, noise_mm=NOISE_MM, pattern=None, bits=10, still=None):
+    """(raw depth (H, W) uint16, colour RGB (H, W, 3) uint8 in colour-camera pixels) for one view.
+    pattern: fixed raw offsets (fixed_pattern) or None; bits 14: raw is Y14 ((Y10 x 16) + 8); still: a
+    second (scene, material, cam_to_world) cast from the same camera (the turntable's room), the nearer
+    hit kept."""
+    hit_any, z, grey, depth = cast(scene, material, cam_to_world)
+    if still is not None:
+        hit2, z2, grey2, depth2 = cast(*still)
+        nearer = hit2 & (~hit_any | (z2 < z))
+        z, grey, depth = np.where(nearer, z2, z), np.where(nearer, grey2, grey), np.where(nearer, depth2, depth)
+    valid = depth
     # depth: noise, the window, random dropouts, and flying pixels / gaps where depth jumps
     zn = z + rng.normal(0, noise_mm, z.shape)
     near, far = CAMERA.window_mm
@@ -228,6 +302,8 @@ def generate(out_dir, n_frames=160, every=1, seed=0, hard=False, kind="box", pat
 
 def first_camera(kind="box", hard=False):
     """Camera -> world of a set's first frame (the start of its path, whatever the frame count)."""
+    if kind == "turntable":
+        return turntable_path(2)[0][0]
     return (path_around(2) if kind == "plate" else path(2, hard))[0]
 
 
@@ -235,7 +311,14 @@ def _generate(out_dir, n_frames, every, seed, hard, kind, pattern_mm, noise_mm, 
     out_dir.mkdir(parents=True, exist_ok=True)
     rng = np.random.default_rng(seed)
     scene, material, marker_xyz = build_scene(kind)
-    cams = (path_around(n_frames) if kind == "plate" else path(n_frames, hard))[::every]
+    rooms = [None] * len(range(0, n_frames, every))
+    if kind == "turntable":
+        calib.use_mode(calib.LONG)  # (the window reaches the room; reading the set switches by its depth_mode)
+        room, room_material = room_scene()
+        both = turntable_path(n_frames)[::every]
+        cams, rooms = [c for c, _ in both], [(room, room_material, r) for _, r in both]
+    else:
+        cams = (path_around(n_frames) if kind == "plate" else path(n_frames, hard))[::every]
     first_inv = np.linalg.inv(cams[0])
     pattern = fixed_pattern(pattern_mm, seed) if pattern_mm else None
     bpl = W * bits // 8
@@ -244,13 +327,13 @@ def _generate(out_dir, n_frames, every, seed, hard, kind, pattern_mm, noise_mm, 
             open(out_dir / "stamps.csv", "w") as fs, open(out_dir / "gt_poses.txt", "w") as fg:
         fi = open(out_dir / "ir.raw", "wb") if blank_ir else None
         fs.write("index,color_t,ir_t,depth_t\n")
-        for i, cam in enumerate(cams):
-            raw, colour = render(scene, material, cam, rng, noise_mm, pattern, bits)
+        for i, (cam, still) in enumerate(zip(cams, rooms)):
+            raw, colour = render(scene, material, cam, rng, noise_mm, pattern, bits, still)
             fc.write(rgb_to_yuyv(colour))
             if fi:
                 fi.write(bytes(fr.FRAME_BYTES["ir"]))
             fd.write(encode_y14(raw) if bits == 14 else encode_y10(raw))
-            t = i * every / 20.0  # 20 fps camera
+            t = i * every / CAMERA_FPS
             fs.write(f"{i},{t:.4f},{t:.4f},{t:.4f}\n")
             fg.write(f"{i} " + " ".join(f"{v:.9f}" for v in (first_inv @ cam).ravel()) + "\n")
         if fi:
@@ -259,9 +342,13 @@ def _generate(out_dir, n_frames, every, seed, hard, kind, pattern_mm, noise_mm, 
             "note": "synthetic: flat-faced box on a table with markers, tilting path; ir is blank",
             "frames": len(cams), "every": every, "seed": seed, "hard": hard}
     if not blank_ir:
+        scene_note = {"plate": "thin plate seen from both sides",
+                      "turntable": "the test block on a turning platform, the scanner standing, a still room"}
         info.update(streams=["color", "depth"], kind=kind, pattern_mm_at_200=pattern_mm, noise_mm=noise_mm,
-                    note=f"synthetic: {'thin plate seen from both sides' if kind == 'plate' else 'box, tilting path'}, "
+                    note=f"synthetic: {scene_note.get(kind, 'box, tilting path')}, "
                          f"{bits}-bit depth, fixed pattern {pattern_mm} mm RMS at 20 cm, frame noise {noise_mm} mm")
+    if kind == "turntable":
+        info["depth_mode"] = calib.LONG
     (out_dir / "info.json").write_text(json.dumps(info, indent=2))
     world_to_first = first_inv
     (out_dir / "markers_gt.json").write_text(json.dumps(
@@ -308,8 +395,8 @@ def main():
     for a in rest:
         if a == "--pattern":
             options["pattern_mm"] = float(next(rest))
-        elif a == "--plate":
-            options["kind"] = "plate"
+        elif a in ("--plate", "--turntable"):
+            options["kind"] = a[2:]
         elif a == "--y14":
             options["bits"] = 14
         else:
