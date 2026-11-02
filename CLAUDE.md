@@ -884,6 +884,35 @@ cubes on the GPU; the CPU keeps the 6x6 solve, markers, base votes, pose graph, 
   - Measured and dropped: marker detection in a helper thread beside the object search (9.3 -> 9.6 fps).
   - Next for 20 fps: the merge out of the tracking process's GIL (or cheaper), the object / base search
     on the GPU; then the live view of the model.
+- FIRST LIVE GPU SCAN (2026-11-02, the user, captures/20261102-081622-scan with its raw frames): hand
+  model (~22 cm) standing on a tiled floor, LONG range, 35-50 cm, 55 s, no markers, mostly the front.
+  The user: result impressive, scanning experience not.
+  - Result: clean one-sided hand, 118k points, doubled 0.0019, Optimise 174 loops, largest correction
+    1.4 mm.
+  - Speed: 483 frames, 9 fps (frame gaps median 100 ms, p90 200, max 1.7 s). Worker per frame:
+    tracking 62 ms, raw copy 34 ms (keep raw on), decode 9. GPU wall: ray cast 10.1 ms (2.7 alone),
+    ICP 9.9 for 5.9 passes.
+  - Tracking: only 132 of 483 frames tracked, 79 merged.
+    - 244 frames were "too few points". The source is the piece at the image centre, and the hand is
+      narrow: whenever the centre hit the floor beside it (removed as the plane), the piece was a
+      1-25 point crumb.
+    - Once lost, only "move back" re-finds (relock from the last good pose). The motion guess keeps
+      extrapolating the last motion over the lost time (the guess's step at the centre grew 7 -> 177
+      mm over 20 lost frames).
+  - Offline replays of its raw frames (scratch code, nothing changed in the repo):
+    - Crumbs skipped (nearest piece >= 30 points): the wrong piece (wall, box) when it was nearer the
+      centre than the hand.
+    - Source seeded from the object's region as predicted by the pose guess (cylinder core, the
+      frame's own plane cut, centre piece when nothing is in the core): 466 of 483 tracked, 284
+      merged.
+    - That exposed the next leak, the long-range base: tile / floor points 3-10 mm above the base
+      plane (OBJECT_ABOVE_MM 3, set for close range) connect to the hand's foot. The region grew to
+      radius 523 mm (live 98), and floor speckle got into the cloud. Cropped to the hand: doubled
+      0.009, same shape.
+    - Patching scene.py's centre piece as well (crumb skip) let the region grow into the background:
+      21% doubled.
+  - GPU replays are not bit-identical run to run (the same variant ended x6 / x22 lost). Not traced;
+    relock reads the cloud without waiting for pending merges (a suspect).
 
 ## The person you are working with
 
