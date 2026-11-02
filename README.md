@@ -81,12 +81,15 @@ both with Open3D 0.20: the same results on every test and evaluation.
 The viewer shows depth large in the middle, colour and IR on the left, and folding panels on the
 right: Scanner, Capture, Scan, IMU and View.
 
-- **Start scan (c)**: stay 18-30 cm from the object (the guide line under the images shows it),
-  move slowly, keep markers in view. **Stop scan (c)** saves `captures/<stamp>-scan/cloud.ply` and
-  runs Optimise. *Remove base* (on by default) leaves the table under the object out of the result.
-  While scanning, the depth view dims everything that is not the object. Tick *keep raw frames* to
-  keep the frames the scan used, for replays.
-  *Continue last* goes on with the last saved scan.
+- **Start scan (c)**: stay 18-30 cm from the object in close range, 30-50 cm in long range (the
+  guide line under the images shows the distance), move steadily, keep markers in view if there are
+  any. **Stop scan (c)** saves `captures/<stamp>-scan/cloud.ply` and runs Optimise. *Remove base* (on
+  by default) leaves the table under the object out of the result. While scanning, the depth view
+  dims everything that is not the object and, with a GPU, paints the scan so far over it, as seen
+  from where the scanner is: **grey** where the mesh will have the surface, **yellow** where it needs
+  more views, **orange** where the scanner sees the object but the scan has nothing yet. A red frame
+  means tracking is lost: aim at a part already scanned. Tick *keep raw frames* to keep the frames
+  the scan used, for replays. *Continue last* goes on with the last saved scan.
 - **Open 3D view**: the scan in the browser. *Process* has Optimise again, merge again at
   0.5 / 1 / 2 mm point distance, Make mesh, and Remove base / Keep base; *Show* switches between
   the cloud and the mesh (*Colour: Grey* shows its shape); *Export* downloads `cloud.ply`,
@@ -377,6 +380,8 @@ Next up:
   - [x] tracking against the fused model on the GPU (9.3 fps through the live worker, offline)
   - [x] tracking that holds a narrow object away from the middle of the view and finds its place again
         after a loss (the first live scan, replayed: 132 -> 480 of 483 frames tracked)
+  - [x] the live model view: the scan so far painted over the depth view (done, needs more views,
+        missing), 1 ms a frame
   - [ ] live scanning at full rate (that recording now runs at about 10 fps through the live worker
         on a busy desktop; next: the object search on the GPU)
 - [ ] **Crop in the 3D view**: for what touches the object (a stand, a cable), which object

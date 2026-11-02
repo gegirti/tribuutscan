@@ -77,3 +77,35 @@ def test_depth_preview_has_a_red_frame_while_tracking_is_lost():
         assert (edge == viewer.LOST_RGB).all()
     assert (lost[100:400, 100:300] == plain[100:400, 100:300]).all()  # inside unchanged
     assert (idle == plain).all()
+
+
+def test_depth_preview_paints_the_live_model_of_the_tracked_frame():
+    """While scanning with the GPU tracker the preview shows the frame the worker tracked (not the newest),
+    with the model painted over it: grey where seen often enough, yellow too few times, orange missing."""
+    import time
+    from tribuutscan.depth import encode_y10
+
+    class Cap:
+        width, height, bytesperline = 1280, 800, 1600
+
+    as_array = lambda ppm: np.frombuffer(ppm.split(b"\n", 1)[1], np.uint8).reshape(500, 800, 3).astype(int)
+    tracked, newest = encode_y10(np.full((800, 1280), 400, np.uint16)), encode_y10(np.full((800, 1280), 100, np.uint16))
+    viewer.scan_view.update(mask=None, t=0.0)
+    plain = as_array(viewer.render_depth(Cap, tracked)[0])
+    codes = np.zeros((400, 640), np.uint8)
+    codes[:, :160] = 255  # done, facing the scanner
+    codes[:, 160:320] = 127  # seen too few times, facing
+    codes[:, 320:480] = 1  # the object, not in the model yet
+    mask = np.full((100, 160), 2, np.uint8)  # all object: nothing dimmed
+    try:
+        viewer.scan_view.update(mask=mask, t=time.monotonic(), lost=False, model=(codes, tracked))
+        ppm, stats = viewer.render_depth(Cap, newest)
+        shown = as_array(ppm)
+    finally:
+        viewer.scan_view.update(mask=None, t=0.0, model=None)
+    assert (shown[:200, :150] == viewer.MODEL_DONE).all()
+    assert (shown[:200, 210:390] == viewer.MODEL_THIN).all()
+    want = (plain[:200, 410:590] * 0.3 + viewer.MODEL_MISSING * 0.7).astype(np.uint8)
+    assert (shown[:200, 410:590] == want).all()
+    assert (shown[:200, 610:] == plain[:200, 610:]).all()  # the tracked frame's depth, not the newest's
+    assert viewer.MODEL_LEGEND in stats["text"]

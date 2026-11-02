@@ -162,10 +162,15 @@ MARKER_RADII = (3, 4, 5, 7)  # dot radius in half-resolution pixels (smaller one
 found_markers = {"on": True, "list": [], "stamp": 0.0}  # list in full-resolution pixels
 # While scanning, the worker says what each frame was (livescan.view_mask: 0 other, 1 base, 2 object):
 # the depth preview dims all but the object (the base is tinted while it is kept), marks its centre (the
-# first frame's object is what the centre hits) and has a red frame while tracking is lost.
-scan_view = {"mask": None, "t": 0.0, "keep_base": False, "lost": False}
+# first frame's object is what the centre hits) and has a red frame while tracking is lost. With the GPU
+# tracker it also sends the live model view of that frame (gpu.preview_codes), painted over the object
+# (paint_model); the preview then shows the frame the worker tracked, so model and depth agree.
+scan_view = {"mask": None, "t": 0.0, "keep_base": False, "lost": False, "model": None}  # model: (codes, depth raw)
 BASE_TINT = np.array([0, 40, 110], np.uint8)
 LOST_RGB, LOST_PX = np.array([198, 40, 40], np.uint8), 8
+MODEL_DONE, MODEL_THIN = np.array([215, 222, 235]), np.array([240, 196, 60])  # seen often enough / too few times
+MODEL_MISSING = np.array([255, 96, 32])  # the object where the model has nothing yet
+MODEL_LEGEND = "   model: grey done, yellow needs more views, orange not scanned yet"
 
 
 def find_markers_loop(color):
@@ -200,6 +205,10 @@ def render_ir(cap, buf, width=SIDE_W):
 
 
 def render_depth(cap, buf, width=DEPTH_W):
+    scanning = time.monotonic() - scan_view["t"] < 1.0
+    model = scan_view["model"] if scanning else None
+    if model is not None:
+        model, buf = model  # the frame the scan worker tracked: its model view and its depth agree
     d = decode_depth(buf, cap.width, cap.height, cap.bytesperline)
     h, w = d.shape
     centre = d[h * 3 // 8:h * 5 // 8, w * 3 // 8:w * 5 // 8]
@@ -210,18 +219,34 @@ def render_depth(cap, buf, width=DEPTH_W):
         "centre_cm": float(pointcloud.depth_to_mm(np.median(valid))) / 10 if valid.size else None,
     }
     rgb = depth_to_rgb(fit(d, width))  # colour-map only the shown pixels
-    view, scanning = scan_view["mask"], time.monotonic() - scan_view["t"] < 1.0
+    view = scan_view["mask"]
     if view is not None and scanning:
         lab = view[np.ix_(preview_index(view.shape[0], rgb.shape[0]), preview_index(view.shape[1], rgb.shape[1]))]
         rgb[lab == 0] //= 4
         base = lab == 1
         rgb[base] = rgb[base] // 2 + BASE_TINT if scan_view["keep_base"] else rgb[base] // 4
+    if model is not None:
+        paint_model(rgb, model)
+        stats["text"] += MODEL_LEGEND
     if scanning:
         mark_centre(rgb)
         if scan_view["lost"]:
             b = LOST_PX
             rgb[:b], rgb[-b:], rgb[:, :b], rgb[:, -b:] = LOST_RGB, LOST_RGB, LOST_RGB, LOST_RGB
     return ppm(rgb), stats
+
+
+def paint_model(rgb, codes):
+    """Paint the live model view (gpu.preview_codes) over a preview: model surface seen often enough grey,
+    too few times yellow, both shaded by how squarely they face the scanner; the frame's own object
+    where the model has nothing yet orange."""
+    lab = codes[np.ix_(preview_index(codes.shape[0], rgb.shape[0]), preview_index(codes.shape[1], rgb.shape[1]))]
+    lab = lab.astype(np.float32)
+    done, thin, missing = lab >= 128, (lab >= 2) & (lab < 128), lab == 1
+    light = 0.35 + 0.65 * np.where(done, (lab - 128) / 127, (lab - 2) / 125)
+    rgb[done] = (MODEL_DONE * light[done][:, None]).astype(np.uint8)
+    rgb[thin] = (MODEL_THIN * light[thin][:, None]).astype(np.uint8)
+    rgb[missing] = (rgb[missing] * 0.3 + MODEL_MISSING * 0.7).astype(np.uint8)
 
 
 def mark_centre(rgb, arm=10, gap=4):
@@ -329,7 +354,7 @@ class App:
         self.record_rate = tk.StringVar(value=next(iter(RECORD_RATES)))
         self.job = {"process": None, "dir": None}
         self.live = {"proc": None, "commands": None, "replies": None, "url": None, "open": False,
-                     "inflight": 0, "sent": 0.0}
+                     "inflight": 0, "sent": 0.0, "raw": {}}  # raw: depth buffers in work, by capture time
         self.scan_state = "idle"  # idle | scanning | saving | optimising
         self.imu, self.imu_note, self.imu_want = None, "", usbdepth.available()
         self.retry_at = 0.0  # time.monotonic() before which a lost scanner is not reconnected again
@@ -818,7 +843,8 @@ class App:
             self.start_worker()
         out = fr.CAPTURES / (time.strftime("%Y%m%d-%H%M%S") + "-scan")
         self.scan_state, live["inflight"] = "scanning", 0
-        scan_view.update(keep_base=not self.remove_base.get(), lost=False)
+        scan_view.update(keep_base=not self.remove_base.get(), lost=False, model=None)
+        self.live["raw"] = {}
         live["commands"].put(("start", self.preset.get(), out, self.keep_raw.get(), continue_from, calib.CAMERA.mode,
                               self.remove_base.get()))
         self.log(f"scan started: {out.name} ({self.preset.get()}, point distance {cloud.PRESETS_MM[self.preset.get()]} mm)"
@@ -852,6 +878,8 @@ class App:
             d_raw, d_t = depth.raw, depth.stamp
             live["sent"] = d_t
             live["inflight"] += 1
+            live["raw"] = {t: r for t, r in live["raw"].items() if t > d_t - 2.0}  # (for the live model view)
+            live["raw"][d_t] = d_raw
             c_raw, c_t = color.nearest(d_t)  # no IR: the worker's raw copy leaves it out (frames.SCAN_STREAMS)
             live["commands"].put(("frame", c_raw, None, d_raw, depth.cap.bytesperline, (c_t, 0.0, d_t)))
         while live["replies"] is not None:
@@ -867,9 +895,11 @@ class App:
                 self.log(rest[0])
             elif kind == "frame_done":
                 live["inflight"] = max(0, live["inflight"] - 1)
-                merged, frames, points, tracking, cue, view = (list(rest) + [None] * 6)[:6]
+                merged, frames, points, tracking, cue, view, model, model_t = (list(rest) + [None] * 8)[:8]
+                raw = live["raw"].pop(model_t, None)
                 if self.scan_state == "scanning" and cue is not None:
-                    scan_view.update(mask=view, t=time.monotonic(), lost=not tracking)
+                    scan_view.update(mask=view, t=time.monotonic(), lost=not tracking,
+                                     model=None if model is None or raw is None else (model, raw))
                     held = ", ".join(([f"{cue['markers']} markers"] if cue.get("markers") else [])
                                      + (["features"] if cue.get("features") else [])) or "shape"
                     hint = ("   TRACKING LOST: aim at a part already scanned, or move back to where it was"

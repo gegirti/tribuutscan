@@ -8,10 +8,12 @@ Commands:  ("start", preset, out_dir, keep_raw, continue_from or None, depth mod
            (tracker: "gpu", the default, which falls back to the CPU solve without a GPU; or "joint")
            | ("frame", yuyv, grey or None, depth_buf, bytesperline, (t_colour, t_ir, t_depth))
            | ("stop",) | ("quit",)   (times: camera capture times, seconds)
-Replies:   ("ready", url) | ("log", text) | ("frame_done", merged, frames, points, tracking, cue, view)
-           | ("saved", path, points)
+Replies:   ("ready", url) | ("log", text)
+           | ("frame_done", merged, frames, points, tracking, cue, view, model, t_depth) | ("saved", path, points)
            cue: {"markers": used, "features": ORB start, "flat": shape alone slides, "base": base found}
            view: what the frame was, at 1/VIEW_STEP of its size (uint8: 0 other, 1 base, 2 object), or None
+           model: the live model view of that frame (gpu.preview_codes at 1/gputrack.PREVIEW_STEP: its piece
+           against the model built so far), or None without the GPU tracker; t_depth: the frame's depth time
 
 With keep_raw, the frames the worker processed are also written to out_dir/<stamp>-rec/ (the
 viewer's recording format, without IR), so a scan can be replayed offline with cloud.py for
@@ -180,7 +182,7 @@ def run(commands, replies, port=view3d.PORT):
                     log(f"continuing {Path(continue_from).name}: show the scanner a part it has seen")
                 else:
                     source.scanner = cl.Scanner(preset, log=log, remove_base=remove_base,
-                                                track_with=tracker[0] if tracker else "gpu")
+                                                track_with=tracker[0] if tracker else "gpu", live_view=True)
                 source.scan_id += 1
                 source.name = f"live: {out_dir.name}"
                 source.phase, source.out_dir = "scanning", out_dir
@@ -216,7 +218,7 @@ def run(commands, replies, port=view3d.PORT):
             timing["feed"] += time.perf_counter() - t2
             timing["frames"] += 1
             replies.put(("frame_done", s.stats["merged"], s.stats["frames"], points, s.stats["tracking"],
-                         dict(s.cue, base=s.scene.plane is not None), view_mask(s.last_view)))
+                         dict(s.cue, base=s.scene.plane is not None), view_mask(s.last_view), s.view_codes, t_d))
         elif kind == "frame":
             replies.put(("frame_done", 0, 0, 0))
         elif kind == "stop" and source.scanner is not None:

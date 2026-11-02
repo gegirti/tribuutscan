@@ -481,14 +481,24 @@ def test_frames_as_the_live_worker_gets_them_are_tracked_and_merged():
         with tempfile.TemporaryDirectory() as tmp:
             rec = Path(tmp) / "t-rec"
             synth.generate(rec, n_frames=12)
-            for tracker in ("joint", "gpu"):
-                sc = cl.Scanner(log=lambda *a: None, track_with=tracker)
+            for tracker in ("joint", "gpu"):  # (every keyframe merged: 12 frames are 0.6 s)
+                sc = cl.Scanner(log=lambda *a: None, track_with=tracker, live_view=True, merge_min_s=0.0)
+                views = []
                 for i, frame in enumerate(fr.read_recording(rec, yuyv=True)):
                     assert "yuyv" in frame and "color" not in frame
                     sc.feed(frame, i)
+                    views.append(sc.view_codes)
                 sc.flush()
                 sc.close()
                 assert sc.stats["lost"] == 0 and sc.stats["merged"] >= 2 and len(sc.cloud) > 1000, (tracker, sc.stats)
                 assert sc.stats["markers"]  # the merge decoded the YUYV colour to look for markers
+                if sc.track_with != "gpu":
+                    assert all(v is None for v in views)  # the live model view comes from the GPU tracker
+                    continue
+                assert views[0] is None and all(v is not None and v.shape == (400, 640) for v in views[1:])
+                done = [int((v >= 128).sum()) for v in views[1:]]
+                thin = [int(((v >= 2) & (v < 128)).sum()) for v in views[1:]]
+                # the box: seen once at first (no part seen often enough), most of it done after a few frames
+                assert done[0] == 0 and thin[0] > 20000 and done[-1] > 4 * thin[-1] and done[-1] > 30000
     finally:
         calib.use(before)

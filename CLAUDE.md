@@ -988,6 +988,34 @@ cubes on the GPU; the CPU keeps the 6x6 solve, markers, base votes, pose graph, 
     CPU / Python plus ~25 ms of GPU round trips (wall).
   - README: a section "A live scan on the GPU" with examples/hand-gpu-scan/ (mesh renders only, no
     workspace; numpy z-buffer rasteriser, kept in the scratchpad only).
+- LIVE MODEL VIEW (2026-11-02, the user's order: 1 live model view, 2 speed step 2 with a plan first, 3
+  accuracy session, 4 Phase 5).
+  - GPU kernel PREVIEW (gpu_wgpu.Engine.preview, reference gpu.preview_codes + gpu.voxel_weight). It
+    runs after each frame's solve and before its fusion, from the ray cast made for tracking and the
+    frame's source maps. One byte per 2 x 2 block (640 x 400; 4 to a word, a 256 KB readback):
+    - 0: nothing;
+    - 1: the frame's piece with no model ("missing", orange);
+    - 2-127: model seen fewer than min weight times (yellow);
+    - 128-255: seen enough (grey); the low bits are the facing |n . v| (0.6 without a normal).
+    Model hits within OBJECT_ABOVE_MM of the base are not drawn.
+  - "Seen enough" is the most of the 8 voxels around the hit (the single nearest voxel speckled), and a
+    block takes its first hit among its 4 pixels (pinholes speckled orange).
+  - Threshold Scanner.preview_weight = fusion.MIN_WEIGHT x (GPU-fused keyframes / merged frames): the
+    mesh fuses only merged frames (at most 4 a second), the tracking volume every keyframe (hand:
+    272 vs 131, so ~8). A 0.6 s synthetic scan merges 3 frames, so nothing shows as done (the mesh
+    would have nothing either); its test uses merge_min_s=0.
+  - Scanner(live_view=True) (the live worker only) sets view_codes on GPU-tracked frames.
+    gputrack.Tracker.preview, Tracker.ref = the last ray cast's pose, timing "preview" 0.8-1.0 ms a
+    frame.
+  - livescan's frame_done now ends with (model, t_depth). The viewer keeps the depth buffers it sent
+    by capture time (live["raw"]), and scan_view["model"] = (codes, that buffer). render_depth then
+    shows THAT frame (model and depth agree; ~100-200 ms behind, at the worker's rate) and
+    paint_model colours it. The stats line carries the legend.
+  - Checked: on the hand recording the hand shows grey with yellow along grazing edges. End to end
+    with the scanner (no window: capture as the viewer, the worker spawned as the viewer does,
+    replies paired by time, render_depth), static at the hand: 190 frames in 14 s, 0 lost, yellow
+    turning grey by frame 50; the scanner stayed on USB. bench --live on the second hand recording
+    10.9 fps. Not yet seen by the user in the real window.
 - LIVE SPEED, step 1 (2026-11-02, item 2). The desktop was busy all along (load 8-20: Firefox at 90%),
   so timings swing +-15% between runs. Compare only runs made back to back.
   - The ray cast covers only the piece's pixels plus a margin (the coarse level's 30 mm reach at the

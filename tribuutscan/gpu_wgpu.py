@@ -311,6 +311,63 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 """
 
+PREVIEW = """
+@group(0) @binding(1) var<storage, read> index: array<u32>;
+@group(0) @binding(2) var<storage, read> tsdfw: array<u32>;
+@group(0) @binding(3) var<storage, read> rvmap: array<vec4<f32>>;
+@group(0) @binding(4) var<storage, read> rnmap: array<vec4<f32>>;
+@group(0) @binding(5) var<storage, read> vmap: array<vec4<f32>>;
+@group(0) @binding(6) var<storage, read_write> codes: array<u32>;
+fn voxel_weight(vi: vec3<i32>) -> u32 {  // seen-count of a voxel (0 where no brick is allocated)
+  let bc = vec3<i32>(floor(vec3<f32>(vi) / 8.0));
+  let b = brick_index(bc);
+  if (b < 0) { return 0u; }
+  let slot = index[u32(b)];
+  if (slot >= P.dims.w) { return 0u; }
+  let l = vi - bc * 8;
+  return tsdfw[slot * 512u + u32(l.x) + 8u * u32(l.y) + 64u * u32(l.z)] >> 16u;
+}
+fn weight_at(q: vec3<f32>) -> f32 {  // the most of the eight voxels around q (gpu.voxel_weight)
+  let c = vec3<i32>(floor((q - P.vol.xyz) / P.vol.w));
+  var most = 0u;
+  for (var k = 0; k < 8; k++) {
+    most = max(most, voxel_weight(c + vec3<i32>(k & 1, (k >> 1) & 1, (k >> 2) & 1)));
+  }
+  return f32(most);
+}
+fn code(x0: u32, y0: u32, s: u32) -> u32 {  // gpu.preview_codes: the block's first model hit, else its piece
+  var piece = false;
+  for (var dy = 0u; dy < s; dy++) {
+    for (var dx = 0u; dx < s; dx++) {
+      let i = (y0 + dy) * P.img.x + x0 + dx;
+      let m = rvmap[i];
+      if (m.w > 0.0 && dot(P.base.xyz, m.xyz) + P.base.w > 0.0) {
+        let n = rnmap[i];
+        var facing = 0.6;
+        if (n.w > 0.0) { facing = abs(dot(n.xyz, normalize(P.pose[3].xyz - m.xyz))); }
+        if (weight_at(m.xyz) >= P.ray.x) { return 128u + u32(facing * 127.0); }
+        return 2u + u32(facing * 125.0);
+      }
+      piece = piece || vmap[i].w > 0.0;
+    }
+  }
+  return select(0u, 1u, piece);
+}
+@compute @workgroup_size(16, 16)
+fn main(@builtin(global_invocation_id) g: vec3<u32>) {  // four codes (bytes) per word
+  let s = max(u32(P.trk.w), 1u);
+  let ow = P.img.x / s;
+  let pw = (ow + 3u) / 4u;
+  if (g.x >= pw || g.y >= P.img.y / s) { return; }
+  var word = 0u;
+  for (var k = 0u; k < 4u; k++) {
+    let ox = g.x * 4u + k;
+    if (ox < ow) { word = word | (code(ox * s, g.y * s, s) << (8u * k)); }
+  }
+  codes[g.y * pw + g.x] = word;
+}
+"""
+
 ICP = """
 @group(0) @binding(1) var<storage, read> vcur: array<vec4<f32>>;
 @group(0) @binding(2) var<storage, read> ncur: array<vec4<f32>>;
@@ -571,7 +628,7 @@ def integrate_source(nearest):
     return consts + INTEGRATE
 
 
-KERNELS = {"model_normals": MODEL_NORMALS, "maps": MAPS, "allocate": ALLOCATE, "clamp": CLAMP, "integrate": INTEGRATE, "raycast": RAYCAST, "icp": ICP,
+KERNELS = {"preview": PREVIEW, "model_normals": MODEL_NORMALS, "maps": MAPS, "allocate": ALLOCATE, "clamp": CLAMP, "integrate": INTEGRATE, "raycast": RAYCAST, "icp": ICP,
            "mesh": MESH}
 # --- frame preparation (S1-S3): fusion.frame_images + Pinhole on the GPU ----------------------------------
 PREP_PRELUDE = """
@@ -806,7 +863,7 @@ class Engine:
         w, h = size
         dev = self.device
         buf = lambda n, usage=S.STORAGE | S.COPY_DST | S.COPY_SRC: dev.create_buffer(size=int(n), usage=usage)
-        self.uniform = {k: buf(gpu.PARAMS_BYTES, S.UNIFORM | S.COPY_DST) for k in ("frame", "ray", "icp")}
+        self.uniform = {k: buf(gpu.PARAMS_BYTES, S.UNIFORM | S.COPY_DST) for k in ("frame", "ray", "icp", "view")}
         self.depth, self.colour = buf(4 * w * h), buf(4 * w * h)
         self.vmap, self.nmap, self.rvmap, self.rnmap = (buf(16 * w * h) for _ in range(4))
         self.index, self.mark = buf(4 * layout.bricks), buf(4 * layout.bricks)
@@ -819,6 +876,7 @@ class Engine:
         self.table = buf(4 * len(gpu.packed_triangle_table()))
         self.out = buf(MESH_BYTES)
         self.tri_count = buf(8)
+        self.codes = buf(4 * ((w + 3) // 4) * h)  # preview(): a byte per pixel, four to a word
         q = dev.queue
         q.write_buffer(self.table, 0, gpu.packed_triangle_table())
         q.write_buffer(self.index, 0, np.full(layout.bricks, gpu.EMPTY, np.uint32))
@@ -843,6 +901,8 @@ class Engine:
             "raycast": self._group("raycast", u["ray"], self.index, self.tsdfw, self.rvmap, self.rnmap),
             "model_normals": self._group("model_normals", u["ray"], self.rvmap, self.rnmap),
             "icp": self._group("icp", u["icp"], self.vmap, self.nmap, self.rvmap, self.rnmap, self.partials),
+            "preview": self._group("preview", u["view"], self.index, self.tsdfw, self.rvmap, self.rnmap, self.vmap,
+                                   self.codes),
             "mesh": self._group("mesh", u["ray"], self.index, self.tsdfw, self.colvox, self.bricks, self.table, self.out,
                                 self.tri_count),
         }
@@ -1055,6 +1115,17 @@ class Engine:
         self._params("icp", pose=pose, ref_inv=np.linalg.inv(ref_pose), centre=centre, **options)
         self._run([("icp", (gpu.ICP_GROUPS,))])
         return gpu.reduce_icp(np.frombuffer(self.device.queue.read_buffer(self.partials), np.float32))
+
+    def preview(self, pose, base=(0.0, 0.0, 0.0, 1.0), min_weight=4.0, step=2):
+        """The live view (gpu.preview_codes) from the last ray cast, made from `pose` (camera -> world, mm),
+        and the last frame's maps: uint8 (h // step, w // step). `base`: (n, c), the surface above it."""
+        self._params("view", pose=pose, min_weight=min_weight, stride=step, base=tuple(float(v) for v in base))
+        w, h = self.size
+        ow, oh = w // step, h // step
+        pw = (ow + 3) // 4
+        self._run([("preview", ((pw + 15) // 16, (oh + 15) // 16))])
+        words = np.frombuffer(self.device.queue.read_buffer(self.codes, 0, 4 * pw * oh), np.uint32)
+        return words.view(np.uint8).reshape(oh, 4 * pw)[:, :ow].copy()
 
     def mesh(self, min_weight=4):
         """(vertices world mm, triangles, colours) of the surface where all eight voxels of a cube were

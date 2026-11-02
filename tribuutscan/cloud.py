@@ -486,7 +486,7 @@ class Scanner:
 
     def __init__(self, preset="small", log=print, clean_depth="merge", gate_refind=True, motion_dt=True,
                  mode="still", track_with="joint", target="model", use_features=True, threaded_merge=True,
-                 remove_base=True, segment_stride=None, orb=None, merge_min_s=None):
+                 remove_base=True, segment_stride=None, orb=None, merge_min_s=None, live_view=False):
         try:
             from . import fuse  # Open3D: frame-to-frame ICP
         except ImportError:
@@ -559,6 +559,8 @@ class Scanner:
         self.merge_min_s = MERGE_MIN_S if merge_min_s is None else merge_min_s
         self.no_markers = 0  # frames since markers were last seen (frame_markers)
         self.points_kept = 0  # cubes seen MIN_SEEN times after the last merge (read without the cloud lock)
+        self.live_view, self.view_codes = live_view, None  # live_view: each GPU-tracked frame's preview codes
+        self.gpu_fused = 0  # frames fused into the GPU tracker's volume
         self.track_log = []  # per frame: (index, status, pose or None); for evaluation
         self.on_merge = None  # optional callback(index, world_xyz_mm, rgb, world_normals, pose)
         self.remove_base = remove_base  # the saved/shown cloud leaves the base out (it is merged either way)
@@ -571,7 +573,7 @@ class Scanner:
         stats, fuse = self.stats, self.fuse
         index = stats["frames"] if index is None else index
         stats["frames"] += 1
-        self.last_view = None
+        self.last_view, self.view_codes = None, None
         if self.clean_depth is True:  # track on cleaned depth as well
             frame = self.cleaned(frame)
         shape = frame["depth"].shape
@@ -652,6 +654,8 @@ class Scanner:
                             ok = self.accepted(info, step, xyz)
                             self.feature_starts += 1
                     self.note(index, info)
+                    if self.live_view:
+                        self.view_codes = self.gpu.preview(self.gpu_base(), self.preview_weight())
                 elif joint:
                     step, ok = self.joint_step(levels, xyz, marker_pts, guess, index)
                 else:
@@ -706,6 +710,7 @@ class Scanner:
         self.since_merge, self.last_merged = 0, self.pose.copy()
         if self.gpu is not None:  # into the volume the next frame is tracked against: every such frame (cheap)
             self.gpu.fuse(frame, self.labels[index], self.pose)
+            self.gpu_fused += 1
         if t is not None and self.merge_t is not None and t - self.merge_t < self.merge_min_s:
             return False  # the point cloud and Optimise's keyframes take one every MERGE_MIN_S at most
         self.merge_t = t
@@ -882,13 +887,24 @@ class Scanner:
         (step from the previous pose, info) for `accepted` and `note`."""
         init = self.pose @ guess
         to_world = scene_transform(init)
-        base = None
+        found, info = self.gpu.solve(init, init, self.marker_pairs(marker_pts, guess, np.eye(4)), object_radius(xyz),
+                                     xyz.mean(0) @ to_world[:3, :3].T + to_world[:3, 3], self.gpu_base(),
+                                     self.marker_sigma)
+        return np.linalg.inv(self.pose) @ found, info
+
+    def gpu_base(self):
+        """The kept base for the GPU (n, c: the model is what lies OBJECT_ABOVE_MM above it), or None."""
         if self.scene.mode == "still" and self.scene.plane is not None:
             n, c = self.scene.plane
-            base = (n, c - OBJECT_ABOVE_MM)
-        found, info = self.gpu.solve(init, init, self.marker_pairs(marker_pts, guess, np.eye(4)), object_radius(xyz),
-                                     xyz.mean(0) @ to_world[:3, :3].T + to_world[:3, 3], base, self.marker_sigma)
-        return np.linalg.inv(self.pose) @ found, info
+            return n, c - OBJECT_ABOVE_MM
+        return None
+
+    def preview_weight(self):
+        """How often the live view wants a surface seen before it shows it as done: as often as the mesh
+        (fusion.MIN_WEIGHT merged frames), scaled by the GPU volume's frames per merged one (it takes
+        every keyframe, the point cloud and the mesh one per MERGE_MIN_S)."""
+        from .fusion import MIN_WEIGHT
+        return MIN_WEIGHT * max(1.0, self.gpu_fused / max(self.stats["merged"], 1))
 
     def keyframe_orb(self, slot, frame, mask_pixels, pose):
         """A keyframe's ORB (Optimise's loop candidates, the next ORB start), into its keyframe entry."""

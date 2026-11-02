@@ -144,6 +144,51 @@ def maps(depth, K, step=1):
     return vmap, nmap
 
 
+def voxel_weight(layout, index, weights, xyz):
+    """Seen-count of each point's cell (world mm): the most of its eight corner voxels, from
+    Engine.volume()'s index and the unpacked weights of its pool; 0 where no brick is allocated."""
+    base = np.floor((np.asarray(xyz, np.float64) - layout.origin) / layout.voxel_mm).astype(np.int64)
+    d = np.asarray(layout.dims, np.int64)
+    index, weights = np.asarray(index, np.int64), np.asarray(weights)
+    out = np.zeros(base.shape[:-1], weights.dtype)
+    for corner in np.ndindex(2, 2, 2):
+        vi = base + corner
+        bc = np.floor_divide(vi, 8)
+        inside = ((bc >= 0) & (bc < d)).all(-1)
+        slot = np.where(inside, index[np.where(inside, bc[..., 0] + d[0] * (bc[..., 1] + d[1] * bc[..., 2]), 0)], EMPTY)
+        ok = inside & (slot < len(weights) // 512)
+        loc = vi - bc * 8
+        at = np.where(ok, slot * 512 + loc[..., 0] + 8 * loc[..., 1] + 64 * loc[..., 2], 0)
+        out = np.maximum(out, np.where(ok, weights[at], 0))
+    return out
+
+
+def preview_codes(vref, nref, vcur, pose, base, weight, min_weight, step=2):
+    """The live view (Engine.preview's reference): uint8 per `step` x `step` block of pixels. 0 nothing, 1
+    the frame's own piece (vcur valid) where the model has no surface, 2-127 model surface above the base
+    seen fewer than `min_weight` times, 128-255 seen enough; the rest of the code is how squarely the
+    surface faces the camera (0.6 where its normal is unknown). A block shows its first model hit (row by
+    row), else 1 if any of its pixels is the frame's piece. vref / nref: the ray cast's maps (world, from
+    `pose`, camera -> world mm); weight: each ray-cast pixel's seen-count (voxel_weight)."""
+    h, w = vref.shape[0] // step, vref.shape[1] // step
+    blocks = lambda a: a[:h * step, :w * step].reshape(h, step, w, step, *a.shape[2:]).swapaxes(1, 2) \
+        .reshape(h, w, step * step, *a.shape[2:])
+    vr, nr, vc, wt = blocks(vref), blocks(nref), blocks(vcur), blocks(np.asarray(weight))
+    q = vr[..., :3].astype(np.float64)
+    hit = (vr[..., 3] > 0) & (q @ np.asarray(base[:3], np.float64) + base[3] > 0)
+    first = np.argmax(hit, axis=-1)  # the first hit in each block
+    take = lambda a: np.take_along_axis(a, first[..., None, None] if a.ndim == 4 else first[..., None], 2)[:, :, 0]
+    any_hit = hit.any(-1)
+    q, n, wq = take(q), take(nr), take(wt)
+    v = np.asarray(pose, np.float64)[:3, 3] - q
+    v /= np.maximum(np.linalg.norm(v, axis=-1, keepdims=True), 1e-9)
+    facing = np.where(n[..., 3] > 0, np.abs((n[..., :3] * v).sum(-1)), 0.6)
+    out = np.where((vc[..., 3] > 0).any(-1), 1, 0).astype(np.int64)
+    out = np.where(any_hit & (wq < min_weight), 2 + (facing * 125).astype(np.int64), out)
+    out = np.where(any_hit & (wq >= min_weight), 128 + (facing * 127).astype(np.int64), out)
+    return out.astype(np.uint8)
+
+
 def icp_sums(vcur, ncur, pose, vref, nref, ref_inv, K, centre, tukey=TUKEY_MM, gate=NORMAL_GATE, area=0.0,
              reach_mm=1e9, stride=1, base=(0.0, 0.0, 0.0, 1.0)):
     """The ICP sums (ICP_VALUES, float64) of a frame's maps (camera) against a ray-cast model's maps

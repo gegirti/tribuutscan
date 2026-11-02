@@ -160,6 +160,19 @@ def test_engine_matches_open3d_and_the_references():
         nv, near_n = near.model_maps()
         nhit = nv[..., 3] > 0
         assert np.median(np.abs(nv[..., 3][nhit] - wall(poses[1])[nhit])) < 0.02  # no half-pixel offset
+        index, tw, _ = near.volume()  # the live view: model seen often enough / too few times / the frame's own
+        weight = gpu.voxel_weight(layout, index, gpu.unpack_tsdf(tw)[1], nv[..., :3])
+        base = (0.0, 0.0, 1.0, -252.0)  # the wall's nearer part counts as the base
+        fv = near.frame_maps()[0]
+        for step in (1, 2):
+            got = near.preview(poses[1], base, len(poses), step)
+            want = gpu.preview_codes(nv, near_n, fv, poses[1], base, weight, len(poses), step)
+            assert got.shape == want.shape == (h // step, w // step)
+            differ = got.astype(int) - want
+            # float32 on the device: a shade may round one step the other way
+            assert (np.abs(differ) <= 1).all() and (differ != 0).mean() < 0.01
+        for lo, hi in ((1, 1), (2, 127), (128, 255)):
+            assert ((got >= lo) & (got <= hi)).any(), (lo, hi)  # every kind of pixel occurs
         near.raycast(poses[1], rect=(13, 7, 41, 30))  # only a window of the view, the rest cleared
         wv, wn = near.model_maps()
         assert (wv[7:30, 13:41] == nv[7:30, 13:41]).all() and (wn[7:30, 13:41] == near_n[7:30, 13:41]).all()

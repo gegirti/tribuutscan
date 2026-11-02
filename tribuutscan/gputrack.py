@@ -40,6 +40,7 @@ RAY_MARGIN_MM, RAY_MARGIN_PX = 30.0, 16  # the ray cast covers the piece's pixel
     # Hand scan (long range, the object a sixth of the view): ray cast 11.9 ms over the whole image
 TRUNC_VOXELS = 6.0  # 3 mm: the mesh's 1.5 mm (fusion.TRUNC_VOXELS) gave worse tracking on the thin plate (ATE 36 mm; 2 mm: 19, 3 mm: 6.8)
 KEYFRAME_MM = 2.0  # keyframe points (Optimise): one per cell of this size, as track.levels' finest level
+PREVIEW_STEP = 2  # the live view (preview): every 2nd pixel each way, 640 x 400
 
 
 def kind():
@@ -81,9 +82,10 @@ class Tracker:
         far = camera.window_mm[1] + 20 if far_mm is None else far_mm
         self.engine = gpu_wgpu.Engine(layout, self.K, size, adapter, far, timestamps=False)  # wall clock below
         self.engine.set_camera(camera, self.pinhole.index)
-        self.timing = {"source": 0.0, "raycast": 0.0, "icp": 0.0, "fuse": 0.0}  # wall clock s, with readbacks
+        self.timing = {"source": 0.0, "raycast": 0.0, "icp": 0.0, "fuse": 0.0, "preview": 0.0}  # wall s, readbacks in
         self.frames, self.passes = 0, 0  # frames solved, ICP passes run
         self.rect = None  # the ray cast's pixels (source)
+        self.ref = None  # the pose (mm) the last ray cast was made from
 
     def source(self, frame, pix, step, near_mm=None):
         """This frame's piece (pixels `pix`, sampled every `step`-th each way) as the maps to track; with
@@ -107,7 +109,7 @@ class Tracker:
         object's centre (world), which the GPU's sums turn about; `base`: (n, c) with n . x + c > 0
         above the base (world mm), or None."""
         e = self.engine
-        ref = gpu.pose_mm(init)
+        ref = self.ref = gpu.pose_mm(init)
         t0 = time.perf_counter()
         e.raycast(ref, normal_px=MODEL_NORMAL_PX, rect=self.rect)
         e.sync()
@@ -141,6 +143,17 @@ class Tracker:
                     break
         self.timing["icp"] += time.perf_counter() - t1
         return t, summary(last, radius_mm)
+
+    def preview(self, base=None, min_weight=4.0):
+        """The live view of the frame just solved (gpu_wgpu.Engine.preview: its piece against the model as
+        ray cast for it), uint8 at 1/PREVIEW_STEP; `base` as solve's. None before any solve."""
+        if self.ref is None:
+            return None
+        t0 = time.perf_counter()
+        plane = (0.0, 0.0, 0.0, 1.0) if base is None else (*base[0], base[1])
+        out = self.engine.preview(self.ref, plane, min_weight, PREVIEW_STEP)
+        self.timing["preview"] += time.perf_counter() - t0
+        return out
 
     def fuse(self, frame, labels, pose_m):
         """Fuse a merged frame (its 1/8 labels; pose camera -> world, metres) into the volume."""
