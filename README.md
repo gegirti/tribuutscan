@@ -406,8 +406,9 @@ Next up:
         after a loss (the first live scan, replayed: 132 -> 480 of 483 frames tracked)
   - [x] the live model view: the scan so far painted over the depth view (done, needs more views,
         missing), 1 ms a frame
-  - [ ] live scanning at full rate (that recording now runs at about 15 fps through the live worker
-        on a busy desktop, merging in a process of its own; next: unpacking depth on the GPU)
+  - [ ] live scanning at full rate (that recording runs at about 15 fps through the live worker on a
+        busy desktop, 20-24 without the live worker's messages around it; depth is unpacked on the
+        GPU and merged in a process of its own)
 - [ ] **Crop in the 3D view**: for what touches the object (a stand, a cable), which object
       separation keeps.
 - [ ] **Speed** (measured on the marker scan: 247 ms per frame, about 4 fps):

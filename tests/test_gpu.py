@@ -228,6 +228,21 @@ def test_gpu_frame_preparation_is_fusions():
             ok = d_cpu > 0
             assert np.abs(d_cpu[ok] - d_gpu[ok]).max() < 1e-3
             assert (c_cpu[ok] != c_gpu[ok]).any(1).mean() < 0.01
+            # the same frame from the scanner's bytes (unpack: the GPU decodes them), Y14 and Y10, with a
+            # garbled run: the depth is depth.decode_depth's, and fusing it reads that depth
+            from tribuutscan import depth as dp
+            bad = np.round(raw).astype(np.uint16)
+            bad[40:46] = (64 * (np.arange(6)[:, None] + 3) + np.arange(w) % 64).astype(np.uint16)
+            for packed, bpl in ((dp.encode_y14(bad * 16 + 8), w * 14 // 8), (dp.encode_y10(bad), w * 10 // 8)):
+                want = dp.decode_depth(packed, w, h, bpl)
+                _, cleared = dp.decode_strided(packed, w, h, bpl)
+                assert cleared is not None and not want[cleared].any()
+                e.unpack(packed, bpl, cleared)
+                assert np.array_equal(e.unpacked(), want.astype(np.float32))
+                assert e.fuse_frame({"depth": want, "yuyv": yuyv}, labels, np.eye(4), depth_ready=True)
+                d_ready, _ = e.prepared()
+                e.fuse_frame({"depth": want, "yuyv": yuyv}, labels, np.eye(4))
+                assert np.array_equal(d_ready, e.prepared()[0])
     finally:
         calib.use(saved[0])
         calib.use_mode(saved[1])

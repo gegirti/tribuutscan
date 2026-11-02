@@ -129,3 +129,57 @@ def test_a_merge_process_lost_mid_scan_leaves_the_scan_merging_on_the_thread():
     xyz, _, _ = sc.cloud_points(1)  # a wait on it finds it gone: the local (thread) cloud answers
     assert len(xyz) == 0 and sc.merge_proc is None and sc.merger is not None and "merge process lost" in said[-1]
     sc.flush()  # nothing left to pull: the local cloud stays
+
+
+def test_live_frames_with_their_depth_packed_track_as_decoded_ones():
+    """A 14-bit synthetic scan fed as the live worker feeds it (depth.LazyFrame: every 4th pixel decoded on
+    the CPU, the rest unpacked by the GPU and by whoever merges) and fully decoded: the same poses, cloud,
+    keyframes; in the thread and in the merge process."""
+    try:
+        from tribuutscan import synth
+    except ImportError:
+        return
+    import tempfile
+    from pathlib import Path
+    from tribuutscan import calib, depth as dp
+    from tribuutscan import frames as fr
+    from tribuutscan.merger import CLOUD_ARRAYS
+    before = calib.CAMERA.spec
+    calib.use(calib.ESTIMATES)
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            rec = Path(tmp) / "t-rec"
+            synth.generate(rec, n_frames=16, bits=14)
+            decoded = list(fr.read_recording(rec, yuyv=True))
+            h, w = decoded[0]["depth"].shape
+
+            def lazy():
+                for b in fr.read_raw(rec):
+                    d4, cleared = dp.decode_strided(b["depth"], w, h, b["bytesperline"])
+                    yield dp.LazyFrame(yuyv=b["color"], depth_raw=b["depth"], bytesperline=b["bytesperline"], depth4=d4,
+                                       cleared=cleared, shape=(h, w), t=b["t"][2], skew_ms=(b["t"][0] - b["t"][2]) * 1000)
+
+            runs, real, decodes = [], dp.decode_depth, []
+            for frames, process in ((decoded, False), (lazy(), False), (lazy(), True)):
+                sc = cl.Scanner(log=lambda *a: None, track_with="gpu", merge_min_s=0.0, merge_process=process)
+                dp.decode_depth = lambda *a, **k: decodes.append(process) or real(*a, **k)
+                try:
+                    for i, frame in enumerate(frames):
+                        sc.feed(frame, i)
+                    sc.flush()  # (the thread's merges decode: counted till they are done)
+                finally:
+                    dp.decode_depth = real
+                sc.close()
+                runs.append(sc)
+            # with the merge process no full CPU decode here at all (this box's markers take the depth from the GPU)
+            assert decodes.count(True) == 0
+            ref = runs[0]
+            assert ref.stats["merged"] >= 4 and len(ref.cloud) > 1000
+            for sc in runs[1:]:
+                assert all((p is None and q is None) or (p is not None and q is not None and np.array_equal(p, q))
+                           for (_, _, p), (_, _, q) in zip(ref.track_log, sc.track_log))
+                for name in CLOUD_ARRAYS:
+                    assert np.array_equal(getattr(ref.cloud, name), getattr(sc.cloud, name)), name
+                assert [k[0] for k in ref.keyframes] == [k[0] for k in sc.keyframes]
+    finally:
+        calib.use(before)

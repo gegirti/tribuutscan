@@ -828,8 +828,37 @@ fn main(@builtin(global_invocation_id) g: vec3<u32>) {  // mean of the neighbour
 }
 """
 
+PREP_UNPACK = """
+@group(0) @binding(1) var<storage, read> packed: array<u32>;   // the scanner's bytes, as they came
+@group(0) @binding(2) var<storage, read> cleared: array<u32>;  // per row: 1 = garbled (no depth)
+@group(0) @binding(3) var<storage, read_write> raw: array<f32>;
+fn byte_at(o: u32) -> u32 { return (packed[o >> 2u] >> ((o & 3u) * 8u)) & 0xffu; }
+@compute @workgroup_size(64, 4)
+fn main(@builtin(global_invocation_id) g: vec3<u32>) {  // depth.decode_depth: box.x bytes per line, box.y 14 or 10 bits
+  let w = Q.size.x;
+  if (g.x >= w / 4u || g.y >= Q.size.y) { return; }
+  let i = g.y * w + g.x * 4u;
+  var out = vec4<f32>(0.0);
+  if (cleared[g.y] == 0u) {
+    if (Q.box.y == 14u) {  // 4 pixels in 7 bytes, MSB first; on the Y10 scale: (v - 8) / 16, 0 below 16
+      let o = g.y * Q.box.x + g.x * 7u;
+      let b1 = byte_at(o + 1u); let b3 = byte_at(o + 3u); let b5 = byte_at(o + 5u);
+      let v = vec4<u32>((byte_at(o) << 6u) | (b1 >> 2u), ((b1 & 3u) << 12u) | (byte_at(o + 2u) << 4u) | (b3 >> 4u),
+                        ((b3 & 15u) << 10u) | (byte_at(o + 4u) << 2u) | (b5 >> 6u), ((b5 & 63u) << 8u) | byte_at(o + 6u));
+      out = select(vec4<f32>(0.0), (vec4<f32>(v) - 8.0) / 16.0, v >= vec4<u32>(16u));
+    } else {  // 4 pixels in 5 bytes
+      let o = g.y * Q.box.x + g.x * 5u;
+      let b1 = byte_at(o + 1u); let b2 = byte_at(o + 2u); let b3 = byte_at(o + 3u);
+      out = vec4<f32>(vec4<u32>((byte_at(o) << 2u) | (b1 >> 6u), ((b1 & 63u) << 4u) | (b2 >> 4u),
+                                ((b2 & 15u) << 6u) | (b3 >> 2u), ((b3 & 3u) << 8u) | byte_at(o + 4u)));
+    }
+  }
+  raw[i] = out.x; raw[i + 1u] = out.y; raw[i + 2u] = out.z; raw[i + 3u] = out.w;
+}
+"""
+
 PREP = {"prep_blur": PREP_BLUR, "prep_clean": PREP_CLEAN, "prep_erode": PREP_ERODE, "prep_finish": PREP_FINISH, "prep_remap": PREP_REMAP,
-        "prep_source": PREP_SOURCE}
+        "prep_source": PREP_SOURCE, "prep_unpack": PREP_UNPACK}
 
 S = wgpu.BufferUsage
 
@@ -926,6 +955,7 @@ class Engine:
         b = {"raw": buf(4 * w * h), "rays": buf(8 * w * h), "mask1": buf(4 * w * h), "mask2": buf(4 * w * h),
              "labels": buf(4 * (w // 8 + 2) * (h // 8 + 2)), "yuyv": buf(2 * w * h), "zs": buf(4 * w * h), "zt": buf(4 * w * h), "cs": buf(4 * w * h),
              "lookup": buf(4 * w * h), "cells": buf(4 * w * h),
+             "packed": buf((w * 14 // 8 * h + 3) // 4 * 4), "cleared": buf(4 * h),  # unpack(): a frame's raw bytes
              "uniform": dev.create_buffer(size=208, usage=S.UNIFORM | S.COPY_DST)}
         q.write_buffer(b["rays"], 0, np.stack([x, y], 1).astype(np.float32))
         q.write_buffer(b["lookup"], 0, (np.arange(w * h) if lookup is None else lookup).astype(np.int32))
@@ -950,9 +980,10 @@ class Engine:
             "prep_remap_blur": g("prep_remap", "lookup", "zs", "cs", "zt", self.colour),  # then blurred into depth
             "prep_blur_fused": g("prep_blur", "zt", self.depth),
             "prep_source": g("prep_source", "raw", "lookup", "cells", "zs"),
-            "prep_blur": g("prep_blur", "zs", self.depth)})
+            "prep_blur": g("prep_blur", "zs", self.depth),
+            "prep_unpack": g("prep_unpack", "packed", "cleared", "raw")})
 
-    def fuse_frame(self, frame, labels, pose_m, step=8, blur_px=0, blur_mm=1.0):
+    def fuse_frame(self, frame, labels, pose_m, step=8, blur_px=0, blur_mm=1.0, depth_ready=False):
         """Prepare one recorded frame set on the GPU (as fusion.frame_images + Pinhole: cleaned, only on
         its labelled pixels, colour per pixel through the colour camera) and fuse it. `frame` holds
         "depth" (raw, Y10 scale) and "yuyv" (without it, or without a colour model: grey); `labels` its
@@ -981,7 +1012,8 @@ class Engine:
         q.write_buffer(p["buffers"]["uniform"], 0, p["head"] + struct.pack("<4I", c0, r0, c1, r1)
                        + struct.pack("<4I", w, h, cw, ch) + struct.pack("<4I", *cells)
                        + struct.pack("<4f", blur_px, blur_mm, 0, 0))
-        q.write_buffer(p["buffers"]["raw"], 0, np.ascontiguousarray(frame["depth"], np.float32))
+        if not depth_ready:  # (ready: this frame was unpack()ed and nothing has written over it)
+            q.write_buffer(p["buffers"]["raw"], 0, np.ascontiguousarray(frame["depth"], np.float32))
         if cw:
             q.write_buffer(p["buffers"]["yuyv"], 0, np.frombuffer(frame["yuyv"], np.uint8, 2 * cw * ch))
         self._params("frame", pose=gpu.pose_mm(pose_m), frame=self.frames)
@@ -992,6 +1024,27 @@ class Engine:
                    ("allocate", self._image_groups(gpu.ALLOC_STRIDE)), ("clamp", (1,)), ("integrate", "indirect")])
         self.frames += 1
         return True
+
+    def unpack(self, packed, bytesperline, cleared=None):
+        """A frame's depth straight from the scanner's bytes (Y14 or Y10, told apart by bytesperline as
+        depth.decode_depth does), unpacked here onto the Y10 scale for track_source / fuse_frame (passed
+        raw=None / depth_ready): 1.8 MB up instead of 4 MB of floats, and no decode on the CPU. `cleared`:
+        bool per row, the garbled rows (and margins) depth.decode_strided found."""
+        w, h = self.size
+        p, q = self.prep, self.device.queue
+        bits = 14 if bytesperline >= w * 14 // 8 else 10
+        rows = np.zeros(h, np.uint32) if cleared is None else np.asarray(cleared, np.uint32)
+        q.write_buffer(p["buffers"]["uniform"], 0, p["head"] + struct.pack("<4I", bytesperline, bits, 0, 0)
+                       + struct.pack("<4I", w, h, 0, 0) + struct.pack("<4I", 0, 0, 0, 0) + struct.pack("<4f", 0, 0, 0, 0))
+        data = np.frombuffer(packed, np.uint8, count=bytesperline * h)
+        q.write_buffer(p["buffers"]["packed"], 0, np.pad(data, (0, -len(data) % 4)))
+        q.write_buffer(p["buffers"]["cleared"], 0, rows)
+        self._run([("prep_unpack", ((w // 4 + 63) // 64, (h + 3) // 4))])
+
+    def unpacked(self):
+        """The depth unpack() made (Y10 scale, (h, w) float32), read back."""
+        w, h = self.size
+        return np.frombuffer(self.device.queue.read_buffer(self.prep["buffers"]["raw"]), np.float32).reshape(h, w).copy()
 
     def track_source(self, raw, keep, step, normal_step=1, blur_px=0, blur_mm=1.0):
         """Make the maps tracking matches (icp) from a frame's raw depth (Y10 scale, sensor grid): only
@@ -1005,7 +1058,8 @@ class Engine:
         q.write_buffer(p["buffers"]["uniform"], 0, p["head"] + struct.pack("<4I", 0, 0, w, h)
                        + struct.pack("<4I", w, h, 0, 0) + struct.pack("<4I", step, cells.shape[1], cells.shape[0], 1)
                        + struct.pack("<4f", blur_px, blur_mm, 0, 0))
-        q.write_buffer(p["buffers"]["raw"], 0, np.ascontiguousarray(raw, np.float32))
+        if raw is not None:  # (None: the frame's raw bytes were unpacked here already: unpack())
+            q.write_buffer(p["buffers"]["raw"], 0, np.ascontiguousarray(raw, np.float32))
         q.write_buffer(p["buffers"]["cells"], 0, cells)
         self._params("frame", normal_step=normal_step)
         img = self._image_groups()

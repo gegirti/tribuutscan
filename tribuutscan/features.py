@@ -30,8 +30,7 @@ _matcher = cv2.BFMatcher(cv2.NORM_HAMMING)
 
 def luma_of(frame):
     """Brightness (H, W) uint8 of a frame set: straight from the YUYV bytes when it has them."""
-    depth = frame["depth"]
-    h, w = depth.shape
+    h, w = frame["shape"] if "shape" in frame else frame["depth"].shape  # (a live frame's depth stays packed)
     if "yuyv" in frame:
         return np.frombuffer(frame["yuyv"], np.uint8, w * h * 2)[0::2].reshape(h, w)
     rgb = frame["color"]

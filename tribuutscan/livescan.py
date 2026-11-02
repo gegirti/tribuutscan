@@ -36,7 +36,7 @@ from . import cloud as cl
 from . import frames as fr
 from . import pointcloud as pc
 from . import view3d
-from .depth import decode_depth
+from .depth import LazyFrame, decode_strided
 
 PAYLOAD_EVERY_S = 0.5  # rebuild the page's cloud at most this often
 LIVE_MIN_SEEN = 1  # the page shows every cube while scanning; the saved cloud uses cloud.MIN_SEEN
@@ -74,9 +74,10 @@ class RawCopy:
 
 
 class Reader(threading.Thread):
-    """Takes the viewer's commands off its queue beside tracking: a frame's depth is decoded here
-    (depth.decode_depth, garbled rows included; 8 ms a frame) while the main loop tracks the one
-    before. Everything comes out of `out` in the order it came in, frames as (*command, depth)."""
+    """Takes the viewer's commands off its queue beside tracking, in the order they came, frames as
+    (*command, every-4th-pixel depth, cleared rows): depth.decode_strided, with the garbled-row check.
+    The full depth stays packed (depth.LazyFrame): the GPU unpacks it for tracking, the merge process
+    for itself (the full decode here took 14 ms a frame beside tracking, holding the GIL)."""
 
     def __init__(self, commands):
         super().__init__(daemon=True)
@@ -89,7 +90,7 @@ class Reader(threading.Thread):
             if cmd[0] == "frame":
                 t = time.perf_counter()
                 _, _, _, depth_buf, bytesperline, _ = cmd
-                cmd = (*cmd, decode_depth(depth_buf, fr.W, fr.H, bytesperline))
+                cmd = (*cmd, *decode_strided(depth_buf, fr.W, fr.H, bytesperline))
                 self.decode_s += time.perf_counter() - t
             self.out.put(cmd)
             if cmd[0] == "quit":
@@ -214,7 +215,7 @@ def run(commands, replies, port=view3d.PORT):
                 source.name = f"live: {out_dir.name}"
                 source.phase, source.out_dir = "scanning", out_dir
         elif kind == "frame" and source.scanner is not None:
-            _, yuyv, grey, depth_buf, bytesperline, (t_c, t_i, t_d), depth = cmd
+            _, yuyv, grey, depth_buf, bytesperline, (t_c, t_i, t_d), depth4, cleared = cmd
             t0 = time.perf_counter()
             if keep_raw:
                 try:
@@ -233,7 +234,8 @@ def run(commands, replies, port=view3d.PORT):
                         recorder = None
                     replies.put(("log", f"raw copy stopped, the scan goes on: {e}"))
             t2 = time.perf_counter()
-            frame = {"yuyv": yuyv, "depth": depth, "t": t_d, "skew_ms": (t_c - t_d) * 1000}  # colour per point
+            frame = LazyFrame(yuyv=yuyv, depth_raw=depth_buf, bytesperline=bytesperline, depth4=depth4, cleared=cleared,
+                              shape=(fr.H, fr.W), t=t_d, skew_ms=(t_c - t_d) * 1000)  # colour per point
             with source.lock:
                 s = source.scanner
                 s.feed(frame)

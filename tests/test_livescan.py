@@ -45,7 +45,7 @@ def test_a_full_disk_stops_the_raw_copy_not_the_scan():
     assert isinstance(copy.error, fr.DiskFull)
 
 
-def test_the_reader_decodes_frames_beside_tracking_and_keeps_the_order():
+def test_the_reader_decodes_every_4th_pixel_beside_tracking_and_keeps_the_order():
     import queue
     from tribuutscan import frames as fr
     from tribuutscan.depth import decode_depth, encode_y14
@@ -64,6 +64,7 @@ def test_the_reader_decodes_frames_beside_tracking_and_keeps_the_order():
     assert [g[0] for g in got] == [c[0] for c in sent] and reader.out.empty()
     for g, c in zip(got, sent):
         if c[0] == "frame":
-            assert g[:-1] == c and (g[-1] == decode_depth(c[3], fr.W, fr.H, c[4])).all()
+            full = decode_depth(c[3], fr.W, fr.H, c[4])
+            assert g[:-2] == c and (g[-2] == full[::4, ::4]).all() and g[-1] is None  # (no garbled rows)
         else:
             assert g == c

@@ -86,11 +86,13 @@ class Tracker:
         self.frames, self.passes = 0, 0  # frames solved, ICP passes run
         self.rect = None  # the ray cast's pixels (source)
         self.ref = None  # the pose (mm) the last ray cast was made from
+        self.unpacked_frame = None  # the frame whose bytes the engine unpacked last (its depth is on the GPU)
 
     def source(self, frame, pix, step, near_mm=None):
         """This frame's piece (pixels `pix`, sampled every `step`-th each way) as the maps to track; with
-        `near_mm` (the piece's nearest distance) the ray casts cover only the piece's part of the view."""
-        h, w = frame["depth"].shape
+        `near_mm` (the piece's nearest distance) the ray casts cover only the piece's part of the view. A
+        frame with the scanner's bytes ("depth_raw": depth.LazyFrame) is unpacked here (Engine.unpack)."""
+        h, w = frame["shape"] if "shape" in frame else frame["depth"].shape
         keep = np.zeros(((h + step - 1) // step, (w + step - 1) // step), bool)
         keep[pix[:, 1] // step, pix[:, 0] // step] = True
         self.rect = None
@@ -99,8 +101,18 @@ class Tracker:
             lo, hi = pix.min(0) - m, pix.max(0) + m + 1
             self.rect = (max(lo[0], 0), max(lo[1], 0), min(hi[0], w), min(hi[1], h))
         t0 = time.perf_counter()
-        self.engine.track_source(frame["depth"], keep, step, NORMAL_STEP, BLUR_PX)
+        if "depth_raw" in frame:
+            self.engine.unpack(frame["depth_raw"], frame["bytesperline"], frame.get("cleared"))
+            self.engine.track_source(None, keep, step, NORMAL_STEP, BLUR_PX)
+            self.unpacked_frame = frame
+        else:
+            self.engine.track_source(frame["depth"], keep, step, NORMAL_STEP, BLUR_PX)
+            self.unpacked_frame = None
         self.timing["source"] += time.perf_counter() - t0
+
+    def depth(self, frame):
+        """The full depth of the frame source() unpacked last (read back), or None for any other frame."""
+        return self.engine.unpacked() if frame is self.unpacked_frame else None
 
     def solve(self, init, prior=None, marker_pairs=None, radius_mm=60.0, centre_mm=(0, 0, 0), base=None,
               marker_sigma_mm=track.MARKER_SIGMA_MM):
@@ -158,7 +170,7 @@ class Tracker:
     def fuse(self, frame, labels, pose_m):
         """Fuse a merged frame (its 1/8 labels; pose camera -> world, metres) into the volume."""
         t0 = time.perf_counter()
-        fused = self.engine.fuse_frame(frame, labels, pose_m, blur_px=BLUR_PX)
+        fused = self.engine.fuse_frame(frame, labels, pose_m, blur_px=BLUR_PX, depth_ready=frame is self.unpacked_frame)
         self.engine.sync()
         self.timing["fuse"] += time.perf_counter() - t0
         return fused

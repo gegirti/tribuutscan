@@ -20,7 +20,9 @@ import numpy as np
 # wrapping at 1024) that this test misses, hence the wide margin. Dropping the whole frame instead
 # was measured worse: on the marker recording (3.3 fps) the 44 lost frames let tracking double the part.
 GARBLE_STEP = 64  # raw units, both formats
-GARBLE_SHARE, GARBLE_MIN = 0.15, 20  # a row is garbled when this share (and number) of its steps are such
+GARBLE_SHARE, GARBLE_MIN = 0.15, 10  # a row is garbled when this share (and number) of its steps are such...
+GARBLE_COLUMNS = 4  # ...judged on every 4th column: the first pixel of each packed group of 4, the only one a
+                    # live frame unpacks on the CPU (decode_strided; every 2nd column with 20 before)
 GARBLE_MARGIN = 8  # rows cleared above and below each garbled row
 garbled = {"frames": 0, "rows": 0}  # what decode_depth cleared (for the viewer's log)
 
@@ -88,11 +90,11 @@ def decode_y14(buf, width, height, bytesperline):
     return y10_scale(unpack_y14(buf, width, height, bytesperline))
 
 
-def garbled_rows(raw):
+def garbled_rows(raw, every=GARBLE_COLUMNS):
     """Bool per row: rows the scanner filled with garbage (see GARBLE_STEP), except the first of each
-    run. `raw` holds the raw integer values (Y10, or Y14 before y10_scale); judged on every 2nd
-    column, over the pixels that have depth in both rows."""
-    s = raw[:, ::2].astype(np.int32)
+    run. `raw` holds the raw integer values (Y10, or Y14 before y10_scale); judged on every
+    GARBLE_COLUMNS-th column (`every` 1: `raw` holds only those), over the pixels with depth in both rows."""
+    s = raw[:, ::every].astype(np.int32)
     ok = (s[1:] > 0) & (s[:-1] > 0)
     step = s[1:] - s[:-1]
     hits = (ok & (step != 0) & (step % GARBLE_STEP == 0)).sum(1)
@@ -106,10 +108,50 @@ def decode_depth(buf, width, height, bytesperline, clean=True):
     Garbled rows and GARBLE_MARGIN rows around them come back with no depth (0) unless clean is False."""
     y14 = bytesperline >= width * 14 // 8
     raw = unpack_y14(buf, width, height, bytesperline) if y14 else decode_y10(buf, width, height, bytesperline)
-    rows = garbled_rows(raw) if clean else None
-    if rows is not None and rows.any():
-        rows = np.convolve(rows, np.ones(2 * GARBLE_MARGIN + 1), "same") > 0
-        raw[rows] = 0
-        garbled["frames"] += 1
-        garbled["rows"] += int(rows.sum())
+    if clean:
+        rows = cleared_rows(garbled_rows(raw))
+        if rows is not None:
+            raw[rows] = 0
     return y10_scale(raw) if y14 else raw
+
+
+def cleared_rows(hit):
+    """The rows a decode clears for garbled rows `hit` (GARBLE_MARGIN around each), counted; None if none."""
+    if not hit.any():
+        return None
+    rows = np.convolve(hit, np.ones(2 * GARBLE_MARGIN + 1), "same") > 0
+    garbled["frames"] += 1
+    garbled["rows"] += int(rows.sum())
+    return rows
+
+
+def decode_strided(buf, width, height, bytesperline):
+    """Every 4th pixel each way of decode_depth's result, (height // 4, width // 4) on its scale, and the
+    rows it clears (bool per row, or None): only the first pixel of each packed group of 4 is unpacked
+    (2 of its 7 or 5 bytes), so a live frame's object search costs no full decode (8 ms beside tracking,
+    taking the GIL)."""
+    y14 = bytesperline >= width * 14 // 8
+    n = width // 4
+    rows = np.frombuffer(buf, dtype=np.uint8, count=height * bytesperline).reshape(height, bytesperline)
+    g = rows[:, :n * (7 if y14 else 5)].reshape(height, n, 7 if y14 else 5)
+    first = ((g[..., 0].astype(np.uint16) << 6) | (g[..., 1] >> 2)) if y14 else \
+        ((g[..., 0].astype(np.uint16) << 2) | (g[..., 1] >> 6))
+    clear = cleared_rows(garbled_rows(first, every=1))
+    if clear is not None:
+        first = first.copy()
+        first[clear] = 0
+    out = first[::4]
+    return (y10_scale(out) if y14 else out), clear
+
+
+class LazyFrame(dict):
+    """A live frame set whose full "depth" (decode_depth of "depth_raw" with "bytesperline") is decoded
+    only when something asks for it; "depth4" (decode_strided), "cleared" (its rows) and "shape" are
+    there from the start. A dict, so it pickles (the merge process decodes its own copy)."""
+
+    def __missing__(self, key):
+        if key != "depth":
+            raise KeyError(key)
+        h, w = self["shape"]
+        depth = self["depth"] = decode_depth(self["depth_raw"], w, h, self["bytesperline"])
+        return depth

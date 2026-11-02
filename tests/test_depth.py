@@ -79,3 +79,31 @@ def test_garbled_rows_are_cleared():
     assert depth.decode_depth(y14(clean), w, h, w * 14 // 8).all()
     assert not depth.decode_depth(y14(bad), w, h, w * 14 // 8)[20:26].any()
     assert depth.garbled["frames"] == before + 2
+
+
+def test_the_strided_decode_is_every_4th_pixel_of_the_full_one():
+    from tribuutscan import depth
+    clean, bad = garbled_frame()
+    h, w = clean.shape
+    for frame in (clean, bad):
+        for encode, bits, values in ((depth.encode_y10, 10, frame), (depth.encode_y14, 14, frame * 16 + 8)):
+            buf = encode(values)
+            full = depth.decode_depth(buf, w, h, w * bits // 8)
+            got, cleared = depth.decode_strided(buf, w, h, w * bits // 8)
+            assert got.dtype == full.dtype and np.array_equal(got, full[::4, ::4])
+            assert (cleared is None) == (frame is clean)
+
+
+def test_a_lazy_frame_decodes_its_depth_when_asked_and_pickles():
+    import pickle
+    from tribuutscan import depth
+    clean, bad = garbled_frame()
+    h, w = clean.shape
+    buf = depth.encode_y14(bad * 16 + 8)
+    d4, cleared = depth.decode_strided(buf, w, h, w * 14 // 8)
+    frame = depth.LazyFrame(depth_raw=buf, bytesperline=w * 14 // 8, depth4=d4, cleared=cleared, shape=(h, w))
+    assert "depth" not in frame and frame.get("depth") is None  # nothing decoded by looking
+    copy = pickle.loads(pickle.dumps(frame))
+    assert type(copy) is depth.LazyFrame and "depth" not in copy
+    want = depth.decode_depth(buf, w, h, w * 14 // 8)
+    assert np.array_equal(frame["depth"], want) and "depth" in frame and np.array_equal(copy["depth"], want)

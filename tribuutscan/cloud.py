@@ -196,13 +196,16 @@ def frame_points(frame, stride=1, normals=False, colour=True):
     from the neighbouring pixels, facing the camera (zero where a neighbour has no depth). Without
     `colour` the colours are None (tracking needs none: the lookup took 6 of a frame's 7 ms).
     """
-    d = frame["depth"]
-    h, w = d.shape
-    ds = d[::stride, ::stride]
+    if stride == 4 and "depth4" in frame:  # a live frame: its every-4th pixel decoded alone (depth.LazyFrame)
+        ds, (h, w) = frame["depth4"], frame["shape"]
+    else:
+        d = frame["depth"]
+        h, w = d.shape
+        ds = d[::stride, ::stride]
     valid = ds > 0
     v, u = np.nonzero(valid)
+    z = pc.depth_to_mm(ds[v, u])
     v, u = v * stride, u * stride
-    z = pc.depth_to_mm(d[v, u])
     xyz = CAMERA.backproject(u, v, z)
     rgb = None
     if colour:
@@ -211,6 +214,11 @@ def frame_points(frame, stride=1, normals=False, colour=True):
     if not normals:
         return xyz, rgb, np.stack([u, v], 1)
     return xyz, rgb, np.stack([u, v], 1), pixel_normals(ds, stride, v // stride, u // stride, xyz)
+
+
+def frame_shape(frame):
+    """(height, width) of a frame set, without decoding a live frame's depth (depth.LazyFrame)."""
+    return tuple(frame["shape"]) if "shape" in frame else frame["depth"].shape
 
 
 def pixel_normals(ds, stride, rows, cols, xyz):
@@ -632,7 +640,7 @@ class Scanner:
                 self.merge_lost(e)
         if self.clean_depth is True:  # track on cleaned depth as well
             frame = self.cleaned(frame)
-        shape = frame["depth"].shape
+        shape = frame_shape(frame)
         seg = self.seg_stride  # the object / base search's grid (merging takes every self.stride-th pixel)
         all_xyz, _, all_pix = frame_points(frame, seg, colour=False)  # normals and colour only for merging
         scene = self.scene
@@ -797,6 +805,8 @@ class Scanner:
         stats["merged"] += 1
         job = (frame, index, self.pose.copy(), pix, seg)
         if self.merge_proc is not None:
+            if "depth_raw" in frame:  # the scanner's bytes travel, not 4 MB of floats: the merge process decodes them
+                job = (type(frame)({k: v for k, v in frame.items() if k not in ("depth", "depth4")}),) + job[1:]
             self.merge_proc.submit(*job, orb_job)
         elif self.merger is None:
             self.merge(*job)
@@ -1058,7 +1068,7 @@ class Scanner:
         if self.merge_proc is not None and self.orb_slot is not None:
             self.sync_merges()  # (the same, from the merge process: its replies come in order)
             self.orb_slot = None
-        feat = self.features.extract(self.features.luma_of(frame), frame["depth"],
+        feat = self.features.extract(self.features.luma_of(frame), self.depth_of(frame),
                                      None if self.scene.mode == "still" else pix)
         if self.prev_feat is None or self.feat_pose is None:
             return feat, None
@@ -1074,7 +1084,7 @@ class Scanner:
         if self.gpu is None:
             from . import gputrack
             to_world = scene_transform(self.pose)
-            self.gpu = gputrack.Tracker(CAMERA, frame["depth"].shape[::-1],
+            self.gpu = gputrack.Tracker(CAMERA, frame_shape(frame)[::-1],
                                         xyz.mean(0) @ to_world[:3, :3].T + to_world[:3, 3], self.gpu_kind)
             self.log(f"tracking on the GPU: {self.gpu.engine.device_name}")
         self.gpu.source(frame, pix, self.seg_stride, float(np.percentile(xyz[:, 2], 2)) if len(xyz) else None)
@@ -1154,6 +1164,15 @@ class Scanner:
             self.model_levels, self.model_at = fuse.levels(xyz / 1000), self.stats["merged"]
         return True
 
+    def depth_of(self, frame):
+        """A frame's full depth: as decoded, or for a live frame (depth.LazyFrame) read back from the GPU
+        that unpacked it (~2 ms), else decoded on first use. Tracking's thread only (the GPU's buffer)."""
+        if "depth" not in frame and self.gpu is not None:
+            depth = self.gpu.depth(frame)
+            if depth is not None:
+                frame["depth"] = depth
+        return frame["depth"]
+
     def frame_markers(self, frame):
         """Camera-frame centres (mm, (N, 3)) of the markers in a frame; uses frame["markers2d"]
         (pre-detected colour pixels) when given. While none were seen for MARKER_IDLE_FRAMES frames,
@@ -1165,7 +1184,10 @@ class Scanner:
                 return np.empty((0, 3))
             from .features import luma_of
             found = markers.detect_fast(luma_of(frame), frame.get("color"))
-        pts = [loc[0] for loc in markers.locate(frame["depth"], found) if loc is not None]
+        if not len(found):  # (nothing to place: a live frame's depth stays packed)
+            self.no_markers += 1
+            return np.empty((0, 3))
+        pts = [loc[0] for loc in markers.locate(self.depth_of(frame), found) if loc is not None]
         self.no_markers = 0 if pts else self.no_markers + 1
         return np.array(pts).reshape(-1, 3)
 
@@ -1203,7 +1225,7 @@ class Scanner:
         if self.gpu is None or self.features is None or not kfs:
             return False
         if feat is None:
-            feat = self.refind_feat = self.features.extract(self.features.luma_of(frame), frame["depth"],
+            feat = self.refind_feat = self.features.extract(self.features.luma_of(frame), self.depth_of(frame),
                                                             None if self.scene.mode == "still" else pix)
         pick = sorted(set(np.linspace(0, len(kfs) - 1, min(REFIND_KEYFRAMES, len(kfs))).round().astype(int))
                       | set(range(max(0, len(kfs) - 4), len(kfs))))

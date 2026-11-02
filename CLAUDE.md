@@ -1033,6 +1033,37 @@ cubes on the GPU; the CPU keeps the 6x6 solve, markers, base votes, pose graph, 
   - Next in item 3: the user prints it, measures MEASURE with calipers and scans it (close and long
     range). A tool then aligns the scan (compare.py's placement) and measures it against the sdf:
     distances, per-face offsets (step heights), best-fit scale.
+- LIVE SPEED, step 4 (2026-11-02, plan approved): a live frame's depth decoded where it is used.
+  - The decode paths:
+    - `depth.decode_strided`: the first pixel of each packed group, every 4th row, plus the
+      garbled-row check; it equals `decode_depth(...)[::4, ::4]`;
+    - `depth.LazyFrame`: a dict whose "depth" is decoded on first access; it pickles;
+    - livescan.Reader builds LazyFrames (raw bytes, depth4, cleared rows, shape);
+    - `frame_points(frame, 4)` takes depth4; `frame_shape` / `luma_of` take the shape without
+      decoding;
+    - GPU: `Engine.unpack` (kernel PREP_UNPACK, Y14 / Y10 onto the Y10 scale, cleared rows zeroed)
+      fills the buffer `track_source(None)` and `fuse_frame(depth_ready=True)` read;
+    - `Tracker.depth(frame)` reads it back;
+    - `Scanner.depth_of` serves markers / orb_guess / refind from it;
+    - `frame_markers` skips `locate` when nothing was found;
+    - the merge process gets the frame without its floats and decodes its own copy.
+  - Garbled-row check: now every 4th column with GARBLE_MIN 10 (was every 2nd with 20). On the marker
+    recording the same 44 garbled frames are flagged; after the 8-row margin, 5 frames differ by one
+    row (2 more, 3 fewer of ~1300 cleared); nothing on either hand recording.
+  - Tests:
+    - the strided decode against the full one, Y10 / Y14, garbled;
+    - the GPU unpack = decode_depth on the GPU and on llvmpipe; fusing from it = fusing the floats;
+    - a 14-bit synthetic scan fed as LazyFrames tracks bit-identically to decoded frames (poses, cloud,
+      keyframes), and with the merge process the tracking process never decodes the full depth.
+  - Measured: "decode beside tracking" 13-15 -> 3 ms. But fps barely moved: bench --live on hand2
+    alternating with 1e5ab5d gave 14.3 / 15.3 against 13.9 / 14.5. Numpy's bulk work releases the
+    GIL, so that decode was not costing tracking much: an estimate in the plan that did not hold.
+  - The desktop was loaded (8-15: CrealityPrint 55% CPU, WebKit). At that load, in-process tracking
+    is thread 69 / merge process 51 / no merging 43 ms a frame (at load 3.4 it was 58 / 42 / 36). Live
+    is ~62-67 ms, so ~10-15 ms of live-only overhead remains (replies with the model codes, view
+    masks, unpickling 4 MB frames).
+  - No end-to-end scanner run for this step: the user was at the PC (CrealityPrint open), and bench
+    --live drives the same worker with the scanner's own Y14 frames.
 - LIVE SPEED, step 3 (2026-11-02, plan approved): the point-cloud merge and the keyframe ORB in a process of
   their own (`merger.py`; `Scanner(merge_process=True)`, the live worker's scans; replays, evaluate and bench
   keep the thread).
