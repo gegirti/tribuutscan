@@ -331,6 +331,8 @@ python3 -m tribuutscan.view3d captures/<stamp>-scan    # browser 3D view at http
                                             # synthetic scan, ground truth poses + true_surface.ply
 .venv/bin/python -m tribuutscan.bench [rec] [--frames N] [--tracker gpu] [--label x] [--against captures/bench/<run>.json]
                                             # per-stage timing table (warm, disk apart) -> captures/bench/
+.venv/bin/python -m tribuutscan.bench --live [rec] [--frames N] [--tracker gpu|joint]
+                                            # the live worker's fps on a recording (simulated camera)
 ./setup-venv.sh [dir]                       # build .venv from pyproject's "scan" extra (PYTHON=... to pick)
 .venv/bin/python -m tribuutscan.fusion captures/<stamp>-scan [--all] [--min-weight 4] [--force]
                                             # fuse a scan's keyframes -> mesh.ply (m) + mesh.stl (mm)
@@ -853,6 +855,35 @@ cubes on the GPU; the CPU keeps the 6x6 solve, markers, base votes, pose graph, 
     Measured, off by default (gputrack constants): depth blur in frame and fused frames 3 px -> p90 0.63;
     model normals from ray-cast hits 8 px apart -> 0.42 but the noisy box 0.37 -> 1.74 mm. The real
     marker recording (Y10) shows nothing of it; the full-rate Y14 recording (0.7) will say.
+- PHASE 4 GROUNDWORK (2026-11-02, offline, before the user's live session): the live worker tracks on
+  the GPU ("start" takes an optional tracker, default "gpu", falls back to the CPU; Stop frees the GPU
+  before saving). `bench.py --live` replays a recording through the real worker process (frames.read_raw:
+  the capture's raw buffers; two in flight as the viewer, none dropped). Marker recording, live worker:
+  CPU tracker 3.7 fps (270 ms), GPU as Phase 3 left it 5.4, now 9.3 (107 ms), all 581 frames tracked.
+  Moving frames costs nothing worth fixing (decode 6 ms, waiting 3): the shared-memory ring is not needed.
+  - GPU tracker defaults (Scanner segment_stride / orb; the CPU tracker unchanged, evaluate trackers
+    "gpu-p3" and "gpu-seg" keep the steps): the object / base search on every 4th pixel (the masks cover
+    their 4 x 4 blocks for the merge and the GPU source), and ORB only for keyframes (extracted in the
+    merge thread, in order; a retry waits for it, so replays stay identical) and to retry a frame the
+    motion guess did not hold (from the last frame with ORB). The marker recording, at 3.3 fps (more
+    motion per frame than live), never needed the retry. Evaluate (captures/eval/20261102-044300-p4-orbthread
+    against Phase 3): markers 581 tracked, 0 jumps, 0 re-finds, scatter 0.929 -> 0.932, 171 -> 70 ms;
+    ATE synth 0.37 -> 0.36, synth7 0.34 -> 0.42, synthhard 0.40 -> 0.33, synthfp 0.34; synth lost 1 of 160.
+    The plate is now tracked up to its edge-on turn (81 of 160) and stays lost after it instead of being
+    re-found wrong: its cloud is clean (0.13 mm, no doubling; Phase 3 0.82, 2.5% doubled).
+  - bench --tracker gpu (captures/bench/20261102-044143-gpu-p4a.json, before the ORB move): 93 ms a frame
+    (189); left: markers 23, GPU step 20, object piece 14, keyframe ORB 12 (now in the merge thread),
+    base masks 8. Live the merge thread (VoxelCloud merge ~130 ms a keyframe, + ORB) and the main thread
+    fight for the GIL: the ray cast and ICP wall times rise with it.
+  - End to end (cloud.py --optimise --mesh, 12 seeds vs Creality): 156 s (Phase 3 222, CPU 314); cloud
+    98.6% on the part, 0.230 / 0.562 mm, 65.7 / 68.1% within 1 / 2 mm; mesh 0.088 / 0.333 mm, 65.3 /
+    67.8% (Phase 3: 0.235 / 0.570, 66.6 / 69.1; mesh 0.083 / 0.346, 66.2 / 68.7): 0.9 points less of
+    Creality's surface covered, probably the coarser object masks at the outline (not checked).
+  - FOUND: Scanner.merge broke on YUYV frames (only live ones have them) after its pixel-block change;
+    test_frames_as_the_live_worker_gets_them_are_tracked_and_merged covers it now.
+  - Measured and dropped: marker detection in a helper thread beside the object search (9.3 -> 9.6 fps).
+  - Next for 20 fps: the merge out of the tracking process's GIL (or cheaper), the object / base search
+    on the GPU; then the live view of the model.
 
 ## The person you are working with
 

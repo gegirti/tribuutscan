@@ -285,8 +285,9 @@ The IR projector turns on by itself when the IR stream is opened.
   the camera path is 2-3 times closer to the truth (0.34-0.40 mm against 0.55-1.27 mm). On the marker
   recording every frame is tracked, the markers agree better (0.93 mm scatter, was 0.95), and the
   cloud and mesh score the same against Creality's scan, while the whole run (tracking, Optimise,
-  mesh) takes 222 s instead of 314. Replays (`cloud.py`, the viewer's `m`) use it when there is a GPU;
-  live scanning still tracks on the CPU until it is tried with the scanner. Two weak spots, both
+  mesh) takes 222 s instead of 314. Replays (`cloud.py`, the viewer's `m`) and live scans use it when
+  there is a GPU: replayed through the live worker, the marker recording runs at 9.3 frames a second
+  (3.7 on the CPU); live with the scanner it is still to be tried. Two weak spots, both
   measured on synthetic data: a 1.8 mm plate seen edge-on (neither tracker holds that turn), and a fixed
   per-pixel depth error like the sensor's, which lets the GPU's estimate drift about 0.7 mm in the first
   frames (the CPU's 0.13). A full-rate 14-bit recording will show whether the real sensor does that.
@@ -325,7 +326,7 @@ Next up:
       CPU fallback), so it runs for everyone.
   - [x] the engine, chosen by measuring WebGPU against OpenCL: WebGPU (`wgpu`)
   - [x] meshes on the GPU: frame preparation, fusion, marching cubes (a scan's mesh in seconds)
-  - [x] tracking against the fused model on the GPU (replays; live after a session with the scanner)
+  - [x] tracking against the fused model on the GPU (9.3 fps through the live worker, offline)
   - [ ] live scanning at full rate
 - [ ] **Crop in the 3D view**: for what touches the object (a stand, a cable), which object
       separation keeps.

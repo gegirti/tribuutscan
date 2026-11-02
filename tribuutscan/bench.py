@@ -1,6 +1,7 @@
 """Time each stage of the scanning pipeline on a recording; compare runs.
 
     .venv/bin/python -m tribuutscan.bench [recording] [--frames N] [--tracker gpu] [--label x] [--against captures/bench/<run>.json]
+    .venv/bin/python -m tribuutscan.bench --live [recording] [--frames N] [--tracker gpu|joint]
 
 The recording (default: the marker recording, evaluate's "markers") is replayed through cloud.Scanner
 as cloud.py does. Per stage: calls, ms per call and ms per frame, wall clock. Stages are timed
@@ -11,6 +12,11 @@ its own row, not part of a frame. Also noted: peak memory, GPU memory and busy t
 reports them (/proc/self/fdinfo drm-total-* / drm-engine-*: i915, xe, amdgpu and others), and the
 machine and library versions, so runs from other computers can be compared.
 Writes captures/bench/<stamp>-<label>.json.
+
+--live replays the recording through the live scan worker instead (livescan.run in its own process,
+as the viewer starts it), handing it each frame set's raw buffers whenever it has fewer than two in
+hand, as the viewer does, but none dropped: the worker's own frame rate, as a simulated camera. Its
+scan is saved and optimised in a temporary directory, then deleted.
 """
 import functools
 import json
@@ -187,6 +193,72 @@ def run(directory, frames=None, log=print, tracker="joint"):
     }
 
 
+def live(directory, frames=None, tracker="gpu", log=print):
+    """Frames per second of the live scan worker on a recording (see --live); returns the report."""
+    import multiprocessing
+    import queue
+    import shutil
+    import tempfile
+    from . import livescan
+    ctx = multiprocessing.get_context("spawn")
+    commands, replies = ctx.Queue(), ctx.Queue()
+    proc = ctx.Process(target=livescan.run, args=(commands, replies, 0), daemon=True)  # any free port
+    proc.start()
+    messages, done, tracked = [], 0, 0
+
+    def reply():
+        nonlocal done, tracked
+        while True:
+            try:
+                kind, *rest = replies.get(timeout=5)
+                break
+            except queue.Empty:
+                if not proc.is_alive():
+                    raise RuntimeError("the live worker died (its traceback is above)")
+        if kind == "frame_done":
+            done += 1
+            tracked += bool(rest[3]) if len(rest) > 3 else 0
+        elif kind == "log":
+            messages.append(rest[0])
+        return kind, rest
+
+    while reply()[0] != "ready":
+        pass
+    BENCH.mkdir(parents=True, exist_ok=True)
+    tmp = Path(tempfile.mkdtemp(prefix="live-", dir=BENCH))
+    try:
+        source, sent, t0 = fr.read_raw(directory), 0, None
+        for bufs in source:
+            if t0 is None:  # the recording's depth mode is known once its first set is read
+                commands.put(("start", "small", tmp / "scan", False, None, calib.CAMERA.mode, True, tracker))
+                t0 = time.perf_counter()
+            while sent - done >= 2:
+                reply()
+            commands.put(("frame", bufs["color"], None, bufs["depth"], bufs["bytesperline"], bufs.get("t", (0.0, 0.0, 0.0))))
+            sent += 1
+            if frames is not None and sent >= frames:
+                break
+        while done < sent:
+            reply()
+        elapsed = time.perf_counter() - t0
+        commands.put(("stop",))
+        t1 = time.perf_counter()
+        kind = None
+        while kind != "optimised":
+            kind, rest = reply()
+            if kind == "saved":
+                t_saved = time.perf_counter()
+        report = {"recording": str(Path(directory).resolve()), "tracker": tracker, "frames": sent, "tracked": tracked,
+                  "fps": round(sent / elapsed, 2), "ms_per_frame": round(1000 * elapsed / max(sent, 1), 1),
+                  "save_s": round(t_saved - t1, 1), "optimise_s": round(time.perf_counter() - t_saved, 1),
+                  "optimised": rest[0], "worker_log": messages, "machine": machine()}
+    finally:
+        commands.put(("quit",))
+        proc.join(timeout=30)
+        shutil.rmtree(tmp, ignore_errors=True)
+    return report
+
+
 def show(report, against=None):
     old = {r["stage"]: r for r in (against or {}).get("stages", [])}
     print(f"{report['measured']} frames timed (of {report['frames']}; {report['tracked']} tracked, "
@@ -215,6 +287,14 @@ def main():
         from .evaluate import dataset_path
         directory = dataset_path("markers")
     frames = int(opt("--frames")) if opt("--frames") else None
+    if "--live" in args:
+        report = live(directory, frames, opt("--tracker", "gpu"))
+        print(json.dumps({k: v for k, v in report.items() if k != "machine"}, indent=1))
+        BENCH.mkdir(parents=True, exist_ok=True)
+        out = BENCH / f"{time.strftime('%Y%m%d-%H%M%S')}-live-{report['tracker']}.json"
+        out.write_text(json.dumps(report, indent=2))
+        print(f"-> {out}")
+        return
     against = json.loads(Path(opt("--against")).read_text()) if opt("--against") else None
     report = run(directory, frames, tracker=opt("--tracker", "joint"))
     show(report, against)

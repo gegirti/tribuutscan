@@ -358,3 +358,33 @@ def test_synthetic_sensor_sets_and_their_true_surface():
             assert np.array_equal(pattern, synth.fixed_pattern(0.144, 0))  # fixed: the same every time
     finally:
         calib.use(before)
+
+
+def test_frames_as_the_live_worker_gets_them_are_tracked_and_merged():
+    """Colour left as YUYV bytes (as livescan hands frames over): feed and the merge thread take them,
+    on the CPU tracker and on the GPU one (when there is a GPU; else it falls back to the CPU)."""
+    try:
+        from tribuutscan import synth
+    except ImportError:  # needs Open3D (.venv)
+        return
+    import tempfile
+    from pathlib import Path
+    from tribuutscan import calib
+    from tribuutscan import frames as fr
+    before = calib.CAMERA.spec
+    calib.use(calib.ESTIMATES)
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            rec = Path(tmp) / "t-rec"
+            synth.generate(rec, n_frames=12)
+            for tracker in ("joint", "gpu"):
+                sc = cl.Scanner(log=lambda *a: None, track_with=tracker)
+                for i, frame in enumerate(fr.read_recording(rec, yuyv=True)):
+                    assert "yuyv" in frame and "color" not in frame
+                    sc.feed(frame, i)
+                sc.flush()
+                sc.close()
+                assert sc.stats["lost"] == 0 and sc.stats["merged"] >= 2 and len(sc.cloud) > 1000, (tracker, sc.stats)
+                assert sc.stats["markers"]  # the merge decoded the YUYV colour to look for markers
+    finally:
+        calib.use(before)

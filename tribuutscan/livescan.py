@@ -4,7 +4,8 @@ The viewer starts it with the .venv Python when there is one (so ICP tracking wo
 to it over two queues. The worker also serves the browser 3D view of the growing cloud
 (view3d page), so cloud data never passes back through the viewer.
 
-Commands:  ("start", preset, out_dir, keep_raw, continue_from or None, depth mode name, remove_base)
+Commands:  ("start", preset, out_dir, keep_raw, continue_from or None, depth mode name, remove_base[, tracker])
+           (tracker: "gpu", the default, which falls back to the CPU solve without a GPU; or "joint")
            | ("frame", yuyv, grey or None, depth_buf, bytesperline, (t_colour, t_ir, t_depth))
            | ("stop",) | ("quit",)   (times: camera capture times, seconds)
 Replies:   ("ready", url) | ("log", text) | ("frame_done", merged, frames, points, tracking, cue, view)
@@ -127,6 +128,7 @@ def run(commands, replies, port=view3d.PORT):
         except queue.Empty:
             if parent is not None and not parent.is_alive():  # viewer killed: don't linger holding the port
                 if source.scanner is not None and out_dir is not None and not (out_dir / "cloud.ply").exists():
+                    source.scanner.close()
                     source.scanner.save(out_dir)  # keep what was scanned
                 if recorder is not None:
                     recorder.close()
@@ -137,7 +139,7 @@ def run(commands, replies, port=view3d.PORT):
         timing["wait"] += time.perf_counter() - t_wait
         if kind == "start":
             timing = {k: 0 for k in timing}
-            _, preset, out_dir, keep_raw, continue_from, depth_mode, remove_base = cmd
+            _, preset, out_dir, keep_raw, continue_from, depth_mode, remove_base, *tracker = cmd
             calib.use_mode(depth_mode)  # the law of the scanner's mode, before any frame is turned into points
             recorder = None
             log = lambda m: replies.put(("log", m))
@@ -147,7 +149,8 @@ def run(commands, replies, port=view3d.PORT):
                     source.scanner.remove_base = remove_base
                     log(f"continuing {Path(continue_from).name}: show the scanner a part it has seen")
                 else:
-                    source.scanner = cl.Scanner(preset, log=log, remove_base=remove_base)
+                    source.scanner = cl.Scanner(preset, log=log, remove_base=remove_base,
+                                                track_with=tracker[0] if tracker else "gpu")
                 source.scan_id += 1
                 source.name = f"live: {out_dir.name}"
                 source.phase, source.out_dir = "scanning", out_dir
@@ -189,6 +192,7 @@ def run(commands, replies, port=view3d.PORT):
                 recorder.close()
                 recorder = None
             with source.lock:
+                source.scanner.close()  # the GPU tracker's memory back (Optimise and the mesh come next)
                 path, kept = source.scanner.save(out_dir)
                 source.name = out_dir.name
                 source.phase = "optimising"
@@ -196,7 +200,8 @@ def run(commands, replies, port=view3d.PORT):
             n = max(timing["frames"], 1)
             replies.put(("log", f"worker: {timing['frames']} frames; per frame: tracking {1000 * timing['feed'] / n:.0f} ms, "
                                 f"raw copy {1000 * timing['raw'] / n:.0f} ms, decode {1000 * timing['decode'] / n:.0f} ms, "
-                                f"waiting for frames {1000 * timing['wait'] / n:.0f} ms"))
+                                f"waiting for frames {1000 * timing['wait'] / n:.0f} ms"
+                                + (f"; GPU {source.scanner.stats['gpu_ms']}" if source.scanner.stats.get("gpu_ms") else "")))
             try:  # Optimise right away (user decision): loop closures, pose graph, merge again
                 from . import optimise
                 with source.busy:

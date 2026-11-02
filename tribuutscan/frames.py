@@ -253,13 +253,11 @@ def zlib_records(data):
     return records
 
 
-def read_recording(directory, yuyv=False):
-    """Yield decoded frame sets (as from `decode`, colour left as YUYV bytes with `yuyv`) from a Recorder
-    directory.
-
-    Each set also carries "t" (depth timestamp, s) and "skew_ms" (colour minus depth time) when the
-    recording has stamps.csv. Switches calib.CAMERA to the recording's depth mode (close if not noted).
-    """
+def read_raw(directory):
+    """Yield each frame set of a Recorder directory as the capture handed it over: {"color", "depth",
+    "ir" (when recorded)} raw bytes (depth unpacked from zlib), its "bytesperline" (depth) and, when the
+    recording has stamps.csv, "t": (colour, ir, depth) capture times (s). Switches calib.CAMERA to the
+    recording's depth mode (close if not noted)."""
     directory = Path(directory)
     info = json.loads((directory / "info.json").read_text())
     calib.use_mode(info.get("depth_mode", calib.CLOSE))
@@ -282,8 +280,22 @@ def read_recording(directory, yuyv=False):
         bufs["depth"] = raw["depth"][start:start + size].tobytes()
         if packed:
             bufs["depth"] = zlib.decompress(bufs["depth"])
-        frame = decode(bufs["color"], bufs.get("ir"), bufs["depth"], info["depth_bytesperline"], yuyv)
+        bufs["bytesperline"] = info["depth_bytesperline"]
         if stamps is not None and i < len(stamps):
-            frame["t"] = float(stamps[i, 3])
-            frame["skew_ms"] = float((stamps[i, 1] - stamps[i, 3]) * 1000)
+            bufs["t"] = tuple(float(v) for v in stamps[i, 1:4])
+        yield bufs
+
+
+def read_recording(directory, yuyv=False):
+    """Yield decoded frame sets (as from `decode`, colour left as YUYV bytes with `yuyv`) from a Recorder
+    directory (read_raw).
+
+    Each set also carries "t" (depth timestamp, s) and "skew_ms" (colour minus depth time) when the
+    recording has stamps.csv. Switches calib.CAMERA to the recording's depth mode (close if not noted).
+    """
+    for bufs in read_raw(directory):
+        frame = decode(bufs["color"], bufs.get("ir"), bufs["depth"], bufs["bytesperline"], yuyv)
+        if "t" in bufs:
+            frame["t"] = bufs["t"][2]
+            frame["skew_ms"] = (bufs["t"][0] - bufs["t"][2]) * 1000
         yield frame

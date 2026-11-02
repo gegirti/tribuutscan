@@ -436,12 +436,15 @@ class Scanner:
     clean_depth (prep.clean: "merge" cleans only what is merged and tracks on the uncleaned depth,
     whose edges and steep faces hold flat objects in place; True cleans both), gate_refind
     (re-found poses must be plausible), motion_dt (the next-frame guess follows the real time
-    between frames).
+    between frames). For the GPU tracker by default (None: chosen by the tracker), measured on
+    evaluate's datasets: segment_stride (the object / base search on every n-th pixel, 4 instead of
+    the merge's 2; the masks cover their blocks) and orb ("demand": ORB only for keyframes and to
+    retry a frame the motion guess did not hold; "frame": every frame, as the CPU tracker).
     """
 
     def __init__(self, preset="small", log=print, clean_depth="merge", gate_refind=True, motion_dt=True,
                  mode="still", track_with="joint", target="model", use_features=True, threaded_merge=True,
-                 remove_base=True):
+                 remove_base=True, segment_stride=None, orb=None):
         try:
             from . import fuse  # Open3D: frame-to-frame ICP
         except ImportError:
@@ -479,6 +482,11 @@ class Scanner:
                 track_with = "joint"
         self.track_with, self.marker_map = track_with, MarkerMap(add_mm=3.0)
         self.stats["tracker"] = track_with
+        on_gpu = track_with == "gpu"
+        self.seg_stride = segment_stride or (2 * self.stride if on_gpu else self.stride)
+        self.orb = orb or ("demand" if on_gpu else "frame")
+        self.feat_pose = None  # pose of the frame prev_feat belongs to (with orb="demand": the last keyframe)
+        self.orb_job = None  # orb="demand": the last keyframe's ORB, extracted beside tracking (merge thread)
         # joint solve against the "model" (cloud so far; default) or the previous "frame". Measured:
         # model + markers halved synthetic error (3.4 -> 1.7 mm, hard path 6.1 -> 1.5); the model
         # WITHOUT markers drifts (synthetic 25 mm): markers keep the model honest.
@@ -519,7 +527,8 @@ class Scanner:
         if self.clean_depth is True:  # track on cleaned depth as well
             frame = self.cleaned(frame)
         shape = frame["depth"].shape
-        all_xyz, all_rgb, all_pix = frame_points(frame, self.stride)  # normals only for merging (below)
+        seg = self.seg_stride  # the object / base search's grid (merging takes every self.stride-th pixel)
+        all_xyz, all_rgb, all_pix = frame_points(frame, seg)  # normals only for merging (below)
         scene = self.scene
         if scene.mode == "turntable":
             scene.observe(all_xyz, all_pix, shape, np.eye(4))
@@ -527,7 +536,7 @@ class Scanner:
         else:
             keep = isolate_mask(all_xyz, all_pix, shape, self.rng)[0]
         xyz, rgb, pix = all_xyz[keep], all_rgb[keep], all_pix[keep]
-        if len(xyz) < 500 // self.stride ** 2:
+        if len(xyz) < 500 // seg ** 2:
             stats["lost"] += 1
             stats["tracking"] = False
             self.lost_run += 1
@@ -555,7 +564,7 @@ class Scanner:
                 levels = fuse.levels(xyz / 1000)
             marker_pts = self.frame_markers(frame) if self.track_with in ("joint", "gpu") else np.empty((0, 3))
             feat = None
-            if joint and self.features is not None:  # colour features: a starting pose for big movements
+            if joint and self.features is not None and self.orb == "frame":  # colour features: a starting pose
                 feat = self.features.extract(self.features.luma_of(frame), frame["depth"],
                                              None if scene.mode == "still" else pix)
                 if self.prev is not None and self.prev_feat is not None:
@@ -577,7 +586,17 @@ class Scanner:
                 self.log(f"continuing: found my place in the saved scan at frame {index}")
             elif self.prev is not None:
                 if self.track_with == "gpu":
-                    step, ok = self.gpu_step(xyz, marker_pts, guess, index)
+                    if self.orb == "demand":
+                        self.cue["features"] = False
+                    step, info = self.gpu_step(xyz, marker_pts, guess)
+                    ok = self.accepted(info, step, xyz)
+                    if not ok and self.orb == "demand" and self.features is not None:  # an ORB start, then again
+                        feat, retry = self.orb_guess(frame, pix, xyz)
+                        if retry is not None:
+                            step, info = self.gpu_step(xyz, marker_pts, retry)
+                            ok = self.accepted(info, step, xyz)
+                            self.feature_starts += 1
+                    self.note(index, info)
                 elif joint:
                     step, ok = self.joint_step(levels, xyz, marker_pts, guess, index)
                 else:
@@ -602,7 +621,8 @@ class Scanner:
             stats["tracking"] = True
             if joint and len(marker_pts):
                 self.marker_map.add(marker_pts, self.pose)
-            self.prev_feat = feat
+            if self.orb == "frame" or feat is not None:
+                self.prev_feat, self.feat_pose = feat, self.pose.copy()
         self.track_log.append((index, status, self.pose.copy()))
         if scene.mode == "still":  # the object (above the kept base, in its region) and the base under it
             to_world = scene_transform(self.pose)  # (every tracked frame: the region grows per frame)
@@ -622,14 +642,21 @@ class Scanner:
         self.since_merge = 0
         if self.gpu is not None:  # keyframe for Optimise / continuing a scan
             from .gputrack import grid_points
-            self.keyframes.append((index, self.pose.copy(), grid_points(xyz), self.prev_feat, marker_pts))
+            self.keyframes.append((index, self.pose.copy(), grid_points(xyz), feat, marker_pts))
+            if self.orb == "demand" and self.features is not None and feat is None:  # keyframes keep their ORB:
+                job = (len(self.keyframes) - 1, frame, None if scene.mode == "still" else pix, self.pose.copy())
+                if self.merger is None:  # extracted in the merge thread, in order (ORB releases the GIL)
+                    self.keyframe_orb(*job)
+                else:
+                    self.orb_job = self.merger.submit(self.keyframe_orb, *job)
+                    self.pending.append(self.orb_job)
         elif self.prev is not None and self.prev is not True:
             self.keyframes.append((index, self.pose.copy(), np.asarray(self.prev[-1].points) * 1000,
                                    self.prev_feat, marker_pts if joint else np.empty((0, 3))))
         self.last_merged = self.pose.copy()
         self.poses.append((index, self.pose.copy()))
         stats["merged"] += 1
-        job = (frame, index, self.pose.copy(), pix)
+        job = (frame, index, self.pose.copy(), pix, seg)
         if self.gpu is not None:  # into the volume the next frame is tracked against (here, not in the merge thread)
             self.gpu.fuse(frame, self.labels[index], self.pose)
         if self.merger is None:
@@ -646,14 +673,15 @@ class Scanner:
         """[(index, pose)] of every tracked frame (a scan saved before these were kept: its merged ones)."""
         return [(i, p) for i, _, p in self.track_log if p is not None] or list(self.poses)
 
-    def merge(self, frame, index, pose, pix):
-        """Merge one tracked frame's object pixels (cleaned, with normals) into the cloud."""
-        shape = frame["depth"].shape
-        kept = np.zeros(shape, bool)  # merge these pixels (cleaned, if cleaning)
-        kept[pix[:, 1], pix[:, 0]] = True
+    def merge(self, frame, index, pose, pix, step=1):
+        """Merge one tracked frame's object pixels (cleaned, with normals) into the cloud; `pix` sampled every
+        `step`-th pixel, each standing for its step x step block."""
+        h, w = frame["depth"].shape
+        kept = np.zeros(((h + step - 1) // step, (w + step - 1) // step), bool)  # merge these blocks
+        kept[pix[:, 1] // step, pix[:, 0] // step] = True
         merge_frame = self.cleaned(frame, pix) if self.clean_depth == "merge" else frame
         cxyz, crgb, cpix, cnrm = frame_points(merge_frame, self.stride, normals=True)
-        sel = kept[cpix[:, 1], cpix[:, 0]]
+        sel = kept[cpix[:, 1] // step, cpix[:, 0] // step]
         mxyz, mrgb, mnrm = cxyz[sel], crgb[sel], cnrm[sel]
         self.merged_data[index] = (mxyz.astype(np.float32), mrgb, mnrm.astype(np.float32))
         world = mxyz @ pose[:3, :3].T + pose[:3, 3] * 1000
@@ -663,7 +691,7 @@ class Scanner:
         if self.on_merge is not None:
             self.on_merge(index, world, mrgb, world_nrm, pose)
         if not self.stats["markers"]:
-            color = frame["color"] if "color" in frame else yuyv_to_rgb(frame["yuyv"], *shape[::-1])
+            color = frame["color"] if "color" in frame else yuyv_to_rgb(frame["yuyv"], w, h)
             self.stats["markers"] = [[round(x, 1), round(y, 1)] for x, y, *_ in markers.detect_half(color)]
 
     def remerge(self, new_poses, point_mm=None):
@@ -780,9 +808,10 @@ class Scanner:
         step = np.linalg.inv(self.pose) @ found if use_model else found
         return step, self.judge(index, info, step, xyz)
 
-    def gpu_step(self, xyz, marker_pts, guess, index):
+    def gpu_step(self, xyz, marker_pts, guess):
         """One frame on the GPU (gputrack: against a ray cast of the volume of merged frames, the base left
-        out by the kept plane as model_points does), with joint_step's marker pairs, prior and gates."""
+        out by the kept plane as model_points does), with joint_step's marker pairs and prior; returns
+        (step from the previous pose, info) for `accepted` and `note`."""
         init = self.pose @ guess
         to_world = scene_transform(init)
         base = None
@@ -791,8 +820,31 @@ class Scanner:
             base = (n, c - OBJECT_ABOVE_MM)
         found, info = self.gpu.solve(init, init, self.marker_pairs(marker_pts, guess, np.eye(4)), object_radius(xyz),
                                      xyz.mean(0) @ to_world[:3, :3].T + to_world[:3, 3], base, self.marker_sigma)
-        step = np.linalg.inv(self.pose) @ found
-        return step, self.judge(index, info, step, xyz)
+        return np.linalg.inv(self.pose) @ found, info
+
+    def keyframe_orb(self, slot, frame, mask_pixels, pose):
+        """A keyframe's ORB (Optimise's loop candidates, the next ORB start), into its keyframe entry."""
+        feat = self.features.extract(self.features.luma_of(frame), frame["depth"], mask_pixels)
+        k = self.keyframes[slot]
+        self.keyframes[slot] = (k[0], k[1], k[2], feat, k[4])
+        self.prev_feat, self.feat_pose = feat, pose
+
+    def orb_guess(self, frame, pix, xyz):
+        """(this frame's ORB, a step from the previous pose from matching it with the last frame that has
+        ORB, or None)."""
+        if self.orb_job is not None:
+            self.orb_job.result()  # the last keyframe's ORB first (replays stay deterministic)
+            self.orb_job = None
+        feat = self.features.extract(self.features.luma_of(frame), frame["depth"],
+                                     None if self.scene.mode == "still" else pix)
+        if self.prev_feat is None or self.feat_pose is None:
+            return feat, None
+        found, _ = self.features.relative_pose(feat, self.prev_feat, self.rng)
+        if found is None:
+            return feat, None
+        step = np.linalg.inv(self.pose) @ self.feat_pose @ found
+        self.cue["features"] = bool(plausible_step(step, xyz))
+        return feat, (step if self.cue["features"] else None)
 
     def gpu_source(self, frame, xyz, pix):
         """Hand this frame's piece to the GPU tracker; the first frame makes it, its volume around this piece."""
@@ -802,7 +854,7 @@ class Scanner:
             self.gpu = gputrack.Tracker(CAMERA, frame["depth"].shape[::-1],
                                         xyz.mean(0) @ to_world[:3, :3].T + to_world[:3, 3], self.gpu_kind)
             self.log(f"tracking on the GPU: {self.gpu.engine.device_name}")
-        self.gpu.source(frame, pix, self.stride)
+        self.gpu.source(frame, pix, self.seg_stride)
 
     def close(self):
         """Give the GPU tracker's memory back (after the last frame; the cloud and everything saved stay)."""
@@ -825,16 +877,23 @@ class Scanner:
 
     def judge(self, index, info, step, xyz):
         """Note a solve's info (flat-face hint, cues) and say whether its pose is taken."""
+        self.note(index, info)
+        return self.accepted(info, step, xyz)
+
+    def note(self, index, info):
+        """Keep a frame's solve info (evaluation, track.csv) and the cues the viewer shows."""
         from . import track
         self.track_info.append((index, info))
         flat = bool(info["degeneracy"] is not None and info["degeneracy"] < track.DEGENERATE and not info["markers_used"])
         self.stats["flat"] = self.stats.get("flat", 0) + flat
         self.cue = {"markers": int(info["markers_used"]), "features": bool(self.cue.get("features", False)),
                     "flat": flat}  # plain Python values: the page receives them as JSON
-        ok = (info["fitness"] >= JOINT_MIN_FITNESS and info["rmse_mm"] is not None
-              and info["rmse_mm"] <= JOINT_MAX_RMSE_MM and plausible_step(step, xyz)
-              and (info["marker_rmse_mm"] is None or info["marker_rmse_mm"] <= self.marker_accept))
-        return ok
+
+    def accepted(self, info, step, xyz):
+        """Is a solve's pose taken: enough overlap, a small residual, a believable step, markers agreeing."""
+        return (info["fitness"] >= JOINT_MIN_FITNESS and info["rmse_mm"] is not None
+                and info["rmse_mm"] <= JOINT_MAX_RMSE_MM and plausible_step(step, xyz)
+                and (info["marker_rmse_mm"] is None or info["marker_rmse_mm"] <= self.marker_accept))
 
     def model_ready(self):
         """Prepare the model target (levels of the cloud so far, world); False until it has enough points."""
