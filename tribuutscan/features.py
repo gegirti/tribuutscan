@@ -71,15 +71,22 @@ def extract(luma, depth, mask_pixels=None):
     return pts, desc[ok]
 
 
-def relative_pose(current, reference, rng):
+def good_matches(current, reference):
+    """Descriptor matches of `current` in `reference` (extract() results) that pass the ratio test."""
+    da, db = current[1], reference[1]
+    if da is None or db is None or len(da) < 3 or len(db) < 3:
+        return []
+    return [m for m, n in (p for p in _matcher.knnMatch(da, db, k=2) if len(p) == 2) if m.distance < RATIO * n.distance]
+
+
+def relative_pose(current, reference, rng, inliers_out=None):
     """Transform (4x4, metres) taking `current` camera coordinates to `reference`'s, or None.
 
-    current, reference: (points mm, descriptors) from extract().
+    current, reference: (points mm, descriptors) from extract(). `inliers_out` (a list), if given,
+    receives the current frame's inlier points (mm).
     """
     (pa, da), (pb, db) = current, reference
-    if da is None or db is None or len(da) < 3 or len(db) < 3:
-        return None, 0
-    good = [m for m, n in (p for p in _matcher.knnMatch(da, db, k=2) if len(p) == 2) if m.distance < RATIO * n.distance]
+    good = good_matches(current, reference)
     if len(good) < MIN_INLIERS:
         return None, len(good)
     a, b = pa[[m.queryIdx for m in good]], pb[[m.trainIdx for m in good]]
@@ -94,4 +101,6 @@ def relative_pose(current, reference, rng):
         return None, int(best_mask.sum())
     t = kabsch(a[best_mask], b[best_mask])  # refined on all inliers
     t[:3, 3] /= 1000
+    if inliers_out is not None:
+        inliers_out.append(a[best_mask])
     return t, int(best_mask.sum())

@@ -15,8 +15,11 @@ In each frame it is the piece more than OBJECT_ABOVE_MM above the plane that the
 hits (the piece tracking uses), if that piece reaches the cylinder's core; otherwise whatever is
 connected to the core. The cylinder grows toward what is seen in the middle of the view, by at most
 REGION_GROW_MM per frame, so a neighbour at the edge of the view does not pull it out (on the marker
-scan it grew to 317 mm while it followed everything connected). The base is the plane's points inside
-the cylinder: merged too, so "remove base" can be decided when the cloud is saved (cloud.Scanner).
+scan it grew to 317 mm while it followed everything connected), and only toward points GROW_ABOVE_MM
+above the plane: what lies on the table (cardboard, cables, the floor's own noise) does not pull it
+either (on the long-range hand scan it grew 98 -> 552 mm through points 3-10 mm up). The base is the
+plane's points inside the cylinder: merged too, so "remove base" can be decided when the cloud is
+saved (cloud.Scanner).
 
 Until a base is found (or never, e.g. an object held in the hand) the object is each frame's centre
 piece inside a ball around the first one, which grows slowly and at most to BALL_MAX times its start.
@@ -40,6 +43,9 @@ OBJECT_ABOVE_MM = 3.0
 REGION_MARGIN_MM, REGION_GROW_MM = 20.0, 15.0
 GROW_WINDOW = 0.5  # the region grows only toward what is seen in the middle of the view (this share of
                    # its width and height): what the scanner is aimed at, not a neighbour at the edge
+GROW_ABOVE_MM = 10.0  # ...and only toward points this far above the plane. Hand scan (long range, tiled
+                      # floor): the floor's own scatter reaches 3 mm (p1/p99 at 35-75 cm), cardboard and
+                      # cables lying on it 3-25 mm
 REFIT_BAND_MM = 10.0  # the kept plane is re-fitted to the frame's points within this band...
 REFIT_MAX_DEG, REFIT_MAX_MM = 3.0, 5.0  # ...and a re-fit that turns or moves it more is not taken
 
@@ -150,6 +156,29 @@ class Scene:
             n, c = n_fit, -n_fit @ centre
         return n, c
 
+    def core(self, xyz_cam, cam_to_region):
+        """Which points (camera coordinates) lie in the object region's core with the camera at
+        `cam_to_region` (a pose guess: the kept plane is moved, not re-fitted), GROW_ABOVE_MM clear of the
+        plane: where tracking finds the object when the middle of the view misses it (cloud.Scanner)."""
+        if self.mode != "still" or self.plane is None or self.axis is None:
+            return None
+        to_cam = np.linalg.inv(cam_to_region)
+        n, c = plane_to(self.plane, to_cam)
+        axis = to_cam[:3, :3] @ self.axis + to_cam[:3, 3]
+        h = xyz_cam @ n + c
+        r = np.linalg.norm(xyz_cam - np.outer((xyz_cam - axis) @ n, n) - axis, axis=1)
+        return (r <= self.radius - REGION_MARGIN_MM) & (h > GROW_ABOVE_MM) & (h <= self.top - REGION_MARGIN_MM)
+
+    def away(self, xyz_cam, cam_to_region):
+        """Which points (camera coordinates) lie clear of the object's region (outside its cylinder plus
+        REGION_MARGIN_MM, or anywhere while no region is known: all False then)."""
+        if self.plane is None or self.axis is None:
+            return np.zeros(len(xyz_cam), bool)
+        world = xyz_cam @ cam_to_region[:3, :3].T + cam_to_region[:3, 3]
+        n = self.plane[0]
+        r = np.linalg.norm(world - np.outer((world - self.axis) @ n, n) - self.axis, axis=1)
+        return (r > self.radius + REGION_MARGIN_MM) | (self.height(world) > self.top + REGION_MARGIN_MM)
+
     def object_mask(self, xyz_cam, pix, shape, cam_to_region):
         """Which points (camera coordinates) are the object (see `masks`)."""
         return self.masks(xyz_cam, pix, shape, cam_to_region)[0]
@@ -185,7 +214,8 @@ class Scene:
             piece = cl.connected_piece(pts, core) if core.any() else core
         hh, ww = shape
         u, v = pix[idx, 0], pix[idx, 1]
-        aimed = piece & (np.abs(u - ww / 2) <= GROW_WINDOW * ww / 2) & (np.abs(v - hh / 2) <= GROW_WINDOW * hh / 2)
+        aimed = (piece & (np.abs(u - ww / 2) <= GROW_WINDOW * ww / 2) & (np.abs(v - hh / 2) <= GROW_WINDOW * hh / 2)
+                 & (h[idx] > GROW_ABOVE_MM))
         if aimed.any():  # grow the region toward what the middle of the view sees, a little per frame
             reach = r[aimed].max() + REGION_MARGIN_MM
             self.radius = min(max(self.radius, reach), self.radius + REGION_GROW_MM)

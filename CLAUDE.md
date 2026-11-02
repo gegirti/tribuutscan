@@ -326,7 +326,8 @@ python3 -m tribuutscan.view3d captures/<stamp>-scan    # browser 3D view at http
                                             # ChArUco calibration -> captures/calibration.json
 .venv/bin/python -m tribuutscan.evaluate [datasets] [--tracker gpu] [--label x] [--against report.json] [--mesh]
                                             # tracking metrics on saved + synthetic recordings (--mesh:
-                                            # also fuse, score against the true surface)
+                                            # also fuse, score against the true surface; datasets in
+                                            # evaluate.DATASETS, "hand", "markersgap", "handgap" among them)
 .venv/bin/python -m tribuutscan.synth [out] [frames] [every] [hard] [--plate] [--pattern MM] [--y14]
                                             # synthetic scan, ground truth poses + true_surface.ply
 .venv/bin/python -m tribuutscan.bench [rec] [--frames N] [--tracker gpu] [--label x] [--against captures/bench/<run>.json]
@@ -912,7 +913,63 @@ cubes on the GPU; the CPU keeps the 6x6 solve, markers, base votes, pose graph, 
     - Patching scene.py's centre piece as well (crumb skip) let the region grow into the background:
       21% doubled.
   - GPU replays are not bit-identical run to run (the same variant ended x6 / x22 lost). Not traced;
-    relock reads the cloud without waiting for pending merges (a suspect).
+    relock reads the cloud without waiting for pending merges (a suspect). It now flushes first.
+- TRACKING ROBUSTNESS (2026-11-02, the user: "follow your schedule", item 1). Offline, on the hand
+  recording (evaluate dataset "hand", plus "markersgap" / "handgap": 80 / 100 frames left out, a jump
+  to find again; `GAPS`). evaluate has a "region mm" column (the object region's radius: leaks show
+  there).
+  - Region growth (scene.py GROW_ABOVE_MM 10): only toward points 10 mm above the base. The floor's own
+    scatter at 35-75 cm is +-3 mm (p1/p99); cardboard and cables on it 3-25 mm.
+  - Tracking source (Scanner.feed, isolate_mask `seeds`): the piece connected to the region's core
+    where the pose guess puts it (Scene.core: inside radius - margin, 10 mm up, below top - margin),
+    after the frame's own plane cut; the centre piece only until the region exists or with < 20 seeds.
+    When the frame shows no table of its own, the kept base (plane_in_camera at the guess, computed
+    lazily) cuts instead (`known`): the whole floor was in the piece, and the solve matched 10-28%.
+  - The motion guess extrapolates at most GUESS_MAX_S 0.3 s.
+  - Pose checks (accepted = solve_ok + plausible_step + floor_agrees):
+    - floor_agrees: the frame's own table (table_normal: least squares, narrower extent) must lie
+      within 2.5 degrees of the kept base at the solved pose. No verdict when the patch is under
+      150 mm across or more than 15 degrees off. Hand: good poses 0.1-1.1 degrees, slid ones
+      3.4-8.2. Marker scan: its rim, 80 mm across, read 1.6-3.7 (hence the span rule), and most of its
+      frames' own "planes" are the part or the backdrop (57-60 degrees). Tilt only: an object's flat
+      top is parallel to the table.
+    - relock (Open3D, from the last pose) must also pass the GPU solve's checks (markers): synth
+      replayed once re-found a box 8.3 mm off. The marker check rejected the right pose there (a
+      map entry 2.9 mm off, the known weakness).
+  - refind_anywhere (GPU only) after relock fails: the frame's ORB (whole image in still mode) against
+    16 keyframes spread over the scan plus the last 4; the best 3 tried. A candidate needs:
+    - 50 RANSAC inliers, 25 of them away from the object (Scene.away);
+    - solve_ok, fitness 0.6 and floor_agrees;
+    - `reachable` in the time lost: 300 mm/s and 60 degrees/s at the object, plus 50 mm / 15 degrees.
+    Then 2 more tracked frames before merging resumes (REFIND_HOLD).
+    - Why each rule: the synthetic plate (the same marker grid on both faces, a plain table) was
+      re-found mirrored, 180 degrees off, on 31 / 54 inliers with 8-12 off the plate, and with a
+      true turn of ~100 degrees the mirror looked like a reachable 79. The real re-finds: hand
+      141-245 inliers (49-215 away), 18-31 degrees after 19-27 s.
+    - The marker part fills the view (0 away), so markersgap is re-found by relock instead.
+    - 200 keyframes instead of 16 recovered one frame sooner at 150 ms instead of 49.
+  - Measured and dropped: a residual check against the scan's median (rmse / z^2, 2.5x). The first
+    frames match a model of nearly the same view, so the median starts low and the check rejected
+    the hand's frames from frame 13 on.
+  - Results (evaluate --tracker gpu, captures/eval/20261102-102002-robust-final against
+    20261102-085234-robust-before):
+    - hand: 133 -> 480 tracked, 1 -> 0 jumps, region 98 -> 121 mm. Doubled 0.0017 -> 0.0185, all at
+      the stand's stepped rim, 10-40 mm up (6.8% there, likely real geometry); the hand above
+      40 mm 0.1-0.3%. Floor tilt <= 1.15 degrees on every frame. Coverage now the palm side and
+      the base too.
+    - markers: identical (581, 0 jumps, scatter 0.931).
+    - synth sets: equal or better (ATE 0.351 / 0.373 / 0.327 / 0.339); synthplate ATE 7.46 -> 4.11.
+    - markersgap 500 of 501, handgap 275 of 383 (without refind 249; it waits for a view it has
+      seen).
+    - CPU tracker (`current`): synth and synthhard identical, markers 2 -> 1 re-finds; hand 470.
+  - Cost: Scene.core 2.7-3.9 ms, table_normal 0.2-1.8, plane_in_camera 1.9-8 (only frames without
+    their own table). Whole-run timings swung +-15% with the desktop busy (load 11-15).
+  - LIVE SPEED, the next item: bench --live on the hand recording gives 6.3 fps with 480 tracked (old
+    code: 12.2 fps with 133). Nearly every frame is now tracked and 60% merged; the VoxelCloud merge
+    thread fights the main thread for the GIL; ICP 17.6 ms for 10 passes.
+  - Viewer: while scanning, the depth preview shows a centre mark (the first frame's object is what
+    it hits) and a red frame while tracking is lost. The hint now says "aim at a part already scanned,
+    or move back".
 
 ## The person you are working with
 

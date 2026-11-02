@@ -161,9 +161,11 @@ MARKER_HZ = 5  # marker search rate; one search takes ~0.1 s at half resolution
 MARKER_RADII = (3, 4, 5, 7)  # dot radius in half-resolution pixels (smaller ones were glints)
 found_markers = {"on": True, "list": [], "stamp": 0.0}  # list in full-resolution pixels
 # While scanning, the worker says what each frame was (livescan.view_mask: 0 other, 1 base, 2 object):
-# the depth preview dims all but the object (the base is tinted while it is kept).
-scan_view = {"mask": None, "t": 0.0, "keep_base": False}
+# the depth preview dims all but the object (the base is tinted while it is kept), marks its centre (the
+# first frame's object is what the centre hits) and has a red frame while tracking is lost.
+scan_view = {"mask": None, "t": 0.0, "keep_base": False, "lost": False}
 BASE_TINT = np.array([0, 40, 110], np.uint8)
+LOST_RGB, LOST_PX = np.array([198, 40, 40], np.uint8), 8
 
 
 def find_markers_loop(color):
@@ -208,13 +210,28 @@ def render_depth(cap, buf, width=DEPTH_W):
         "centre_cm": float(pointcloud.depth_to_mm(np.median(valid))) / 10 if valid.size else None,
     }
     rgb = depth_to_rgb(fit(d, width))  # colour-map only the shown pixels
-    view = scan_view["mask"]
-    if view is not None and time.monotonic() - scan_view["t"] < 1.0:
+    view, scanning = scan_view["mask"], time.monotonic() - scan_view["t"] < 1.0
+    if view is not None and scanning:
         lab = view[np.ix_(preview_index(view.shape[0], rgb.shape[0]), preview_index(view.shape[1], rgb.shape[1]))]
         rgb[lab == 0] //= 4
         base = lab == 1
         rgb[base] = rgb[base] // 2 + BASE_TINT if scan_view["keep_base"] else rgb[base] // 4
+    if scanning:
+        mark_centre(rgb)
+        if scan_view["lost"]:
+            b = LOST_PX
+            rgb[:b], rgb[-b:], rgb[:, :b], rgb[:, -b:] = LOST_RGB, LOST_RGB, LOST_RGB, LOST_RGB
     return ppm(rgb), stats
+
+
+def mark_centre(rgb, arm=10, gap=4):
+    """A white cross (2 px lines, open in the middle) at the centre of a preview."""
+    h, w = rgb.shape[:2]
+    cy, cx = h // 2, w // 2
+    for a, b in ((cx - gap - arm, cx - gap), (cx + gap, cx + gap + arm)):
+        rgb[cy - 1:cy + 1, a:b] = 255
+    for a, b in ((cy - gap - arm, cy - gap), (cy + gap, cy + gap + arm)):
+        rgb[a:b, cx - 1:cx + 1] = 255
 
 
 def distance_hint(stats):
@@ -801,7 +818,7 @@ class App:
             self.start_worker()
         out = fr.CAPTURES / (time.strftime("%Y%m%d-%H%M%S") + "-scan")
         self.scan_state, live["inflight"] = "scanning", 0
-        scan_view["keep_base"] = not self.remove_base.get()
+        scan_view.update(keep_base=not self.remove_base.get(), lost=False)
         live["commands"].put(("start", self.preset.get(), out, self.keep_raw.get(), continue_from, calib.CAMERA.mode,
                               self.remove_base.get()))
         self.log(f"scan started: {out.name} ({self.preset.get()}, point distance {cloud.PRESETS_MM[self.preset.get()]} mm)"
@@ -852,10 +869,11 @@ class App:
                 live["inflight"] = max(0, live["inflight"] - 1)
                 merged, frames, points, tracking, cue, view = (list(rest) + [None] * 6)[:6]
                 if self.scan_state == "scanning" and cue is not None:
-                    scan_view.update(mask=view, t=time.monotonic())
+                    scan_view.update(mask=view, t=time.monotonic(), lost=not tracking)
                     held = ", ".join(([f"{cue['markers']} markers"] if cue.get("markers") else [])
                                      + (["features"] if cue.get("features") else [])) or "shape"
-                    hint = ("   TRACKING LOST: move back slowly to where it was" if not tracking else
+                    hint = ("   TRACKING LOST: aim at a part already scanned, or move back to where it was"
+                            if not tracking else
                             "   FLAT AREA: aim at an edge, a corner or markers" if cue.get("flat") else "")
                     base = "base found" if cue.get("base") else "looking for the base"
                     self.message = f"SCAN {merged} of {frames} frames merged, {points:,} points | held by {held} | {base}{hint}"

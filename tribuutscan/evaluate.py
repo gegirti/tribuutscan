@@ -38,6 +38,8 @@ EVAL = fr.CAPTURES / "eval"
 DATASETS = {  # name: (path or glob under captures/, notes, scan mode)
     "markers": ("20261030-194411-scan/*-rec", "the marker part, hand-held, 581 frames: the first recording with "
                 "the calibration and frames paired by capture time", "still"),
+    "hand": ("20261102-081622-scan/*-rec", "the first live GPU scan's raw frames: a hand model (~22 cm) standing on "
+             "a tiled floor with cardboard and cables, long range at 35-50 cm, ~9 fps, no markers", "still"),
     "synth": ("synth/box-tilt-rec", "synthetic box with markers, tilting path, ground truth", "still"),
     "synth7": ("synth/box-tilt-7fps-rec", "the same at ~7 fps (every 3rd frame), like a slow live worker", "still"),
     "synthhard": ("synth/box-hard-rec", "synthetic at 10 fps with a jerk and a stretch beyond the depth window",
@@ -47,6 +49,12 @@ DATASETS = {  # name: (path or glob under captures/, notes, scan mode)
     "synthplate": ("synth/plate-rec", "synthetic 1.8 mm plate standing on the table, seen from both sides; "
                    "14-bit with the fixed error of synthfp", "still"),
 }
+GAPS = {  # name: (dataset, frames left out): a stretch skipped as if tracking had been lost while the scanner moved
+    "markersgap": ("markers", range(250, 330)),
+    "handgap": ("hand", range(150, 250)),
+}
+DATASETS.update({name: (DATASETS[base][0], f"{base} with frames {gap.start}-{gap.stop - 1} left out: tracking "
+                        "must find its place again after a jump", DATASETS[base][2]) for name, (base, gap) in GAPS.items()})
 SENSOR = dict(pattern_mm=0.144, noise_mm=0.05, bits=14)  # synth.py: closer to the real sensor
 SYNTH = {"synth": dict(every=1), "synth7": dict(every=3), "synthhard": dict(every=2, hard=True),
          "synthfp": dict(every=1, **SENSOR), "synthplate": dict(every=1, kind="plate", **SENSOR)}
@@ -147,10 +155,13 @@ def mesh_result(name, directory, scanner):
 
 def _run(name, tracker, preset, live_markers, optimise_after, mesh=False):
     directory = dataset_path(name)
-    found = cached_markers(name, directory)
+    base, gap = GAPS.get(name, (name, range(0)))
+    found = cached_markers(base, directory)
     scanner = make_scanner(tracker, preset, DATASETS[name][2])
     sightings, elapsed, n = [], 0.0, 0
     for i, frame in enumerate(fr.read_recording(directory)):
+        if i in gap:
+            continue
         if not live_markers:
             frame["markers2d"] = found.get(i, [])
         t0 = time.perf_counter()
@@ -181,6 +192,7 @@ def _run(name, tracker, preset, live_markers, optimise_after, mesh=False):
         "ms_per_frame": round(1000 * elapsed / max(n, 1), 1),
         "gpu_ms": scanner.stats.get("gpu_ms"),
         "points": int(len(xyz)),
+        "region_mm": None if scanner.scene.radius is None else round(float(scanner.scene.radius)),
         "pose_jumps": metrics.pose_jumps(tracked, centre),
         "flat_frames": scanner.stats.get("flat", 0),
         "feature_starts": scanner.feature_starts,
@@ -251,7 +263,7 @@ def show(results, against=None):
             ("keyframe_marker_scatter.scatter_mm", "kf mk mm"), ("loop_gap.mm", "gap mm"),
             ("ground_truth.ate_mm", "ATE mm"), ("keyframe_ground_truth.ate_mm", "kf ATE"), ("truth_mm.median", "truth mm"),
             ("mesh.tracked.median", "mesh mm"), ("mesh.true_poses.median", "fused mm"),
-            ("optimise.loops_kept", "loops"), ("ms_per_frame", "ms")]
+            ("optimise.loops_kept", "loops"), ("region_mm", "region mm"), ("ms_per_frame", "ms")]
     print(f"{'dataset':9s} " + " ".join(f"{h:>14s}" for _, h in cols))
     for r in results:
         o = old.get(r["dataset"])

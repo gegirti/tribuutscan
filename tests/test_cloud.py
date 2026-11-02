@@ -237,6 +237,110 @@ def test_the_region_grows_toward_what_the_scanner_is_aimed_at():
         sc.GROW_WINDOW = old
 
 
+def test_the_region_does_not_grow_along_what_lies_on_the_table():
+    """A sheet lying on the table (cardboard, a cable: 4 mm up) touching the object's foot, right in the
+    middle of the view: the region stays (the long-range hand scan's grew 98 -> 552 mm along such)."""
+    from tribuutscan import scene as sc
+    rng = np.random.default_rng(14)
+    f, w, h = 1000.0, 1280, 800
+    proj = lambda p: np.c_[p[:, 0] * f / p[:, 2] + w / 2, p[:, 1] * f / p[:, 2] + h / 2]
+    table = np.c_[rng.uniform(-250, 250, (20000, 2)), np.full(20000, 300.0)]
+    top = np.c_[rng.uniform(-60, 60, (8000, 2)), np.full(8000, 260.0)]
+    sides = np.concatenate([np.c_[np.full(1500, x), rng.uniform(-60, 60, 1500), rng.uniform(260, 297, 1500)]
+                            for x in (-60.0, 60.0)])
+    obj = np.concatenate([top, sides])
+    sheet = np.c_[rng.uniform(60, 200, 6000), rng.uniform(-40, 40, 6000), np.full(6000, 296.0)]
+    first, later = np.concatenate([table, obj]), np.concatenate([table, obj, sheet])
+    old = sc.GROW_WINDOW
+    try:
+        sc.GROW_WINDOW = 1.0  # the whole view counts as aimed at
+        scene = sc.Scene("still", np.random.default_rng(0))
+        for _ in range(3):
+            scene.observe(first, proj(first), (h, w), np.eye(4))
+        scene.masks(first, proj(first), (h, w), np.eye(4))
+        start = scene.radius
+        for _ in range(10):
+            scene.masks(later, proj(later), (h, w), np.eye(4))
+        assert scene.radius < start + 1, (start, scene.radius)
+    finally:
+        sc.GROW_WINDOW = old
+
+
+def _off_centre_scene():
+    """Camera looking down at a table (z = 300 mm), a 60 mm box off to the side, a crumb (5 points 5 mm up)
+    where the middle of the view hits; a Scene that knows the table and the box's region."""
+    from tribuutscan import scene as sc
+    rng = np.random.default_rng(15)
+    f, w, h = 1000.0, 1280, 800
+    table = np.c_[rng.uniform(-250, 250, (20000, 2)), np.full(20000, 300.0)]
+    top = np.c_[rng.uniform(100, 160, 3000), rng.uniform(-30, 30, 3000), np.full(3000, 240.0)]
+    side = np.c_[np.full(2000, 100.0), rng.uniform(-30, 30, 2000), rng.uniform(240, 297, 2000)]
+    crumb = np.c_[rng.uniform(-1, 1, (5, 2)), np.full(5, 295.0)]
+    xyz = np.concatenate([table, top, side, crumb])
+    pix = np.c_[xyz[:, 0] * f / xyz[:, 2] + w / 2, xyz[:, 1] * f / xyz[:, 2] + h / 2].astype(int)
+    scene = sc.Scene("still", rng)
+    scene.plane = (np.array([0.0, 0.0, -1.0]), 300.0)  # up out of the table, toward the scanner
+    scene.axis, scene.radius, scene.top = np.array([130.0, 0.0, 300.0]), 60.0, 80.0
+    return xyz, pix, (h, w), scene, slice(len(table), len(table) + 5000)
+
+
+def test_the_tracking_source_follows_the_region_when_the_centre_misses():
+    xyz, pix, shape, scene, box = _off_centre_scene()
+    centre, plane = cl.isolate_mask(xyz, pix, shape, np.random.default_rng(0))
+    assert plane is not None and centre.sum() <= 5  # the middle of the view: a crumb
+    seeds = scene.core(xyz, np.eye(4))
+    keep, _ = cl.isolate_mask(xyz, pix, shape, np.random.default_rng(0), seeds)
+    assert keep[box].mean() > 0.99 and keep.sum() <= box.stop - box.start + 2  # the box, nothing else
+    assert cl.isolate_mask(xyz, pix, shape, np.random.default_rng(0), seeds & False)[0].sum() <= 5  # no seeds
+
+
+def test_the_base_cuts_the_source_when_the_frame_shows_no_table_of_its_own():
+    xyz, pix, shape, scene, box = _off_centre_scene()
+    near = (np.abs(xyz[:, 0] - 130) < 45) & (np.abs(xyz[:, 1]) < 45)  # a frame showing too little table to fit
+    xyz, pix = xyz[near], pix[near]
+    assert cl.support_plane(xyz, np.random.default_rng(0), pix, shape) is None
+    seeds = scene.core(xyz, np.eye(4))
+    whole = cl.isolate_mask(xyz, pix, shape, np.random.default_rng(0), seeds)[0]
+    cut = cl.isolate_mask(xyz, pix, shape, np.random.default_rng(0), seeds,
+                          lambda: scene.plane_in_camera(xyz, np.eye(4)))[0]
+    on_table = np.abs(xyz[:, 2] - 300) < 3
+    assert whole[on_table].mean() > 0.9 and not cut[on_table].any() and cut[~on_table & seeds].all()
+
+
+def test_a_pose_that_tilts_the_table_is_not_taken():
+    """A broad table must lie as flat as the kept base (the hand scan's slid poses tilted it 3.4-8.2
+    degrees); a narrow strip of it (a rim around an object filling the view) says nothing."""
+    xyz, pix, shape, scene, box = _off_centre_scene()
+    s = cl.Scanner(log=lambda m: None)
+    s.scene = scene
+    plane = cl.support_plane(xyz, np.random.default_rng(0), pix, shape)
+    s.frame_table = cl.table_normal(xyz, plane)
+    tilt = lambda deg: np.r_[np.c_[np.array([[1, 0, 0], [0, np.cos(np.radians(deg)), -np.sin(np.radians(deg))],
+                                             [0, np.sin(np.radians(deg)), np.cos(np.radians(deg))]]), np.zeros(3)],
+                             [[0, 0, 0, 1]]]
+    assert s.floor_agrees(np.eye(4)) and s.floor_agrees(tilt(1.5))
+    assert not s.floor_agrees(tilt(5.0)) and not s.floor_agrees(tilt(-5.0))
+    assert s.floor_agrees(tilt(40.0))  # that far off it is another surface
+    strip = xyz[(np.abs(xyz[:, 2] - 300) < 3) & (np.abs(xyz[:, 1]) < 30)]
+    s.frame_table = cl.table_normal(strip, plane)
+    assert s.frame_table[1] < cl.FLOOR_MIN_SPAN_MM and s.floor_agrees(tilt(5.0))
+
+
+def test_a_pose_found_anywhere_must_be_reachable_in_the_time_lost():
+    s = cl.Scanner(log=lambda m: None)
+    s.last_t = 10.0
+    xyz = np.array([[0.0, 0.0, 300.0]])  # the object 30 cm in front
+    turn = lambda deg: np.r_[np.c_[np.array([[np.cos(np.radians(deg)), 0, np.sin(np.radians(deg))], [0, 1, 0],
+                                             [-np.sin(np.radians(deg)), 0, np.cos(np.radians(deg))]]),
+                                   np.zeros(3)], [[0, 0, 0, 1]]]
+    about_object = lambda deg: np.r_[np.c_[np.eye(3), [0, 0, 0.3]], [[0, 0, 0, 1]]] @ turn(deg) @ \
+        np.r_[np.c_[np.eye(3), [0, 0, -0.3]], [[0, 0, 0, 1]]]  # the camera walked round the object
+    assert s.reachable(about_object(40), xyz, 11.0)  # 40 degrees in 1 s
+    assert not s.reachable(about_object(136), xyz, 11.35)  # the plate's mirrored re-find
+    assert s.reachable(about_object(136), xyz, 13.0)  # given the time
+    assert s.reachable(about_object(170), xyz, None)  # no time stamps: no limit
+
+
 def test_output_leaves_out_base_background_and_floating_bits():
     s = cl.Scanner("small", log=lambda m: None)
     s.scene.plane, s.scene.axis = (np.array([0.0, 0.0, 1.0]), 0.0), np.zeros(3)  # world: base at z = 0

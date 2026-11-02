@@ -44,6 +44,7 @@ BORDER_PX = 40  # a support plane must have points this close to the image edge
 PLANE_MIN_CM2 = 80  # ...and cover this much area. A slice through a curved part covered 33-53 cm2,
                     # a mostly hidden table 100 cm2 (one test each; revisit with turntable scans)
 CLUSTER_CELL_MM = 6.0  # cell size for finding the connected piece at the centre
+MIN_SEEDS = 20  # region-core points (scene.Scene.core) that place the tracking source instead of the centre
 OUTPUT_CELL_MM = 3.0  # connectivity of the saved cloud: cubes further apart than this are not connected
 
 KEY_MOVE_MM, KEY_TURN_DEG = 3.0, 2.0  # merge a frame after this much motion since the last one...
@@ -51,6 +52,18 @@ KEY_EVERY = 10  # ...or every 10th tracked frame anyway (a still scanner keeps a
 MAX_STEP_MM, MAX_STEP_DEG = 30.0, 15.0  # larger jumps between tracked frames are tracking failures
 RELOCK_FITNESS = 0.6  # after a loss, a frame must match this share of its points to the cloud so far
 RELOCK_MAX_SCALE = 2.0  # a re-found pose may be at most this many normal steps from the last good one
+GUESS_MAX_S = 0.3  # the motion guess extrapolates the last motion over at most this long (lost frames:
+                   # it ran on and on, 7 -> 177 mm at the object over 20 lost frames of the hand scan)
+REFIND_KEYFRAMES, REFIND_TRIES = 16, 3  # refind_anywhere: keyframes compared, best ones tried...
+REFIND_MIN_INLIERS = 50  # ...and the ORB inliers a pose found anywhere needs (the hand scan's had 141-245)...
+REFIND_MIN_AWAY = 25  # ...this many of them on the still scene around the object, not on it: the synthetic plate
+                      # (the same markers on both faces, a plain table) was re-found mirrored, 180 degrees off
+REFIND_MM_S, REFIND_DEG_S, REFIND_SLACK = 300.0, 60.0, (50.0, 15.0)  # ...and must be reachable in the time lost:
+    # a full circle round the object in 6 s is a fast walk; a faster turn only delays the re-find. The plate's
+    # mirrored re-find turned 136 degrees in 1.35 s (truly ~45); the real ones 18-31 degrees after 19-27 s
+REFIND_HOLD = 2  # frames tracked after a pose found anywhere before merging resumes
+FLOOR_MAX_DEG = 2.5  # a taken pose tilts the kept base at most this much from the frame's own table...
+FLOOR_OTHER_DEG, FLOOR_MIN_SPAN_MM = 15.0, 150.0  # ...a plane further off, or narrower, says nothing
 OBJECT_ABOVE_MM = 3.0  # (scene.py) the object starts this far above the table
 JOINT_MIN_FITNESS, JOINT_MAX_RMSE_MM = 0.3, 2.0  # accepting a joint-solve pose (markers: see Scanner)
 MODEL_EVERY = 5  # target="model": rebuild the model's levels after this many merges
@@ -307,22 +320,47 @@ def connected_piece(xyz, seeds, cell_mm=CLUSTER_CELL_MM):
     return piece[inv]
 
 
-def isolate_mask(xyz, pix, shape, rng):
-    """Mask of the object's points (support plane dropped, piece at the centre kept), and had_plane."""
+def isolate_mask(xyz, pix, shape, rng, seeds=None, known=None):
+    """Mask of the object's points (support plane dropped, piece at the centre kept), and that plane
+    ((n, c), or None). With `seeds` (bool mask: where the object should be, scene.Scene.core), the piece
+    connected to the seeds left after the plane cut is kept instead, when there are MIN_SEEDS of them.
+    `known`: a function giving a plane to cut by when the frame shows none of its own (the kept base
+    where the pose guess puts it: without a cut the piece took in the whole floor, and the hand scan's
+    frames 46-49 matched the model at 10-28%)."""
     keep = np.ones(len(xyz), bool)
     plane = support_plane(xyz, rng, pix, shape)
-    if plane is not None:
-        keep = np.abs(xyz @ plane[0] + plane[1]) >= PLANE_TOL_MM
+    cut = plane if plane is not None or known is None else known()
+    if cut is not None:
+        keep = np.abs(xyz @ cut[0] + cut[1]) >= PLANE_TOL_MM
     if keep.any():
         idx = np.nonzero(keep)[0]
-        keep[idx[~centre_piece(xyz[idx], pix[idx], shape)]] = False
-    return keep, plane is not None
+        if seeds is not None and seeds[idx].sum() >= MIN_SEEDS:
+            piece = connected_piece(xyz[idx], seeds[idx])
+        else:
+            piece = centre_piece(xyz[idx], pix[idx], shape)
+        keep[idx[~piece]] = False
+    return keep, plane
+
+
+def table_normal(xyz, plane):
+    """(unit normal, least squares, facing the camera; narrower in-plane extent in mm, +-2 sigma) of the
+    points within PLANE_TOL_MM of a frame's table `plane`, or None."""
+    if plane is None:
+        return None
+    pts = xyz[np.abs(xyz @ plane[0] + plane[1]) < PLANE_TOL_MM]
+    if len(pts) < 200:
+        return None
+    pts = pts[::max(1, len(pts) // 5000)]
+    centre = pts.mean(0)
+    w, v = np.linalg.eigh(np.cov((pts - centre).T))
+    n = v[:, 0] if v[:, 0] @ centre < 0 else -v[:, 0]
+    return n, 4 * float(np.sqrt(max(w[1], 0.0)))
 
 
 def isolate(xyz, rgb, pix, shape, rng):
     """Cut a frame down to the object: drop the support plane, keep the piece at the centre."""
-    keep, had_plane = isolate_mask(xyz, pix, shape, rng)
-    return xyz[keep], rgb[keep], had_plane
+    keep, plane = isolate_mask(xyz, pix, shape, rng)
+    return xyz[keep], rgb[keep], plane is not None
 
 
 def plausible_step(t, xyz, scale=1.0):
@@ -511,6 +549,8 @@ class Scanner:
         self.pending = []
         self.track_info = []  # per tracked frame: (index, info from track.solve); for evaluation
         self.last_t, self.motion_s, self.lost_run = None, None, 0  # time of the last tracked frame, of `motion`
+        self.frame_table = None  # this frame's own table: (normal, narrower extent mm), for floor_agrees
+        self.hold, self.refind_feat = 0, None  # refind_anywhere's state
         self.track_log = []  # per frame: (index, status, pose or None); for evaluation
         self.on_merge = None  # optional callback(index, world_xyz_mm, rgb, world_normals, pose)
         self.remove_base = remove_base  # the saved/shown cloud leaves the base out (it is merged either way)
@@ -530,11 +570,22 @@ class Scanner:
         seg = self.seg_stride  # the object / base search's grid (merging takes every self.stride-th pixel)
         all_xyz, all_rgb, all_pix = frame_points(frame, seg)  # normals only for merging (below)
         scene = self.scene
+        t = frame.get("t")
+        guess = self.motion
+        if self.motion_dt and t is not None and self.last_t is not None and self.motion_s:
+            guess = scale_motion(self.motion, min(t - self.last_t, GUESS_MAX_S) / self.motion_s)
+        self.frame_table = None
         if scene.mode == "turntable":
             scene.observe(all_xyz, all_pix, shape, np.eye(4))
             keep = scene.object_mask(all_xyz, all_pix, shape, np.eye(4))
-        else:
-            keep = isolate_mask(all_xyz, all_pix, shape, self.rng)[0]
+        else:  # the frame's piece where the guess puts the object (the middle of the view can miss a narrow one)
+            seeds = known = None
+            if self.prev is not None:
+                to_world = scene_transform(self.pose @ guess)
+                seeds = scene.core(all_xyz, to_world)
+                known = None if scene.plane is None else lambda: scene.plane_in_camera(all_xyz, to_world)
+            keep, plane = isolate_mask(all_xyz, all_pix, shape, self.rng, seeds, known)
+            self.frame_table = table_normal(all_xyz, plane)
         xyz, rgb, pix = all_xyz[keep], all_rgb[keep], all_pix[keep]
         if len(xyz) < 500 // seg ** 2:
             stats["lost"] += 1
@@ -542,10 +593,6 @@ class Scanner:
             self.lost_run += 1
             self.track_log.append((index, "too few points", None))
             return False
-        t = frame.get("t")
-        guess = self.motion
-        if self.motion_dt and t is not None and self.last_t is not None and self.motion_s:
-            guess = scale_motion(self.motion, (t - self.last_t) / self.motion_s)
         status = "first" if self.prev is None else "tracked"
         if self.track_with == "markers":
             if not self.marker_step(frame, guess, index):
@@ -607,9 +654,13 @@ class Scanner:
                     self.motion = step
                     self.motion_s = (t - self.last_t) if (t is not None and self.last_t is not None) else None
                     self.pose = self.pose @ self.motion
-                elif self.relock(*self.relock_source(levels, xyz, all_xyz, all_pix, shape)):
+                elif self.relock(*self.relock_source(levels, xyz), marker_pts):
                     stats["relocked"] += 1
                     status = "relocked"
+                elif self.refind_anywhere(frame, pix, xyz, marker_pts, feat):
+                    stats["relocked"] += 1
+                    status = "re-found"
+                    feat = self.refind_feat
                 else:
                     stats["lost"] += 1
                     stats["tracking"] = False
@@ -634,6 +685,11 @@ class Scanner:
             self.last_view = (all_pix, keep, np.zeros(len(keep), bool), shape)
         self.labels[index] = view_mask(self.last_view)
         stats["plane_frames"] += scene.plane is not None
+        if status == "re-found" and self.track_with == "gpu":
+            self.hold = REFIND_HOLD + 1
+        if self.hold:  # a pose found anywhere is merged only once the frames after it have tracked from it
+            self.hold -= 1
+            return False
         self.since_merge = getattr(self, "since_merge", 0) + 1
         if self.last_merged is not None:
             move, turn = turned(np.linalg.inv(self.last_merged) @ self.pose)
@@ -890,9 +946,28 @@ class Scanner:
                     "flat": flat}  # plain Python values: the page receives them as JSON
 
     def accepted(self, info, step, xyz):
-        """Is a solve's pose taken: enough overlap, a small residual, a believable step, markers agreeing."""
+        """Is a solve's pose taken: its checks (solve_ok), a believable step, the table as flat as it was."""
+        return self.solve_ok(info) and plausible_step(step, xyz) and self.floor_agrees(step)
+
+    def floor_agrees(self, step):
+        """In "still" mode, does the frame's own table (frame_table, when broad enough to tell) lie as flat as
+        the kept base with the camera at self.pose @ step? Their normals within FLOOR_MAX_DEG; a plane more
+        than FLOOR_OTHER_DEG off is another surface and says nothing, and so does a narrow strip (a table
+        rim around an object filling the view fixes the tilt across it poorly). Tilt only: an object's flat
+        top lies parallel to the table. Hand scan (long range): good poses within 0.75 degrees, poses that
+        slid along the thin fingers 3.4-8.2; marker scan: its table rim 80 mm across read 1.6-3.7."""
+        from .scene import plane_to
+        scene, own = self.scene, self.frame_table
+        if scene.mode != "still" or scene.plane is None or own is None or own[1] < FLOOR_MIN_SPAN_MM:
+            return True
+        n = plane_to(scene.plane, np.linalg.inv(scene_transform(self.pose @ step)))[0]
+        tilt = np.degrees(np.arccos(np.clip(abs(n @ own[0]), -1, 1)))
+        return tilt <= FLOOR_MAX_DEG or tilt > FLOOR_OTHER_DEG
+
+    def solve_ok(self, info):
+        """Did a solve fit: enough overlap, a small residual, markers agreeing."""
         return (info["fitness"] >= JOINT_MIN_FITNESS and info["rmse_mm"] is not None
-                and info["rmse_mm"] <= JOINT_MAX_RMSE_MM and plausible_step(step, xyz)
+                and info["rmse_mm"] <= JOINT_MAX_RMSE_MM
                 and (info["marker_rmse_mm"] is None or info["marker_rmse_mm"] <= self.marker_accept))
 
     def model_ready(self):
@@ -940,15 +1015,56 @@ class Scanner:
         stats["tracking"] = True
         return True
 
-    def relock_source(self, levels, xyz, all_xyz, all_pix, shape):
-        """Points to re-find with. The cloud holds only the object, so in "still" mode (tracking on
-        the whole scene) use the frame's object piece, not the scene."""
-        if self.scene.mode != "still":
-            return (self.fuse.levels(xyz / 1000) if levels is None else levels), xyz
-        obj = isolate_mask(all_xyz, all_pix, shape, self.rng)[0]
-        if obj.sum() < 50:
-            return (self.fuse.levels(xyz / 1000) if levels is None else levels), xyz
-        return self.fuse.levels(all_xyz[obj] / 1000), all_xyz[obj]
+    def refind_anywhere(self, frame, pix, xyz, marker_pts, feat=None):
+        """Lost, and not back near the last good pose (relock): find the frame anywhere in the scan by
+        matching its ORB with keyframes' (the whole image in "still" mode, where the scene stands still),
+        the best REFIND_TRIES of up to REFIND_KEYFRAMES spread over the scan, each candidate with
+        REFIND_MIN_INLIERS (REFIND_MIN_AWAY of them on the still scene, off the object), checked by the
+        tracking solve (solve_ok, RELOCK_FITNESS, floor_agrees) and by the time lost (reachable). GPU tracker
+        only. The ORB extracted here is kept in self.refind_feat."""
+        self.refind_feat = feat
+        kfs = [k for k in self.keyframes if k[3] is not None and k[3][1] is not None]
+        if self.gpu is None or self.features is None or not kfs:
+            return False
+        if feat is None:
+            feat = self.refind_feat = self.features.extract(self.features.luma_of(frame), frame["depth"],
+                                                            None if self.scene.mode == "still" else pix)
+        pick = sorted(set(np.linspace(0, len(kfs) - 1, min(REFIND_KEYFRAMES, len(kfs))).round().astype(int))
+                      | set(range(max(0, len(kfs) - 4), len(kfs))))
+        counts = sorted(((len(self.features.good_matches(feat, kfs[j][3])), j) for j in pick), reverse=True)
+        for count, j in counts[:REFIND_TRIES]:
+            if count < REFIND_MIN_INLIERS:
+                break
+            pts = []
+            found, inliers = self.features.relative_pose(feat, kfs[j][3], self.rng, pts)
+            if found is None or inliers < REFIND_MIN_INLIERS:
+                continue
+            pose = kfs[j][1] @ found
+            if self.scene.mode == "still" and self.scene.away(pts[0], scene_transform(pose)).sum() < REFIND_MIN_AWAY:
+                continue  # held by the object alone: a symmetric one matches itself turned round
+            step, info = self.gpu_step(xyz, marker_pts, np.linalg.inv(self.pose) @ pose)
+            if self.solve_ok(info) and info["fitness"] >= RELOCK_FITNESS and self.floor_agrees(step) \
+                    and self.reachable(step, xyz, frame.get("t")):
+                self.pose, self.motion, self.motion_s = self.pose @ step, np.eye(4), None
+                return True
+        return False
+
+    def reachable(self, step, xyz, t):
+        """Could a hand-held scanner have moved by `step` (from the last good pose, judged at the object's
+        centre as plausible_step) in the time since that pose? REFIND_MM_S / REFIND_DEG_S plus a slack;
+        True without time stamps. The synthetic plate, symmetric with the same markers on both faces, was
+        otherwise re-found 180 degrees round after 1 s."""
+        if t is None or self.last_t is None:
+            return True
+        dt = max(t - self.last_t, 0.0)
+        c = xyz.mean(0) / 1000
+        moved_mm = np.linalg.norm(step[:3, :3] @ c + step[:3, 3] - c) * 1000
+        return (moved_mm <= REFIND_MM_S * dt + REFIND_SLACK[0]
+                and turned(step)[1] <= REFIND_DEG_S * dt + REFIND_SLACK[1])
+
+    def relock_source(self, levels, xyz):
+        """Levels to re-find with: the frame's object piece, as tracked (the cloud holds only the object)."""
+        return (self.fuse.levels(xyz / 1000) if levels is None else levels), xyz
 
     def cleaned(self, frame, pix=None):
         """The frame with prep.clean applied to the pixels tracking samples (every stride-th); with
@@ -963,27 +1079,37 @@ class Scanner:
         out[r0:r1:s, c0:c1:s] = prep.clean(d[r0:r1:s, c0:c1:s], s, origin=(c0, r0))
         return dict(frame, depth=out)
 
-    def relock(self, levels, xyz):
+    def relock(self, levels, xyz, marker_pts=None):
         """Tracking failed: try to place the frame against the cloud so far, from the last known pose.
 
         Works when the scanner comes back near where tracking was lost (like the app's "move back").
         With gate_refind, the re-found pose must be a believable step from the last good pose
         (limits widen with the frames lost, up to RELOCK_MAX_SCALE): the first version accepted
-        jumps of 120-190 mm, which merged shifted copies of the object.
+        jumps of 120-190 mm, which merged shifted copies of the object. On the GPU the pose found must
+        also pass the tracking solve's own checks (markers among them, which Open3D's ICP does not
+        have): synth replayed with the region-seeded source re-found a box 8.3 mm off and merged it.
         """
         if not len(self.cloud):
             return False
         if self.model_merged != self.stats["merged"]:
-            xyz = self.model_points()  # (under the cloud lock: a background merge may replace its arrays)
-            self.model, self.model_merged = self.fuse.levels(xyz / 1000), self.stats["merged"]
+            self.flush()  # the model must not depend on how far background merges have got (replays match)
+            self.model, self.model_merged = self.fuse.levels(self.model_points() / 1000), self.stats["merged"]
         result = self.fuse.icp(levels, self.model, self.pose)
         if result.fitness < RELOCK_FITNESS:
             return False
-        if self.gate_refind:
-            jump = np.linalg.inv(self.pose) @ result.transformation  # current camera -> last good camera
-            if not plausible_step(jump, xyz, min(self.lost_run + 1, RELOCK_MAX_SCALE)):
+        found = result.transformation
+        if self.gpu is not None:
+            step, info = self.gpu_step(xyz, np.empty((0, 3)) if marker_pts is None else marker_pts,
+                                       np.linalg.inv(self.pose) @ found)
+            if not self.solve_ok(info):
                 return False
-        self.pose, self.motion, self.motion_s = result.transformation, np.eye(4), None
+            found = self.pose @ step
+        jump = np.linalg.inv(self.pose) @ found  # current camera -> last good camera
+        if self.gate_refind and not plausible_step(jump, xyz, min(self.lost_run + 1, RELOCK_MAX_SCALE)):
+            return False
+        if not self.floor_agrees(jump):
+            return False
+        self.pose, self.motion, self.motion_s = found, np.eye(4), None
         return True
 
     def model_points(self, min_seen=1):

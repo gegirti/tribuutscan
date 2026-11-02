@@ -287,7 +287,12 @@ The IR projector turns on by itself when the IR stream is opened.
   cloud and mesh score the same against Creality's scan, while the whole run (tracking, Optimise,
   mesh) takes 222 s instead of 314. Replays (`cloud.py`, the viewer's `m`) and live scans use it when
   there is a GPU: replayed through the live worker, the marker recording runs at 9.3 frames a second
-  (3.7 on the CPU); live with the scanner it is still to be tried. Two weak spots, both
+  (3.7 on the CPU). The first live scan (a hand model at long range, 9 fps) kept track in only 132 of
+  483 frames: the tracker took whatever the middle of the view hit as the object, and a narrow object
+  is easy to miss. Now it looks where the object should be from the expected pose, checks each pose
+  against the table the object stands on, and after a loss finds its place again anywhere already
+  scanned (image features matched with earlier views, confirmed by the background around the
+  object): replayed, the same recording keeps track in 480 frames. Two weak spots, both
   measured on synthetic data: a 1.8 mm plate seen edge-on (neither tracker holds that turn), and a fixed
   per-pixel depth error like the sensor's, which lets the GPU's estimate drift about 0.7 mm in the first
   frames (the CPU's 0.13). A full-rate 14-bit recording will show whether the real sensor does that.
@@ -327,7 +332,10 @@ Next up:
   - [x] the engine, chosen by measuring WebGPU against OpenCL: WebGPU (`wgpu`)
   - [x] meshes on the GPU: frame preparation, fusion, marching cubes (a scan's mesh in seconds)
   - [x] tracking against the fused model on the GPU (9.3 fps through the live worker, offline)
-  - [ ] live scanning at full rate
+  - [x] tracking that holds a narrow object away from the middle of the view and finds its place again
+        after a loss (the first live scan, replayed: 132 -> 480 of 483 frames tracked)
+  - [ ] live scanning at full rate (that recording now runs at about 6 fps, since nearly every frame is
+        tracked and merged: merging into the point cloud holds it back)
 - [ ] **Crop in the 3D view**: for what touches the object (a stand, a cable), which object
       separation keeps.
 - [ ] **Speed** (measured on the marker scan: 247 ms per frame, about 4 fps):
