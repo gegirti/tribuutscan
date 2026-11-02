@@ -1056,6 +1056,15 @@ cubes on the GPU; the CPU keeps the 6x6 solve, markers, base votes, pose graph, 
     hand has too few colour features of its own to be re-found by features; relock found it a turn later.
   - Turntable scanning needs: a mode switch in the viewer, a shape re-find (as session.refind), object-only
     loops, and markers on the platform at best.
+  - SECOND PLATFORM SCAN (17:42, captures/20261102-174213-scan, 94 s, 1109 frames, 11.8 fps). The platform was
+    turned slowly; the user said tracking "stopped" at ~90 degrees, where the hand gets thin.
+    - The data: all 1109 frames tracked, 0 lost, 170 merged; the tracked turn was ~123 degrees.
+    - The hand stopped turning at frame ~1024. The depth outline's overlap with frame 960 levels off there, and
+      so does the tracked angle.
+    - What got weak: shape degeneracy fell 0.036 -> 0.0036 as the hand turned edge-on. "Flat" was on for 32% of
+      frames 900-999 and for all frames from 1000, so the viewer showed FLAT AREA.
+    - Cloud doubled 0.45% (first platform scan 9.2%, the 12:13 hand-held one 0.62%). Optimise kept 468 feature
+      loops, largest correction 24 mm.
 - LIVE SPEED, step 4 (2026-11-02, plan approved): a live frame's depth decoded where it is used.
   - The decode paths:
     - `depth.decode_strided`: the first pixel of each packed group, every 4th row, plus the
