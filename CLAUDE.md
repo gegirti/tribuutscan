@@ -1041,6 +1041,21 @@ cubes on the GPU; the CPU keeps the 6x6 solve, markers, base votes, pose graph, 
   - Next in item 3: the user prints it, measures MEASURE with calipers and scans it (close and long
     range). A tool then aligns the scan (compare.py's placement) and measures it against the sdf:
     distances, per-face offsets (step heights), best-fit scale.
+- PLATFORM SCAN (2026-11-02 17:07, captures/20261102-170723-scan with raw frames, ~46 s, 505 frames). The hand on
+  a round white platform, LONG range ~30 cm. The scanner stood STILL and the platform was turned by hand: the
+  shelves behind never move (contact sheets), and tracked poses say ~1.1 turns. The live scan ran as "still" (the
+  viewer has no mode switch).
+  - Colour features came from the static background:
+    - the re-find after the edge-on view (lost 92-126) was built on the shelves ("did not move");
+    - so were Optimise's 102 loops (all "features"), so the largest correction was 196 mm (a replay: 260).
+  - Still a full 360 degree hand (cloud 302k points). But the fingers are doubled on the sides, with a seam where
+    the turn closes.
+  - The platform top had NO depth at this low angle (white, likely glossy, grazing). So no base was found
+    (plane_frames 0), and the object was the centre piece in a ball.
+  - Replayed in the P2 turntable mode (Scanner(mode="turntable")): lost 92-262, 82 merged, correction 97 mm. The
+    hand has too few colour features of its own to be re-found by features; relock found it a turn later.
+  - Turntable scanning needs: a mode switch in the viewer, a shape re-find (as session.refind), object-only
+    loops, and markers on the platform at best.
 - LIVE SPEED, step 4 (2026-11-02, plan approved): a live frame's depth decoded where it is used.
   - The decode paths:
     - `depth.decode_strided`: the first pixel of each packed group, every 4th row, plus the
