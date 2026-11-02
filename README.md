@@ -145,6 +145,27 @@ guessed field of view, a hand-measured depth law), and clouds come out about 13%
 Our unit, for comparison: 28 views, reprojection 0.35 px (colour) and 0.32 px (IR), depth-law fit
 0.30 mm.
 
+### A test block, to measure what a scan gets right
+
+<p align="center">
+  <img src="examples/testblock/render.png" width="640" alt="the test block: steps, holes, ribs, a ramp, a dome, bosses">
+</p>
+
+```
+python3 -m tribuutscan.testblock          # writes captures/testblock/testblock.stl (to print) and .ply
+```
+
+An 80 x 55 x 25 mm block that prints without supports (base down), with features of known size:
+- steps of 8, 7 and 15 mm, and a 45 degree ramp;
+- a dome, and bosses 16 and 6 mm across;
+- blind holes 10, 6 and 4 mm across;
+- ribs 1, 2 and 3 mm thick.
+
+Its shape is defined exactly in `tribuutscan/testblock.py`, so a scan of the print can be measured
+against it: how far the surface lies from the true one, whether the sizes are right, and which
+small features survive. A print is never exactly its file, so also measure it with calipers (the
+command lists what to measure). The STL is about 27 MB, closed, and within 0.1 mm of the shape.
+
 ## How a scan works
 
 Each depth frame is paired with the colour frame captured closest in time. The object is found
@@ -186,7 +207,7 @@ The first live scan of the same hand, that morning, kept track in only 132 of 48
 tracker took whatever the middle of the view hit as the object, and a narrow object is easy to
 miss. The changes made that day (see [How a scan works](#how-a-scan-works)) were tried on its
 recording first: replayed, it then kept 480. The two scans agreeing shows consistency, not accuracy:
-both come from the same scanner and calibration (the printed test box will tell accuracy). The back
+both come from the same scanner and calibration (the printed test block will tell accuracy). The back
 of the hand was not scanned, and the thumb only in part.
 
 <p align="center">
@@ -366,6 +387,7 @@ The IR projector turns on by itself when the IR stream is opened.
 - `udev/70-tribuutscan.rules` USB access for 14-bit depth
 - `examples/0-day-kettle/` the first saved frame set
 - `examples/hand-gpu-scan/` renders of the mesh from a live scan on the GPU
+- `examples/testblock/` a render of the test block (`testblock.py` makes its STL)
 - `tests/` plain test functions: run with pytest, or call them directly
 
 ## TODO / roadmap
@@ -395,7 +417,8 @@ Next up:
   - [ ] ORB features on every second frame (about 8 ms)
   - [ ] independent steps in parallel (11 of 12 CPU threads idle)
 - [ ] **Accuracy**:
-  - [ ] a printed test box with known dimensions and small details
+  - [x] a test block to print, with known dimensions and small details (`testblock.py`)
+  - [ ] the test block scanned and measured, close and long range
   - [ ] a long-range board calibration
   - [ ] the up-to-3 mm rim error against Creality's scan of the same part
 - [ ] **IMU in tracking**: read the scanner's IMU calibration, check its clock against the depth

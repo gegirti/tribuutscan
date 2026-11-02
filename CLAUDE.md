@@ -316,6 +316,7 @@ python3 -m tribuutscan.measure [cm]         # flat target: plane RMS, noise, ste
 python3 -m tribuutscan.usbdepth [s] [--all] # 14-bit USB depth throughput check (--all: + colour, IR)
                                             # TRIBUUTSCAN_DEPTH=y10 forces 10-bit V4L2 depth anywhere
 python3 -m tribuutscan.markers captures/<stamp>   # find markers in a saved frame -> markers.png
+python3 -m tribuutscan.testblock [out_dir]       # the test block to print: captures/testblock/testblock.stl, .ply
 .venv/bin/python -m tribuutscan.cloud captures/<stamp>-rec [small|medium|large] [--keep-base]
                                             # merged point cloud -> captures/<stamp>-scan/ (base removed);
                                             # tracks on the GPU when there is one (TRIBUUTSCAN_GPU=0: CPU)
@@ -1016,6 +1017,22 @@ cubes on the GPU; the CPU keeps the 6x6 solve, markers, base votes, pose graph, 
     replies paired by time, render_depth), static at the hand: 190 frames in 14 s, 0 lost, yellow
     turning grey by frame 50; the scanner stayed on USB. bench --live on the second hand recording
     10.9 fps. Not yet seen by the user in the real window.
+- TEST BLOCK for item 3 (2026-11-02, prepared while the user is away; it needs their printer and scanner):
+  - `testblock.py`: an 80 x 55 x 25 mm block, printable without supports. Steps 8 / 7 / 15 mm, a 45°
+    ramp, a dome (R 12, 6 high), bosses Ø16 x 12 and Ø6 x 8, blind holes Ø10 x 8, Ø4 x 5, Ø6 x 6,
+    ribs 1 / 2 / 3 mm; asymmetric.
+  - The shape is an exact sdf, meshed by marching cubes (`gpu.triangle_table`, numpy, vectorised by
+    case) on a 0.25 mm grid offset by 0.37 of a step: grid points exactly on its faces made coincident
+    vertices and an open mesh.
+  - Result: closed and manifold, faces within 0.10 mm, 536,676 triangles, a 27 MB STL plus
+    testblock.ply in captures/testblock/; analytic volume 68,389 mm3 checked in the test.
+  - Measured and dropped: Open3D's quadric decimation to 150k triangles. It left the mesh open and cut
+    corners by up to 1.9 mm (only the vertices stayed on the shape).
+  - One microscopic fold at the dome / base crease (Open3D self-intersection, 2 triangles); slicers
+    don't care.
+  - Next in item 3: the user prints it, measures MEASURE with calipers and scans it (close and long
+    range). A tool then aligns the scan (compare.py's placement) and measures it against the sdf:
+    distances, per-face offsets (step heights), best-fit scale.
 - LIVE SPEED, step 2 (2026-11-02, plan approved: ~/.claude/plans/happy-wobbling-journal.md).
   - Measured first, per frame, no profiler, hand frames: decode 8.1 ms; depth -> points 7.3 (6.2 of it
     a colour lookup feed never used); RANSAC table 6.9; kept-base re-fit in the masks 6.3; masks
