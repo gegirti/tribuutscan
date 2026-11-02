@@ -1148,6 +1148,27 @@ cubes on the GPU; the CPU keeps the 6x6 solve, markers, base votes, pose graph, 
     - Live worker (bench --live) on the first platform recording: 330 of 505 tracked at 8.7 fps (lost frames
       cost relock, the re-finds and the full-view ghost), Optimise 42 loops, 0.9 mm. The old code: 485 tracked
       at 12.1 fps, 69 mm.
+- THIRD PLATFORM SCAN (2026-11-02 20:31, captures/20261102-203145-scan, raw frames kept; the first with "bring back
+  the shape"). The user: "WOW! Look at what I did!"
+  - The scan: 730 frames in 79 s; the platform noticed 6 s in; 362 degrees of turn. Cloud 218k points, 0.12%
+    doubled (the cleanest hand yet). Optimise 95 loops, largest correction 4.5 mm.
+  - How it was used: lost at about -110 degrees (the thin view); the user turned back to the grey shape (found
+    again at -112), went back to -52, then forward through the thin view without a loss (260 degrees in one
+    stretch) and ended where the scan started. At about frame 540 the scanner was lifted for a pass from above
+    (the platform top then has depth).
+  - Mesh (fusion, in a scratch copy): 483k triangles from 124 frames, 13 s on the GPU. Palm and stand clean;
+    small holes in the finger backs, ragged fingertip edges in the side views (the thin view).
+  - STILL LOST: frames 123-183 (edge-on) and 545-616 (the pass from above). No base was ever found (the platform
+    top had no depth during the first VOTE_LIMIT 300 frames), so the tracking source is the view-centre piece
+    (`Scene.core` returns None without a base). From above the centre hit the room (~665 mm) or nothing, leaving a
+    crumb of 2-36 points. Edge-on, it fell between the fingers.
+  - PROPOSED, NOT DONE (waiting for the user's go, 2026-11-03): `Scene.core` in ball mode returns the points
+    within the ball's start radius (ball[2]) of its centre at the pose guess; feed then seeds isolate_mask with
+    them, the frame's own plane cut as before.
+    - Replay of this scan (scratch monkeypatch): 729 of 730 tracked (was 585), 165 merged (124), 256k points
+      (216k), doubled 0.02% either way. Both lost stretches hold.
+    - Before committing: evaluate --tracker gpu --optimise on all datasets (only scans without a base should
+      change), a unit test, the notes.
 - LIVE SPEED, step 4 (2026-11-02, plan approved): a live frame's depth decoded where it is used.
   - The decode paths:
     - `depth.decode_strided`: the first pixel of each packed group, every 4th row, plus the
