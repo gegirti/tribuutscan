@@ -1016,6 +1016,40 @@ cubes on the GPU; the CPU keeps the 6x6 solve, markers, base votes, pose graph, 
     replies paired by time, render_depth), static at the hand: 190 frames in 14 s, 0 lost, yellow
     turning grey by frame 50; the scanner stayed on USB. bench --live on the second hand recording
     10.9 fps. Not yet seen by the user in the real window.
+- LIVE SPEED, step 2 (2026-11-02, plan approved: ~/.claude/plans/happy-wobbling-journal.md).
+  - Measured first, per frame, no profiler, hand frames: decode 8.1 ms; depth -> points 7.3 (6.2 of it
+    a colour lookup feed never used); RANSAC table 6.9; kept-base re-fit in the masks 6.3; masks
+    10.3; core 2.6; table normal 1.0.
+  - Measured and dropped: persistent staging buffers for GPU readbacks (0.25 vs 0.26 ms a read; the
+    ~1.2 ms per ICP pass is wgpu-py's Python side).
+  - The changes:
+    - feed's frame_points(colour=False);
+    - Scene.table_in_camera: the kept base re-fitted ONCE at the pose guess (eigh of the covariance
+      of at most FIT_POINTS 5000 band points), returning (n, c, narrower extent, fitted). It serves
+      the source cut (isolate_mask(plane=): no RANSAC), the floor check (frame_table) and
+      scene.masks(plane=). RANSAC + table_normal remain before the base is found, in the other
+      modes, and when the re-fit is not taken (the guess was off);
+    - livescan.Reader: the worker decodes the next frame on its own thread while it tracks the one
+      before.
+  - FOUND on the way: synthhard's jerk frame 49 was tracked 10 mm off (rmse 1.36 mm), fused into the
+    GPU volume, and tracking stayed ~4 mm off (ATE 0.28 -> 2.78). The previous code got that fragile
+    frame right by chance. Now GPU_MAX_RMSE_MM 1.0, growing with (z / 450 mm)^2, is part of
+    solve_ok for the GPU tracker (accepted, relock, refind); good frames are at most 0.46 mm.
+  - Measured and dropped: gating fusion on fitness < 0.7. It starved the synthetic boxes' models from
+    frame 1, since a view the model does not cover yet matches little.
+  - Evaluate (captures/eval/20261102-141633-oneplane-rmse against 20261102-115226-speed-final): every
+    dataset equal or better; tracked hand 481, synthhard ATE 0.285 (0.28), synth 0.372 -> 0.296;
+    evaluate's ms a frame hand 70 -> 53.
+  - Speed:
+    - bench stage table (hand2): feed 56 ms (depth -> points 1.9, object piece 4.5, masks 9.0, GPU
+      step 16.2);
+    - bench --live on the second hand recording, alternating with the previous code at load 7-11:
+      9.2 / 9.3 -> 11.8 / 12.0 fps.
+  - THE NEXT LEVER: in-process feed of the same 270 frames is 35 ms a frame with no point-cloud merges
+    against 58-71 ms with them. The merge thread (cloud add ~64 ms and keyframe ORB ~51 ms a merge,
+    depth -> points, clean) takes 25-35 ms a frame from tracking through the GIL. The half-resolution
+    ray cast (plan item 4) would save 3-4 ms, so it was not done. Next step: the point-cloud merge
+    out of the tracking process (plan first).
 - LIVE SPEED, step 1 (2026-11-02, item 2). The desktop was busy all along (load 8-20: Firefox at 90%),
   so timings swing +-15% between runs. Compare only runs made back to back.
   - The ray cast covers only the piece's pixels plus a margin (the coarse level's 30 mm reach at the

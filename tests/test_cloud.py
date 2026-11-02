@@ -307,6 +307,25 @@ def test_the_base_cuts_the_source_when_the_frame_shows_no_table_of_its_own():
     assert whole[on_table].mean() > 0.9 and not cut[on_table].any() and cut[~on_table & seeds].all()
 
 
+def test_the_kept_table_refitted_once_serves_the_cut_and_the_floor_check():
+    """Scene.table_in_camera: the kept base re-fitted to the frame (its normal and extent, as the frame's
+    own RANSAC plane gives them); not taken when the pose guess puts the band beside the table. Cutting
+    by it keeps the same piece as searching the frame's own plane (no support_plane per frame)."""
+    xyz, pix, shape, scene, box = _off_centre_scene()
+    n, c, span, fitted = scene.table_in_camera(xyz, np.eye(4))
+    assert fitted and abs(abs(n[2]) - 1) < 1e-4 and abs(abs(c) - 300) < 0.1 and span > cl.FLOOR_MIN_SPAN_MM
+    own = cl.support_plane(xyz, np.random.default_rng(0), pix, shape)
+    rn, rspan = cl.table_normal(xyz, own)
+    assert abs(abs(rn @ n) - 1) < 1e-4 and abs(rspan - span) < 0.05 * span
+    seeds = scene.core(xyz, np.eye(4))
+    searched = cl.isolate_mask(xyz, pix, shape, np.random.default_rng(0), seeds)[0]
+    given, _ = cl.isolate_mask(xyz, pix, shape, np.random.default_rng(0), seeds, plane=(n, c))
+    assert (searched == given).all()
+    off = np.eye(4)
+    off[2, 3] = 25.0  # a guess 25 mm off along the view: the 10 mm band misses the table
+    assert not scene.table_in_camera(xyz, off)[3]
+
+
 def test_a_pose_that_tilts_the_table_is_not_taken():
     """A broad table must lie as flat as the kept base (the hand scan's slid poses tilted it 3.4-8.2
     degrees); a narrow strip of it (a rim around an object filling the view) says nothing."""

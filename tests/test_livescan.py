@@ -43,3 +43,27 @@ def test_a_full_disk_stops_the_raw_copy_not_the_scan():
         copy.put({}, {})  # queued behind the failed one: skipped
         copy.close()
     assert isinstance(copy.error, fr.DiskFull)
+
+
+def test_the_reader_decodes_frames_beside_tracking_and_keeps_the_order():
+    import queue
+    from tribuutscan import frames as fr
+    from tribuutscan.depth import decode_depth, encode_y14
+    rng = np.random.default_rng(17)
+    depths = [encode_y14(rng.integers(0, 16000, (fr.H, fr.W), np.uint16)) for _ in range(2)]
+    commands = queue.Queue()
+    sent = [("start", "small", None, False, None, "close", True)]
+    sent += [("frame", b"yuyv", None, d, fr.W * 14 // 8, (i, 0.0, i)) for i, d in enumerate(depths)]
+    sent += [("stop",), ("quit",)]
+    for cmd in sent:
+        commands.put(cmd)
+    reader = livescan.Reader(commands)
+    reader.start()
+    reader.join(30)
+    got = [reader.out.get_nowait() for _ in range(len(sent))]
+    assert [g[0] for g in got] == [c[0] for c in sent] and reader.out.empty()
+    for g, c in zip(got, sent):
+        if c[0] == "frame":
+            assert g[:-1] == c and (g[-1] == decode_depth(c[3], fr.W, fr.H, c[4])).all()
+        else:
+            assert g == c

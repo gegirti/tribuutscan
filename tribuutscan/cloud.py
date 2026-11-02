@@ -66,6 +66,11 @@ REFIND_MM_S, REFIND_DEG_S, REFIND_SLACK = 300.0, 60.0, (50.0, 15.0)  # ...and mu
     # mirrored re-find turned 136 degrees in 1.35 s (truly ~45); the real ones 18-31 degrees after 19-27 s
 REFIND_HOLD = 2  # frames tracked after a pose found anywhere before merging resumes
 MARKER_IDLE_FRAMES, MARKER_IDLE_EVERY = 15, 4  # no markers seen for this long: look on every 4th frame only
+GPU_MAX_RMSE_MM, GPU_RMSE_Z_MM = 1.0, 450.0  # the GPU solve's residual limit, growing with the piece's distance
+    # squared beyond 450 mm (depth noise does; long range reaches 720 mm: 2.6 mm there). synthhard's jerk frame
+    # was taken 10 mm off with 1.36 mm, fused, and tracking stayed ~4 mm off; good frames on every dataset (hand
+    # at 33-50 cm included): at most 0.46 mm. (The fitness says how much of the view the model covers so far,
+    # not how well it fits: gating fusion on it starved the synthetic boxes' models from frame 1 on.)
 FLOOR_MAX_DEG = 2.5  # a taken pose tilts the kept base at most this much from the frame's own table...
 FLOOR_OTHER_DEG, FLOOR_MIN_SPAN_MM = 15.0, 150.0  # ...a plane further off, or narrower, says nothing
 OBJECT_ABOVE_MM = 3.0  # (scene.py) the object starts this far above the table
@@ -182,13 +187,14 @@ class VoxelCloud:
         return np.linalg.eigh(cov)[1][:, :, 0][inv]  # eigenvector of the smallest eigenvalue
 
 
-def frame_points(frame, stride=1, normals=False):
+def frame_points(frame, stride=1, normals=False, colour=True):
     """Camera-frame points (mm; x right, y down, z forward), colours, and pixel coords of one frame.
 
     `stride` takes every n-th pixel in both directions (more points than cubes is wasted work).
     The frame holds either decoded "color" or the raw "yuyv" buffer (then only the needed
     pixels are converted, which is much cheaper live). With `normals`, also returns unit normals
-    from the neighbouring pixels, facing the camera (zero where a neighbour has no depth).
+    from the neighbouring pixels, facing the camera (zero where a neighbour has no depth). Without
+    `colour` the colours are None (tracking needs none: the lookup took 6 of a frame's 7 ms).
     """
     d = frame["depth"]
     h, w = d.shape
@@ -198,8 +204,10 @@ def frame_points(frame, stride=1, normals=False):
     v, u = v * stride, u * stride
     z = pc.depth_to_mm(d[v, u])
     xyz = CAMERA.backproject(u, v, z)
-    src_x, src_y = pc.color_source(u, v, w, h, z)  # only the needed pixels; parallax-aware when calibrated
-    rgb = frame["color"][src_y, src_x] if "color" in frame else yuyv_pixels(frame["yuyv"], w, src_x, src_y)
+    rgb = None
+    if colour:
+        src_x, src_y = pc.color_source(u, v, w, h, z)  # only the needed pixels; parallax-aware when calibrated
+        rgb = frame["color"][src_y, src_x] if "color" in frame else yuyv_pixels(frame["yuyv"], w, src_x, src_y)
     if not normals:
         return xyz, rgb, np.stack([u, v], 1)
     return xyz, rgb, np.stack([u, v], 1), pixel_normals(ds, stride, v // stride, u // stride, xyz)
@@ -324,15 +332,17 @@ def connected_piece(xyz, seeds, cell_mm=CLUSTER_CELL_MM):
     return piece[inv]
 
 
-def isolate_mask(xyz, pix, shape, rng, seeds=None, known=None):
+def isolate_mask(xyz, pix, shape, rng, seeds=None, known=None, plane=None):
     """Mask of the object's points (support plane dropped, piece at the centre kept), and that plane
     ((n, c), or None). With `seeds` (bool mask: where the object should be, scene.Scene.core), the piece
     connected to the seeds left after the plane cut is kept instead, when there are MIN_SEEDS of them.
     `known`: a function giving a plane to cut by when the frame shows none of its own (the kept base
     where the pose guess puts it: without a cut the piece took in the whole floor, and the hand scan's
-    frames 46-49 matched the model at 10-28%)."""
+    frames 46-49 matched the model at 10-28%). `plane`: the table, already found (scene.Scene.
+    table_in_camera): no search of the frame's own (support_plane, 7 ms a frame)."""
     keep = np.ones(len(xyz), bool)
-    plane = support_plane(xyz, rng, pix, shape)
+    if plane is None:
+        plane = support_plane(xyz, rng, pix, shape)
     cut = plane if plane is not None or known is None else known()
     if cut is not None:
         keep = np.abs(xyz @ cut[0] + cut[1]) >= PLANE_TOL_MM
@@ -578,13 +588,13 @@ class Scanner:
             frame = self.cleaned(frame)
         shape = frame["depth"].shape
         seg = self.seg_stride  # the object / base search's grid (merging takes every self.stride-th pixel)
-        all_xyz, all_rgb, all_pix = frame_points(frame, seg)  # normals only for merging (below)
+        all_xyz, _, all_pix = frame_points(frame, seg, colour=False)  # normals and colour only for merging
         scene = self.scene
         t = frame.get("t")
         guess = self.motion
         if self.motion_dt and t is not None and self.last_t is not None and self.motion_s:
             guess = scale_motion(self.motion, min(t - self.last_t, GUESS_MAX_S) / self.motion_s)
-        self.frame_table = None
+        self.frame_table, table_plane = None, None  # the frame's table (camera): for floor_agrees / the masks
         if scene.mode == "turntable":
             scene.observe(all_xyz, all_pix, shape, np.eye(4))
             keep = scene.object_mask(all_xyz, all_pix, shape, np.eye(4))
@@ -593,10 +603,18 @@ class Scanner:
             if self.prev is not None:
                 to_world = scene_transform(self.pose @ guess)
                 seeds = scene.core(all_xyz, to_world)
-                known = None if scene.plane is None else lambda: scene.plane_in_camera(all_xyz, to_world)
-            keep, plane = isolate_mask(all_xyz, all_pix, shape, self.rng, seeds, known)
-            self.frame_table = table_normal(all_xyz, plane)
-        xyz, rgb, pix = all_xyz[keep], all_rgb[keep], all_pix[keep]
+                if scene.mode == "still" and scene.plane is not None:  # the table: the kept base re-fitted, once
+                    table = scene.table_in_camera(all_xyz, to_world)
+                    if table[3]:
+                        table_plane, self.frame_table = table[:2], (table[0], table[2])
+                    else:  # (the guess was off: the frame's own plane is searched, the kept one only if none)
+                        known = lambda: table[:2]
+            if table_plane is not None:
+                keep, _ = isolate_mask(all_xyz, all_pix, shape, self.rng, seeds, plane=table_plane)
+            else:
+                keep, plane = isolate_mask(all_xyz, all_pix, shape, self.rng, seeds, known)
+                self.frame_table = table_normal(all_xyz, plane)
+        xyz, pix = all_xyz[keep], all_pix[keep]
         if len(xyz) < 500 // seg ** 2:
             stats["lost"] += 1
             stats["tracking"] = False
@@ -690,7 +708,7 @@ class Scanner:
         if scene.mode == "still":  # the object (above the kept base, in its region) and the base under it
             to_world = scene_transform(self.pose)  # (every tracked frame: the region grows per frame)
             scene.observe(all_xyz, all_pix, shape, to_world)
-            obj, base = scene.masks(all_xyz, all_pix, shape, to_world, keep)
+            obj, base = scene.masks(all_xyz, all_pix, shape, to_world, keep, table_plane)
             pix = all_pix[obj | base]
             self.last_view = (all_pix, obj, base, shape)
         else:
@@ -975,7 +993,7 @@ class Scanner:
 
     def accepted(self, info, step, xyz):
         """Is a solve's pose taken: its checks (solve_ok), a believable step, the table as flat as it was."""
-        return self.solve_ok(info) and plausible_step(step, xyz) and self.floor_agrees(step)
+        return self.solve_ok(info, xyz) and plausible_step(step, xyz) and self.floor_agrees(step)
 
     def floor_agrees(self, step):
         """In "still" mode, does the frame's own table (frame_table, when broad enough to tell) lie as flat as
@@ -992,10 +1010,14 @@ class Scanner:
         tilt = np.degrees(np.arccos(np.clip(abs(n @ own[0]), -1, 1)))
         return tilt <= FLOOR_MAX_DEG or tilt > FLOOR_OTHER_DEG
 
-    def solve_ok(self, info):
-        """Did a solve fit: enough overlap, a small residual, markers agreeing."""
+    def solve_ok(self, info, xyz=None):
+        """Did a solve fit: enough overlap, a small residual, markers agreeing. On the GPU the residual
+        must stay within GPU_MAX_RMSE_MM at the piece's distance (`xyz`)."""
+        limit = JOINT_MAX_RMSE_MM
+        if self.gpu is not None and xyz is not None and len(xyz):
+            limit = GPU_MAX_RMSE_MM * max(1.0, float(np.median(xyz[:, 2])) / GPU_RMSE_Z_MM) ** 2
         return (info["fitness"] >= JOINT_MIN_FITNESS and info["rmse_mm"] is not None
-                and info["rmse_mm"] <= JOINT_MAX_RMSE_MM
+                and info["rmse_mm"] <= limit
                 and (info["marker_rmse_mm"] is None or info["marker_rmse_mm"] <= self.marker_accept))
 
     def model_ready(self):
@@ -1076,7 +1098,7 @@ class Scanner:
             if self.scene.mode == "still" and self.scene.away(pts[0], scene_transform(pose)).sum() < REFIND_MIN_AWAY:
                 continue  # held by the object alone: a symmetric one matches itself turned round
             step, info = self.gpu_step(xyz, marker_pts, np.linalg.inv(self.pose) @ pose)
-            if self.solve_ok(info) and info["fitness"] >= RELOCK_FITNESS and self.floor_agrees(step) \
+            if self.solve_ok(info, xyz) and info["fitness"] >= RELOCK_FITNESS and self.floor_agrees(step) \
                     and self.reachable(step, xyz, frame.get("t")):
                 self.pose, self.motion, self.motion_s = self.pose @ step, np.eye(4), None
                 return True
@@ -1134,7 +1156,7 @@ class Scanner:
         if self.gpu is not None:
             step, info = self.gpu_step(xyz, np.empty((0, 3)) if marker_pts is None else marker_pts,
                                        np.linalg.inv(self.pose) @ found)
-            if not self.solve_ok(info):
+            if not self.solve_ok(info, xyz):
                 return False
             found = self.pose @ step
         jump = np.linalg.inv(self.pose) @ found  # current camera -> last good camera

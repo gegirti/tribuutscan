@@ -73,6 +73,29 @@ class RawCopy:
         self.recorder.close()
 
 
+class Reader(threading.Thread):
+    """Takes the viewer's commands off its queue beside tracking: a frame's depth is decoded here
+    (depth.decode_depth, garbled rows included; 8 ms a frame) while the main loop tracks the one
+    before. Everything comes out of `out` in the order it came in, frames as (*command, depth)."""
+
+    def __init__(self, commands):
+        super().__init__(daemon=True)
+        self.commands, self.out = commands, queue.Queue()
+        self.decode_s = 0.0  # time spent decoding (beside tracking)
+
+    def run(self):
+        while True:
+            cmd = self.commands.get()
+            if cmd[0] == "frame":
+                t = time.perf_counter()
+                _, _, _, depth_buf, bytesperline, _ = cmd
+                cmd = (*cmd, decode_depth(depth_buf, fr.W, fr.H, bytesperline))
+                self.decode_s += time.perf_counter() - t
+            self.out.put(cmd)
+            if cmd[0] == "quit":
+                return
+
+
 class LiveSource:
     """view3d source backed by the running Scanner (or the last one)."""
 
@@ -152,11 +175,14 @@ def run(commands, replies, port=view3d.PORT):
     replies.put(("ready", f"http://localhost:{port}/" if server else None))
     out_dir, keep_raw, recorder = None, False, None
     parent = multiprocessing.parent_process()
-    timing = {"wait": 0.0, "raw": 0.0, "decode": 0.0, "feed": 0.0, "frames": 0}  # per scan, logged at Stop
+    timing = {"wait": 0.0, "raw": 0.0, "feed": 0.0, "frames": 0}  # per scan, logged at Stop
+    reader = Reader(commands)
+    reader.start()
+    decoded_at_start = 0.0
     while True:
         t_wait = time.perf_counter()
         try:
-            cmd = commands.get(timeout=1.0)
+            cmd = reader.out.get(timeout=1.0)
         except queue.Empty:
             if parent is not None and not parent.is_alive():  # viewer killed: don't linger holding the port
                 if source.scanner is not None and out_dir is not None and not (out_dir / "cloud.ply").exists():
@@ -170,7 +196,7 @@ def run(commands, replies, port=view3d.PORT):
         kind = cmd[0]
         timing["wait"] += time.perf_counter() - t_wait
         if kind == "start":
-            timing = {k: 0 for k in timing}
+            timing, decoded_at_start = {k: 0 for k in timing}, reader.decode_s
             _, preset, out_dir, keep_raw, continue_from, depth_mode, remove_base, *tracker = cmd
             calib.use_mode(depth_mode)  # the law of the scanner's mode, before any frame is turned into points
             recorder = None
@@ -187,7 +213,7 @@ def run(commands, replies, port=view3d.PORT):
                 source.name = f"live: {out_dir.name}"
                 source.phase, source.out_dir = "scanning", out_dir
         elif kind == "frame" and source.scanner is not None:
-            _, yuyv, grey, depth_buf, bytesperline, (t_c, t_i, t_d) = cmd
+            _, yuyv, grey, depth_buf, bytesperline, (t_c, t_i, t_d), depth = cmd
             t0 = time.perf_counter()
             if keep_raw:
                 try:
@@ -205,16 +231,13 @@ def run(commands, replies, port=view3d.PORT):
                         recorder.close()
                         recorder = None
                     replies.put(("log", f"raw copy stopped, the scan goes on: {e}"))
-            t1 = time.perf_counter()
-            frame = {"yuyv": yuyv, "depth": decode_depth(depth_buf, fr.W, fr.H, bytesperline),  # colour decoded per point
-                     "t": t_d, "skew_ms": (t_c - t_d) * 1000}
             t2 = time.perf_counter()
+            frame = {"yuyv": yuyv, "depth": depth, "t": t_d, "skew_ms": (t_c - t_d) * 1000}  # colour per point
             with source.lock:
                 s = source.scanner
                 s.feed(frame)
                 points = s.points_kept  # (the cloud lock is held through each ~90 ms merge: no waiting for it)
-            timing["raw"] += t1 - t0
-            timing["decode"] += t2 - t1
+            timing["raw"] += t2 - t0
             timing["feed"] += time.perf_counter() - t2
             timing["frames"] += 1
             replies.put(("frame_done", s.stats["merged"], s.stats["frames"], points, s.stats["tracking"],
@@ -233,8 +256,9 @@ def run(commands, replies, port=view3d.PORT):
             replies.put(("saved", str(path), kept))
             n = max(timing["frames"], 1)
             replies.put(("log", f"worker: {timing['frames']} frames; per frame: tracking {1000 * timing['feed'] / n:.0f} ms, "
-                                f"raw copy {1000 * timing['raw'] / n:.0f} ms, decode {1000 * timing['decode'] / n:.0f} ms, "
-                                f"waiting for frames {1000 * timing['wait'] / n:.0f} ms"
+                                f"raw copy {1000 * timing['raw'] / n:.0f} ms, waiting for frames "
+                                f"{1000 * timing['wait'] / n:.0f} ms, decode beside tracking "
+                                f"{1000 * (reader.decode_s - decoded_at_start) / n:.0f} ms"
                                 + (f"; GPU {source.scanner.stats['gpu_ms']}" if source.scanner.stats.get("gpu_ms") else "")))
             try:  # Optimise right away (user decision): loop closures, pose graph, merge again
                 from . import optimise

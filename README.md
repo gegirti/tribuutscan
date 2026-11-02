@@ -43,7 +43,7 @@ The limits, honestly:
   Both are the scanner's own modes; the viewer's *Range* menu switches them. Long-range distances
   follow the scanner's own numbers for that mode, but no board calibration has been done at long
   range yet (checked once by hand: 50 cm read as 49.3 cm).
-- **Live tracking runs at about 8-10 frames per second** with a GPU (about 4 on the CPU alone), so
+- **Live tracking runs at about 10-12 frames per second** with a GPU (about 4 on the CPU alone), so
   move steadily. The GPU itself is mostly idle (about 7 ms of work per frame); the rest is Python on
   the CPU, the next thing to speed up. Plain objects need shape to hold on to: a flat cardboard box
   at 27-31 cm tracked only 138 of 353 frames with the earlier CPU tracker (not retried since).
@@ -382,8 +382,9 @@ Next up:
         after a loss (the first live scan, replayed: 132 -> 480 of 483 frames tracked)
   - [x] the live model view: the scan so far painted over the depth view (done, needs more views,
         missing), 1 ms a frame
-  - [ ] live scanning at full rate (that recording now runs at about 10 fps through the live worker
-        on a busy desktop; next: the object search on the GPU)
+  - [ ] live scanning at full rate (that recording now runs at about 12 fps through the live worker
+        on a busy desktop; next: merging into the point cloud in its own process, which takes
+        25-35 ms of each frame today)
 - [ ] **Crop in the 3D view**: for what touches the object (a stand, a cable), which object
       separation keeps.
 - [ ] **Speed** (measured on the marker scan: 247 ms per frame, about 4 fps):

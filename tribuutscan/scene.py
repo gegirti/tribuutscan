@@ -48,6 +48,7 @@ GROW_ABOVE_MM = 10.0  # ...and only toward points this far above the plane. Hand
                       # cables lying on it 3-25 mm
 REFIT_BAND_MM = 10.0  # the kept plane is re-fitted to the frame's points within this band...
 REFIT_MAX_DEG, REFIT_MAX_MM = 3.0, 5.0  # ...and a re-fit that turns or moves it more is not taken
+FIT_POINTS = 5000  # a re-fit takes at most this many of the points near the plane
 
 
 def plane_to(plane, transform_mm):
@@ -121,7 +122,13 @@ class Scene:
                 return
 
     def plane_in_camera(self, xyz_cam, cam_to_region):
-        """The kept plane in this frame's camera coordinates, re-fitted to the frame's own points.
+        """The kept plane in this frame's camera coordinates, re-fitted to the frame's own points
+        (table_in_camera without its extras): (n, c)."""
+        return self.table_in_camera(xyz_cam, cam_to_region)[:2]
+
+    def table_in_camera(self, xyz_cam, cam_to_region):
+        """The kept plane in this frame's camera coordinates, re-fitted to the frame's own points:
+        (n, c, the fitted points' narrower extent in mm (+-2 sigma, as cl.table_normal), fitted).
 
         The kept plane, moved with a (possibly predicted) pose, is only a prior: points within
         REFIT_BAND_MM of it are fitted again (least squares, then once more without outliers), so a
@@ -130,7 +137,9 @@ class Scene:
         edge of an object standing up, or a face of it lying low, is near the table too, and on the
         marker scan such re-fits tipped the plane 20-64 degrees in 276 of 581 frames. A re-fit that
         still turns the plane more than REFIT_MAX_DEG or moves it more than REFIT_MAX_MM (at the
-        object, or at the view's centre before the region is known) is not taken.
+        object, or at the view's centre before the region is known) is not taken: then fitted is
+        False and (n, c) is the prior. Each fit takes at most FIT_POINTS of the points (the 3 x 3
+        covariance's smallest axis), which made the re-fit 6 -> ~2 ms a frame.
         """
         to_cam = np.linalg.inv(cam_to_region)
         prior = plane_to(self.plane, to_cam)
@@ -140,21 +149,21 @@ class Scene:
             n0 = prior[0]
             flat = xyz_cam - np.outer((xyz_cam - where) @ n0, n0)
             pts_all = xyz_cam[np.linalg.norm(flat - where, axis=1) > self.radius - REGION_MARGIN_MM]
-        n, c = prior
+        n, c, span, fitted = *prior, 0.0, False
         for band in (REFIT_BAND_MM, cl.PLANE_TOL_MM):
             near = np.abs(pts_all @ n + c) < band
             if near.sum() < 50:
-                return prior if band == REFIT_BAND_MM else (n, c)
-            pts = pts_all[near]
+                return (*prior, 0.0, False) if band == REFIT_BAND_MM else (n, c, span, fitted)
+            pts = pts_all[near][::max(1, int(near.sum()) // FIT_POINTS)]
             centre = pts.mean(0)
-            n_fit = np.linalg.svd(pts - centre, full_matrices=False)[2][2]
-            n_fit = n_fit if n_fit @ prior[0] > 0 else -n_fit
+            w, v = np.linalg.eigh(np.cov((pts - centre).T))
+            n_fit = v[:, 0] if v[:, 0] @ prior[0] > 0 else -v[:, 0]
             at = where if where is not None else centre
             if (np.degrees(np.arccos(np.clip(n_fit @ prior[0], -1, 1))) > REFIT_MAX_DEG
                     or abs(n_fit @ (at - centre) - (prior[0] @ at + prior[1])) > REFIT_MAX_MM):
-                return prior
-            n, c = n_fit, -n_fit @ centre
-        return n, c
+                return (*prior, 0.0, False)
+            n, c, span, fitted = n_fit, -n_fit @ centre, 4 * float(np.sqrt(max(w[1], 0.0))), True
+        return n, c, span, fitted
 
     def core(self, xyz_cam, cam_to_region):
         """Which points (camera coordinates) lie in the object region's core with the camera at
@@ -183,16 +192,17 @@ class Scene:
         """Which points (camera coordinates) are the object (see `masks`)."""
         return self.masks(xyz_cam, pix, shape, cam_to_region)[0]
 
-    def masks(self, xyz_cam, pix, shape, cam_to_region, piece=None):
+    def masks(self, xyz_cam, pix, shape, cam_to_region, piece=None, plane=None):
         """(object, base) masks of the points (camera coordinates). The base is the plane's points
         inside the object's cylinder; empty while no plane is known (then the object is the centre
         piece inside the ball). `piece` (bool mask): the frame's piece as tracking found it, used in
         place of the centre piece (cl.Scanner's source: what is connected to the core, the centre
-        missing or not; one flood fill less, two when the centre misses)."""
+        missing or not; one flood fill less, two when the centre misses). `plane`: the kept plane
+        already re-fitted to this frame (table_in_camera at the pose guess), instead of fitting it again."""
         mask = np.zeros(len(xyz_cam), bool)
         if self.plane is None:
             return self._ball_mask(xyz_cam, pix, shape, cam_to_region), mask.copy()
-        n, c = self.plane_in_camera(xyz_cam, cam_to_region)
+        n, c = self.plane_in_camera(xyz_cam, cam_to_region) if plane is None else plane
         h = xyz_cam @ n + c
         above = h > OBJECT_ABOVE_MM
         base = np.zeros(len(xyz_cam), bool)
