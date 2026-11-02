@@ -970,6 +970,24 @@ cubes on the GPU; the CPU keeps the 6x6 solve, markers, base votes, pose graph, 
   - Viewer: while scanning, the depth preview shows a centre mark (the first frame's object is what
     it hits) and a red frame while tracking is lost. The hint now says "aim at a part already scanned,
     or move back".
+- SECOND LIVE GPU SCAN (2026-11-02 12:13, captures/20261102-121318-scan with raw frames, after 071cdf2 and
+  81332d8). The same hand, brighter light, long range 33-39 cm (median 37), azimuth span 88 degrees
+  (front and both sides), looking down 47-64 degrees. The user: "really impressed".
+  - Tracking: 441 frames in 53 s (8.3 fps), all tracked, 0 lost, 0 re-finds; fitness p5 / median
+    0.94 / 0.97, rmse median / p95 0.35 / 0.42 mm; no markers.
+  - Cloud: 131 merged, 141,772 points, doubled 0.0062. Optimise: 360 loops (features), largest
+    correction 5.4 mm.
+  - Mesh (fusion on the GPU, from the scan dir): 219,600 triangles, 177 cm2, 14 s (read 41 ms a frame,
+    integrate 4.2). The hand is 198 mm above the floor.
+  - Consistency: the morning scan's cloud against this mesh (compare.py, 12 seeds): median 0.233 /
+    p90 0.527 mm, all on the part, 91.2% of this mesh within 1 mm.
+  - GPU use, a replay of its frames: 441/441 tracked, 131 merged, as live. Measured with timestamps
+    (calibrate_ticks: 54.2 ns a tick) and DRM fdinfo sampled every 0.25 s. Per frame, kernels 6.7 ms:
+    ray cast 4.3 (windowed), ICP 1.75 (0.21 a pass), prep ~0.4, integrate 0.26 a fused frame. Render
+    engine busy 12% of the run; VRAM 1.07 GB (local0), 75 MB system. The worker's 94 ms a frame is
+    CPU / Python plus ~25 ms of GPU round trips (wall).
+  - README: a section "A live scan on the GPU" with examples/hand-gpu-scan/ (mesh renders only, no
+    workspace; numpy z-buffer rasteriser, kept in the scratchpad only).
 - LIVE SPEED, step 1 (2026-11-02, item 2). The desktop was busy all along (load 8-20: Firefox at 90%),
   so timings swing +-15% between runs. Compare only runs made back to back.
   - The ray cast covers only the piece's pixels plus a margin (the coarse level's 30 mm reach at the

@@ -33,6 +33,9 @@ We are open to testing more devices and to improvements from anyone. See
   automatically, and on our unit it is within 0.9 px and 0.25% of the board's.
 - With markers on the object, tracking holds: a recent scan kept 579 of 581 frames, using about 11
   markers per frame, and Optimise's largest correction was 2.8 mm.
+- Without markers, tracked on the GPU: a live scan of a plain mannequin hand (about 20 cm tall, long
+  range, 33-39 cm away) kept every one of its 441 frames, and two separate scans of it agree to
+  0.23 mm (median). See [A live scan on the GPU](#a-live-scan-on-the-gpu).
 
 The limits, honestly:
 
@@ -40,8 +43,10 @@ The limits, honestly:
   Both are the scanner's own modes; the viewer's *Range* menu switches them. Long-range distances
   follow the scanner's own numbers for that mode, but no board calibration has been done at long
   range yet (checked once by hand: 50 cm read as 49.3 cm).
-- **Tracking runs at 3-7 frames per second** (Python on the CPU), so move slowly. Plain objects
-  without markers lose tracking easily: a cardboard box at 27-31 cm tracked only 138 of 353 frames.
+- **Live tracking runs at about 8-10 frames per second** with a GPU (about 4 on the CPU alone), so
+  move steadily. The GPU itself is mostly idle (about 7 ms of work per frame); the rest is Python on
+  the CPU, the next thing to speed up. Plain objects need shape to hold on to: a flat cardboard box
+  at 27-31 cm tracked only 138 of 353 frames with the earlier CPU tracker (not retried since).
 - **Something touching the object** (the stand it rests on, a cable) stays in the scan. The table
   under it and everything around it are left out, and *Remove base* decides about the base.
 
@@ -139,14 +144,51 @@ Our unit, for comparison: 28 views, reprojection 0.35 px (colour) and 0.32 px (I
 
 ## How a scan works
 
-Each depth frame is paired with the colour frame captured closest in time. The object is cut out
-(the table plane is found once and kept), and the frame's position is solved in one step from three
-things together: the shape against the cloud so far, the markers, and a guess of the motion. Image
-features (ORB) give the starting point. Each accepted frame merges into a voxel cloud: every small
+Each depth frame is paired with the colour frame captured closest in time. The object is found
+where the scanner expects it to be (the table plane is found once and kept, and the object's region
+stands on it), so it does not have to sit in the middle of the view. The frame's position is solved
+in one step from three things together: the shape against the scan so far, the markers, and a guess
+of the motion. With a GPU, the shape is matched against a view of the scan's own fused volume,
+rendered from where the scanner is expected to be; without one, against the point cloud so far. A
+position is taken only if it fits and the table in the frame lies as flat as the kept one. After a
+loss, the frame is matched with earlier views anywhere in the scan (image features, confirmed by the
+background around the object), so aiming at a part already scanned picks the scan up again.
+Accepted frames feed the GPU volume, and up to four a second merge into a voxel cloud: every small
 cube keeps one averaged point (0.5, 1 or 2 mm), and a cube must be seen in 3 frames to be kept.
 After Stop, *Optimise* looks for places the scan has seen before (shared markers, features, nearby
 positions), checks them, and spreads the corrections over the whole path (a pose graph), then merges
-the cloud again.
+the cloud again. *Make mesh* fuses the merged frames once more at their corrected positions into a
+surface, on the GPU in seconds.
+
+## A live scan on the GPU
+
+<p align="center">
+  <img src="examples/hand-gpu-scan/mesh.png" width="760" alt="the mesh of a mannequin hand, three views">
+</p>
+
+A plain green mannequin hand (no markers), about 20 cm tall, standing on a tiled floor with
+cardboard and cables around it. Scanned live in long range from 33-39 cm, about 90 degrees round
+its front (2026-11-02, Intel Arc A750, with the desktop busy beside it):
+
+| | |
+|---|---|
+| frames | 441 in 53 s (8.3 a second), every one tracked, none lost |
+| point cloud | 131 frames merged, 141,772 points at 0.5 mm |
+| Optimise | 360 loop closures, largest correction 5.4 mm |
+| mesh | 219,600 triangles (177 cm2), fused on the GPU in 14 s (mostly reading the recording) |
+| two scans of it | an earlier scan lies 0.23 mm (median) / 0.53 mm (90%) from this mesh and covers 91% of it within 1 mm |
+| GPU | about 7 ms of work per frame (the model view 4.3 ms, matching 1.8 ms over 8 passes, preparing and fusing frames 0.7 ms), busy 12% of the time, 1.07 GB of its 8 GB memory |
+
+The first live scan of the same hand, that morning, kept track in only 132 of 483 frames: the
+tracker took whatever the middle of the view hit as the object, and a narrow object is easy to
+miss. The changes made that day (see [How a scan works](#how-a-scan-works)) were tried on its
+recording first: replayed, it then kept 480. The two scans agreeing shows consistency, not accuracy:
+both come from the same scanner and calibration (the printed test box will tell accuracy). The back
+of the hand was not scanned, and the thumb only in part.
+
+<p align="center">
+  <img src="examples/hand-gpu-scan/mesh_colour.png" width="300" alt="the same mesh with its colour">
+</p>
 
 ## 0-day case
 
@@ -320,6 +362,7 @@ The IR projector turns on by itself when the IR stream is opened.
 - `tribuutscan-viewer.sh` launcher (copy to `~/.local/bin/tribuutscan-viewer`)
 - `udev/70-tribuutscan.rules` USB access for 14-bit depth
 - `examples/0-day-kettle/` the first saved frame set
+- `examples/hand-gpu-scan/` renders of the mesh from a live scan on the GPU
 - `tests/` plain test functions: run with pytest, or call them directly
 
 ## TODO / roadmap
