@@ -23,6 +23,9 @@ from . import track
 
 LEVELS = ((0.006, 0.03), (0.003, 0.012), (0.002, 0.006))  # fuse.ICP_LEVELS: (voxel, reach), metres
 STRIDES = (4, 2, 1)  # frame pixels taking part per level (every n-th each way)
+ITERATIONS = (3, 3, 8)  # ICP passes per level at most (each stops early once converged). track.ITERATIONS
+    # (5, 5, 8) took 10 passes a frame; (3, 3, 8) the same ATE (synth 0.35 -> 0.37, synthhard 0.33 -> 0.28 mm),
+    # (2, 2, 6) lost synth (2.4 mm)
 NORMAL_STEP = 2  # frame normals from neighbours this many pixels away (synthfp: 2, 3 or 4 px the same)
 # Off, measured (synthfp: the sensor's fixed per-pixel error, against which tracking drifts ~0.7 mm in its
 # first frames and the cloud's p90 to the true surface is 0.70 mm, the CPU's 0.33; without the fixed
@@ -32,6 +35,9 @@ NORMAL_STEP = 2  # frame normals from neighbours this many pixels away (synthfp:
 BLUR_PX = 0
 MODEL_NORMAL_PX = 0
 HALF_MM = 400.0  # the volume reaches this far from the first frame's piece each way (a dense brick index)
+RAY_MARGIN_MM, RAY_MARGIN_PX = 30.0, 16  # the ray cast covers the piece's pixels and this much around them
+    # (the coarse level's reach seen at the piece's nearest point): the rest of the view is never matched.
+    # Hand scan (long range, the object a sixth of the view): ray cast 11.9 ms over the whole image
 TRUNC_VOXELS = 6.0  # 3 mm: the mesh's 1.5 mm (fusion.TRUNC_VOXELS) gave worse tracking on the thin plate (ATE 36 mm; 2 mm: 19, 3 mm: 6.8)
 KEYFRAME_MM = 2.0  # keyframe points (Optimise): one per cell of this size, as track.levels' finest level
 
@@ -77,12 +83,19 @@ class Tracker:
         self.engine.set_camera(camera, self.pinhole.index)
         self.timing = {"source": 0.0, "raycast": 0.0, "icp": 0.0, "fuse": 0.0}  # wall clock s, with readbacks
         self.frames, self.passes = 0, 0  # frames solved, ICP passes run
+        self.rect = None  # the ray cast's pixels (source)
 
-    def source(self, frame, pix, step):
-        """This frame's piece (pixels `pix`, sampled every `step`-th each way) as the maps to track."""
+    def source(self, frame, pix, step, near_mm=None):
+        """This frame's piece (pixels `pix`, sampled every `step`-th each way) as the maps to track; with
+        `near_mm` (the piece's nearest distance) the ray casts cover only the piece's part of the view."""
         h, w = frame["depth"].shape
         keep = np.zeros(((h + step - 1) // step, (w + step - 1) // step), bool)
         keep[pix[:, 1] // step, pix[:, 0] // step] = True
+        self.rect = None
+        if near_mm is not None and len(pix):
+            m = int(RAY_MARGIN_MM * self.K[0, 0] / max(near_mm, 1.0)) + RAY_MARGIN_PX + step
+            lo, hi = pix.min(0) - m, pix.max(0) + m + 1
+            self.rect = (max(lo[0], 0), max(lo[1], 0), min(hi[0], w), min(hi[1], h))
         t0 = time.perf_counter()
         self.engine.track_source(frame["depth"], keep, step, NORMAL_STEP, BLUR_PX)
         self.timing["source"] += time.perf_counter() - t0
@@ -96,7 +109,7 @@ class Tracker:
         e = self.engine
         ref = gpu.pose_mm(init)
         t0 = time.perf_counter()
-        e.raycast(ref, normal_px=MODEL_NORMAL_PX)
+        e.raycast(ref, normal_px=MODEL_NORMAL_PX, rect=self.rect)
         e.sync()
         t1 = time.perf_counter()
         self.timing["raycast"] += t1 - t0
@@ -107,7 +120,7 @@ class Tracker:
         plane = (0.0, 0.0, 0.0, 1.0) if base is None else (*base[0], base[1])
         t, w_prior, last = init.copy(), track.prior_weights(prior), None
         fx, fy = self.K[0, 0], self.K[1, 1]
-        for level, ((voxel, reach), stride, iters) in enumerate(zip(LEVELS, STRIDES, track.ITERATIONS)):
+        for level, ((voxel, reach), stride, iters) in enumerate(zip(LEVELS, STRIDES, ITERATIONS)):
             sigmas = track.MARKER_GATE_SIGMAS[0] if level < len(LEVELS) - 1 else track.MARKER_GATE_SIGMAS[1]
             area = stride ** 2 / (fx * fy * (voxel * 1000) ** 2)
             for _ in range(iters):

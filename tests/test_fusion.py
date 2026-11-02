@@ -113,7 +113,11 @@ def test_a_scan_meshes_the_same_on_the_gpu_and_on_the_cpu():
         with tempfile.TemporaryDirectory() as tmp:
             rec, out = Path(tmp) / "t-rec", Path(tmp) / "t-scan"
             synth.generate(rec, n_frames=24)
-            sc = cl.scan(rec, log=lambda *a: None)
+            cap, cl.MERGE_MIN_S = cl.MERGE_MIN_S, 0.0  # every keyframe merged: 24 frames are 1.2 s
+            try:
+                sc = cl.scan(rec, log=lambda *a: None)
+            finally:
+                cl.MERGE_MIN_S = cap
             sc.save(out)
             meshes = {}
             for choice in ("auto", "0"):

@@ -34,7 +34,7 @@ RAY_STEPS = 1024
 ICP_GROUPS = 256  # work-groups of the ICP sums; each writes ICP_VALUES partial sums
 ICP_VALUES = 32  # 21 of the 6x6 J^T W J (upper triangle, row by row), 6 of J^T W r, then: pairs used, sum w,
                  # sum r^2 of those pairs, frame pixels taking part, pixels matched to the model (within reach)
-PARAMS_BYTES = 336
+PARAMS_BYTES = 352
 
 
 class Layout:
@@ -85,10 +85,10 @@ def pose_mm(pose_m):
 
 def params(layout, K, size, pose=np.eye(4), ref_inv=np.eye(4), centre=(0, 0, 0), frame=0, far_mm=1000.0,
            near_mm=50.0, min_weight=RAY_MIN_WEIGHT, limit=MAX_VISIBLE, tukey=TUKEY_MM, gate=NORMAL_GATE,
-           area=0.0, reach_mm=1e9, normal_step=1, stride=1, base=(0.0, 0.0, 0.0, 1.0)):
+           area=0.0, reach_mm=1e9, normal_step=1, stride=1, base=(0.0, 0.0, 0.0, 1.0), rect=(0, 0, 0, 0)):
     """The parameter block every kernel reads (PARAMS_BYTES; matrices column by column). ICP (icp_sums):
     tukey, gate, area (pixel footprint scale), reach_mm, stride, base; maps and model normals:
-    normal_step; ray cast: min_weight."""
+    normal_step; ray cast: min_weight, rect (pixels x0, y0, x1, y1 it covers; x1 = 0: all)."""
     pose = np.asarray(pose, np.float64)
     mats = [pose, np.linalg.inv(pose), np.asarray(ref_inv, np.float64)]
     w, h = size
@@ -102,6 +102,7 @@ def params(layout, K, size, pose=np.eye(4), ref_inv=np.eye(4), centre=(0, 0, 0),
     out += struct.pack("<4I", w, h, frame, limit)
     out += struct.pack("<4f", area, reach_mm, normal_step, stride)
     out += struct.pack("<4f", *base)
+    out += struct.pack("<4I", *rect)
     return out
 
 

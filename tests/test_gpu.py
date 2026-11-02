@@ -157,9 +157,15 @@ def test_engine_matches_open3d_and_the_references():
         for p in poses:
             near.fuse(wall(p), rgb, p)
         near.raycast(poses[1])
-        nv = near.model_maps()[0]
+        nv, near_n = near.model_maps()
         nhit = nv[..., 3] > 0
         assert np.median(np.abs(nv[..., 3][nhit] - wall(poses[1])[nhit])) < 0.02  # no half-pixel offset
+        near.raycast(poses[1], rect=(13, 7, 41, 30))  # only a window of the view, the rest cleared
+        wv, wn = near.model_maps()
+        assert (wv[7:30, 13:41] == nv[7:30, 13:41]).all() and (wn[7:30, 13:41] == near_n[7:30, 13:41]).all()
+        outside = np.ones(wv.shape[:2], bool)
+        outside[7:30, 13:41] = False
+        assert not wv[outside].any() and not wn[outside].any() and nhit[outside].any()
         scene = o3d.t.geometry.RaycastingScene()
         scene.add_triangles(o3c.Tensor(ov.astype(np.float32)), o3c.Tensor(otri.astype(np.uint32)))
         assert np.median(scene.compute_distance(o3c.Tensor(v.astype(np.float32))).numpy()) < 1e-3  # Open3D's mesh

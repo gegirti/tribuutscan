@@ -970,6 +970,36 @@ cubes on the GPU; the CPU keeps the 6x6 solve, markers, base votes, pose graph, 
   - Viewer: while scanning, the depth preview shows a centre mark (the first frame's object is what
     it hits) and a red frame while tracking is lost. The hint now says "aim at a part already scanned,
     or move back".
+- LIVE SPEED, step 1 (2026-11-02, item 2). The desktop was busy all along (load 8-20: Firefox at 90%),
+  so timings swing +-15% between runs. Compare only runs made back to back.
+  - The ray cast covers only the piece's pixels plus a margin (the coarse level's 30 mm reach at the
+    piece's nearest point, + 16 px), and the rest of the maps is cleared: Params.rect (PARAMS_BYTES
+    352), Engine.raycast(rect=), Tracker.source(near_mm=). Hand: 11.9 -> ~6-7 ms; tracking identical.
+  - MERGE_MIN_S 0.25: the point cloud (and Optimise's keyframes with their ORB) takes a keyframe at
+    most every 0.25 s of frame time. The GPU tracking volume still fuses every keyframe (3 mm / 2
+    degrees): capping that too made synth ATE 0.35 -> 2.6 mm. Result: tracking identical; clouds
+    cleaner (doubled hand 1.85 -> 0.5%, synth 1.3 -> 0.4%; truth mm 0.33 -> 0.27, synthfp 0.13 ->
+    0.10); handgap 275 -> 314 tracked. Synthetic meshes from 28 frames instead of 67: synth 0.056 ->
+    0.066 mm, synthfp 0.084 -> 0.049 (p90 0.93 -> 0.19), plate 0.118 -> 0.113. The marker recording
+    (3.3 fps) is barely touched. Tracker "gpu-allmerge" keeps the old rule.
+  - Live raw copy on its own thread (livescan.RawCopy, a 30-set queue: no frame dropped, a full disk
+    stops it): it took 34 ms of each frame in the live session.
+  - Marker search on every 4th frame after 15 frames without markers (live detection only; evaluate's
+    cached detections are unaffected): hand 7-12 -> 2.4 ms.
+  - scene.masks takes the tracking piece (`piece=`) instead of its own centre piece: one or two flood
+    fills less (markers: scatter 0.931 -> 0.934, region 180 -> 182 mm).
+  - gputrack.ITERATIONS (3, 3, 8) instead of (5, 5, 8): 10 -> 8.3 passes per frame, ATE synth 0.35
+    -> 0.37, synthhard 0.33 -> 0.28 mm. (2, 2, 6) lost synth (2.4 mm).
+  - The live worker read the cloud's point count under the cloud lock every frame, and a merge holds
+    it ~90 ms: now Scanner.points_kept, updated by each merge.
+  - Measured and dropped: sys.setswitchinterval(0.5 ms) changed nothing; the wall-clock gaps were not
+    a GIL convoy.
+  - bench --live on the hand recording, back to back at load 10-13: 6.3 -> 9.5 fps, 480 tracked
+    (tracking 135 -> 84 ms a frame). Marker recording: 8.5 fps at that load (9.3 this morning, idle).
+  - Stage table on the hand (bench, 66 ms a frame): object piece 12.7, base masks 14, GPU solve 17.6
+    (ray cast 6-7, ICP ~1.4 ms a pass under load), depth -> points 5.7. Merge thread: 191 ms a merge
+    (cloud add 91, ORB 45, depth -> points 26, clean 22). Next for 20 fps: the object / base search on
+    the GPU, fewer readbacks per frame.
 
 ## The person you are working with
 

@@ -334,8 +334,8 @@ Next up:
   - [x] tracking against the fused model on the GPU (9.3 fps through the live worker, offline)
   - [x] tracking that holds a narrow object away from the middle of the view and finds its place again
         after a loss (the first live scan, replayed: 132 -> 480 of 483 frames tracked)
-  - [ ] live scanning at full rate (that recording now runs at about 6 fps, since nearly every frame is
-        tracked and merged: merging into the point cloud holds it back)
+  - [ ] live scanning at full rate (that recording now runs at about 10 fps through the live worker
+        on a busy desktop; next: the object search on the GPU)
 - [ ] **Crop in the 3D view**: for what touches the object (a stand, a cable), which object
       separation keeps.
 - [ ] **Speed** (measured on the marker scan: 247 ms per frame, about 4 fps):

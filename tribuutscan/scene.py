@@ -183,10 +183,12 @@ class Scene:
         """Which points (camera coordinates) are the object (see `masks`)."""
         return self.masks(xyz_cam, pix, shape, cam_to_region)[0]
 
-    def masks(self, xyz_cam, pix, shape, cam_to_region):
+    def masks(self, xyz_cam, pix, shape, cam_to_region, piece=None):
         """(object, base) masks of the points (camera coordinates). The base is the plane's points
         inside the object's cylinder; empty while no plane is known (then the object is the centre
-        piece inside the ball)."""
+        piece inside the ball). `piece` (bool mask): the frame's piece as tracking found it, used in
+        place of the centre piece (cl.Scanner's source: what is connected to the core, the centre
+        missing or not; one flood fill less, two when the centre misses)."""
         mask = np.zeros(len(xyz_cam), bool)
         if self.plane is None:
             return self._ball_mask(xyz_cam, pix, shape, cam_to_region), mask.copy()
@@ -208,8 +210,8 @@ class Scene:
         r = np.linalg.norm(flat - axis, axis=1)
         inside = (r <= self.radius) & (h[idx] <= self.top)
         core = inside & (r <= self.radius - REGION_MARGIN_MM) & (h[idx] <= self.top - REGION_MARGIN_MM)
-        piece = cl.centre_piece(pts, pix[idx], shape)  # what the middle of the view hits...
-        if not (piece & core).any():  # ...unless that is not the object: then whatever is in its core
+        piece = cl.centre_piece(pts, pix[idx], shape) if piece is None else piece[idx]  # what the middle of
+        if not (piece & core).any():  # the view hits, unless that is not the object: then whatever is in its core
             self.off_centre += 1
             piece = cl.connected_piece(pts, core) if core.any() else core
         hh, ww = shape

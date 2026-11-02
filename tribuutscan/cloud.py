@@ -49,6 +49,9 @@ OUTPUT_CELL_MM = 3.0  # connectivity of the saved cloud: cubes further apart tha
 
 KEY_MOVE_MM, KEY_TURN_DEG = 3.0, 2.0  # merge a frame after this much motion since the last one...
 KEY_EVERY = 10  # ...or every 10th tracked frame anyway (a still scanner keeps averaging the view)
+MERGE_MIN_S = 0.25  # ...into the point cloud at most one per this much frame time (the GPU tracker's volume takes
+    # every such frame: capping it too made synthetic tracking 0.35 -> 2.6 mm worse): at 10-30 fps nearly every
+    # frame moved 3 mm, and the merges (point cloud + keyframe ORB, ~190 ms each) took the tracking thread's CPU
 MAX_STEP_MM, MAX_STEP_DEG = 30.0, 15.0  # larger jumps between tracked frames are tracking failures
 RELOCK_FITNESS = 0.6  # after a loss, a frame must match this share of its points to the cloud so far
 RELOCK_MAX_SCALE = 2.0  # a re-found pose may be at most this many normal steps from the last good one
@@ -62,6 +65,7 @@ REFIND_MM_S, REFIND_DEG_S, REFIND_SLACK = 300.0, 60.0, (50.0, 15.0)  # ...and mu
     # a full circle round the object in 6 s is a fast walk; a faster turn only delays the re-find. The plate's
     # mirrored re-find turned 136 degrees in 1.35 s (truly ~45); the real ones 18-31 degrees after 19-27 s
 REFIND_HOLD = 2  # frames tracked after a pose found anywhere before merging resumes
+MARKER_IDLE_FRAMES, MARKER_IDLE_EVERY = 15, 4  # no markers seen for this long: look on every 4th frame only
 FLOOR_MAX_DEG = 2.5  # a taken pose tilts the kept base at most this much from the frame's own table...
 FLOOR_OTHER_DEG, FLOOR_MIN_SPAN_MM = 15.0, 150.0  # ...a plane further off, or narrower, says nothing
 OBJECT_ABOVE_MM = 3.0  # (scene.py) the object starts this far above the table
@@ -482,7 +486,7 @@ class Scanner:
 
     def __init__(self, preset="small", log=print, clean_depth="merge", gate_refind=True, motion_dt=True,
                  mode="still", track_with="joint", target="model", use_features=True, threaded_merge=True,
-                 remove_base=True, segment_stride=None, orb=None):
+                 remove_base=True, segment_stride=None, orb=None, merge_min_s=None):
         try:
             from . import fuse  # Open3D: frame-to-frame ICP
         except ImportError:
@@ -551,6 +555,10 @@ class Scanner:
         self.last_t, self.motion_s, self.lost_run = None, None, 0  # time of the last tracked frame, of `motion`
         self.frame_table = None  # this frame's own table: (normal, narrower extent mm), for floor_agrees
         self.hold, self.refind_feat = 0, None  # refind_anywhere's state
+        self.merge_t = None  # frame time of the last merge
+        self.merge_min_s = MERGE_MIN_S if merge_min_s is None else merge_min_s
+        self.no_markers = 0  # frames since markers were last seen (frame_markers)
+        self.points_kept = 0  # cubes seen MIN_SEEN times after the last merge (read without the cloud lock)
         self.track_log = []  # per frame: (index, status, pose or None); for evaluation
         self.on_merge = None  # optional callback(index, world_xyz_mm, rgb, world_normals, pose)
         self.remove_base = remove_base  # the saved/shown cloud leaves the base out (it is merged either way)
@@ -678,7 +686,7 @@ class Scanner:
         if scene.mode == "still":  # the object (above the kept base, in its region) and the base under it
             to_world = scene_transform(self.pose)  # (every tracked frame: the region grows per frame)
             scene.observe(all_xyz, all_pix, shape, to_world)
-            obj, base = scene.masks(all_xyz, all_pix, shape, to_world)
+            obj, base = scene.masks(all_xyz, all_pix, shape, to_world, keep)
             pix = all_pix[obj | base]
             self.last_view = (all_pix, obj, base, shape)
         else:
@@ -695,7 +703,12 @@ class Scanner:
             move, turn = turned(np.linalg.inv(self.last_merged) @ self.pose)
             if fuse is not None and move < KEY_MOVE_MM and turn < KEY_TURN_DEG and self.since_merge < KEY_EVERY:
                 return False
-        self.since_merge = 0
+        self.since_merge, self.last_merged = 0, self.pose.copy()
+        if self.gpu is not None:  # into the volume the next frame is tracked against: every such frame (cheap)
+            self.gpu.fuse(frame, self.labels[index], self.pose)
+        if t is not None and self.merge_t is not None and t - self.merge_t < self.merge_min_s:
+            return False  # the point cloud and Optimise's keyframes take one every MERGE_MIN_S at most
+        self.merge_t = t
         if self.gpu is not None:  # keyframe for Optimise / continuing a scan
             from .gputrack import grid_points
             self.keyframes.append((index, self.pose.copy(), grid_points(xyz), feat, marker_pts))
@@ -709,12 +722,9 @@ class Scanner:
         elif self.prev is not None and self.prev is not True:
             self.keyframes.append((index, self.pose.copy(), np.asarray(self.prev[-1].points) * 1000,
                                    self.prev_feat, marker_pts if joint else np.empty((0, 3))))
-        self.last_merged = self.pose.copy()
         self.poses.append((index, self.pose.copy()))
         stats["merged"] += 1
         job = (frame, index, self.pose.copy(), pix, seg)
-        if self.gpu is not None:  # into the volume the next frame is tracked against (here, not in the merge thread)
-            self.gpu.fuse(frame, self.labels[index], self.pose)
         if self.merger is None:
             self.merge(*job)
         else:  # merging runs beside tracking the next frame (numpy and Open3D release the GIL)
@@ -744,6 +754,7 @@ class Scanner:
         world_nrm = mnrm @ pose[:3, :3].T
         with self.cloud_lock:
             self.cloud.add(world, mrgb, world_nrm)
+            self.points_kept = int((self.cloud.seen >= MIN_SEEN).sum())
         if self.on_merge is not None:
             self.on_merge(index, world, mrgb, world_nrm, pose)
         if not self.stats["markers"]:
@@ -769,6 +780,7 @@ class Scanner:
                       nrm.astype(np.float64) @ pose[:3, :3].T)
         with self.cloud_lock:
             self.cloud = cloud
+            self.points_kept = int((cloud.seen >= MIN_SEEN).sum())
         # every tracked frame gets a correction blended from the merged frames on either side of it, within
         # one source recording (held constant instead, the corrections jumped at each merged frame and
         # the mesh fused from every frame came out blurred: p90 0.55 mm against 0.34 from merged frames)
@@ -910,7 +922,7 @@ class Scanner:
             self.gpu = gputrack.Tracker(CAMERA, frame["depth"].shape[::-1],
                                         xyz.mean(0) @ to_world[:3, :3].T + to_world[:3, 3], self.gpu_kind)
             self.log(f"tracking on the GPU: {self.gpu.engine.device_name}")
-        self.gpu.source(frame, pix, self.seg_stride)
+        self.gpu.source(frame, pix, self.seg_stride, float(np.percentile(xyz[:, 2], 2)) if len(xyz) else None)
 
     def close(self):
         """Give the GPU tracker's memory back (after the last frame; the cloud and everything saved stay)."""
@@ -985,12 +997,17 @@ class Scanner:
 
     def frame_markers(self, frame):
         """Camera-frame centres (mm, (N, 3)) of the markers in a frame; uses frame["markers2d"]
-        (pre-detected colour pixels) when given."""
+        (pre-detected colour pixels) when given. While none were seen for MARKER_IDLE_FRAMES frames,
+        markers are looked for only on every MARKER_IDLE_EVERY-th (the search took 7-12 ms a frame
+        live, on a scan without markers)."""
         found = frame.get("markers2d")
         if found is None:
+            if self.no_markers >= MARKER_IDLE_FRAMES and self.stats["frames"] % MARKER_IDLE_EVERY:
+                return np.empty((0, 3))
             from .features import luma_of
             found = markers.detect_fast(luma_of(frame), frame.get("color"))
         pts = [loc[0] for loc in markers.locate(frame["depth"], found) if loc is not None]
+        self.no_markers = 0 if pts else self.no_markers + 1
         return np.array(pts).reshape(-1, 3)
 
     def marker_step(self, frame, guess, index):

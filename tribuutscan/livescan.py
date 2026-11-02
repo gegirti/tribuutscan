@@ -15,7 +15,8 @@ Replies:   ("ready", url) | ("log", text) | ("frame_done", merged, frames, point
 
 With keep_raw, the frames the worker processed are also written to out_dir/<stamp>-rec/ (the
 viewer's recording format, without IR), so a scan can be replayed offline with cloud.py for
-debugging. The copy stops (the scan goes on) when the disk is nearly full (frames.Recorder).
+debugging. The copy stops (the scan goes on) when the disk is nearly full (frames.Recorder). It is
+written beside tracking (RawCopy): in the first live GPU scan it took 34 ms of every frame.
 """
 import io
 import multiprocessing
@@ -39,6 +40,35 @@ PAYLOAD_EVERY_S = 0.5  # rebuild the page's cloud at most this often
 LIVE_MIN_SEEN = 1  # the page shows every cube while scanning; the saved cloud uses cloud.MIN_SEEN
 VIEW_STEP = cl.LABEL_STEP  # the frame's object mask goes back to the viewer at 1/8 of its size (160 x 100)
 view_mask = cl.view_mask  # the same labels the scan keeps for fusing again
+
+
+class RawCopy:
+    """frames.Recorder writes on a thread of their own (zlib and file writes release the GIL). put()
+    waits while QUEUE sets are pending, so no frame is left out; `error` is the DiskFull that stopped it."""
+
+    QUEUE = 30
+
+    def __init__(self, recorder):
+        self.recorder, self.error = recorder, None
+        self.queue = queue.Queue(self.QUEUE)
+        self.thread = threading.Thread(target=self._write, daemon=True)
+        self.thread.start()
+
+    def _write(self):
+        while (item := self.queue.get()) is not None:
+            if self.error is None:
+                try:
+                    self.recorder.write(*item)
+                except fr.DiskFull as e:
+                    self.error = e
+
+    def put(self, bufs, stamps):
+        self.queue.put((bufs, stamps))
+
+    def close(self):
+        self.queue.put(None)
+        self.thread.join()
+        self.recorder.close()
 
 
 class LiveSource:
@@ -160,10 +190,13 @@ def run(commands, replies, port=view3d.PORT):
             if keep_raw:
                 try:
                     if recorder is None:
-                        recorder = fr.Recorder(bytesperline, root=out_dir, extra={"note": "frames a live scan processed"})
+                        recorder = RawCopy(fr.Recorder(bytesperline, root=out_dir,
+                                                       extra={"note": "frames a live scan processed"}))
                         with source.lock:  # its frame 0 is the scanner's next index (continued scans count on)
-                            source.scanner.add_source(recorder.dir.resolve(), source.scanner.stats["frames"])
-                    recorder.write({"color": yuyv, "ir": grey, "depth": depth_buf}, {"color": t_c, "ir": t_i, "depth": t_d})
+                            source.scanner.add_source(recorder.recorder.dir.resolve(), source.scanner.stats["frames"])
+                    if recorder.error is not None:
+                        raise recorder.error
+                    recorder.put({"color": yuyv, "ir": grey, "depth": depth_buf}, {"color": t_c, "ir": t_i, "depth": t_d})
                 except fr.DiskFull as e:
                     keep_raw = False
                     if recorder is not None:
@@ -177,8 +210,7 @@ def run(commands, replies, port=view3d.PORT):
             with source.lock:
                 s = source.scanner
                 s.feed(frame)
-                with s.cloud_lock:
-                    points = int((s.cloud.seen >= cl.MIN_SEEN).sum())
+                points = s.points_kept  # (the cloud lock is held through each ~90 ms merge: no waiting for it)
             timing["raw"] += t1 - t0
             timing["decode"] += t2 - t1
             timing["feed"] += time.perf_counter() - t2

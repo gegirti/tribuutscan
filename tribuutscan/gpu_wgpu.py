@@ -26,6 +26,7 @@ struct Params {
   img: vec4<u32>,   // width, height, frame id, max visible bricks
   trk: vec4<f32>,   // ICP: pixel footprint scale (0: none), reach mm, maps: normal step px; ICP: pixel stride
   base: vec4<f32>,  // ICP: model points with dot(base.xyz, q) + base.w <= 0 are the base, left out
+  rect: vec4<u32>,  // ray cast: the pixels x0, y0 (in) to x1, y1 (out) it covers; x1 = 0: the whole image
 }
 @group(0) @binding(0) var<uniform> P: Params;
 const EMPTY: u32 = 0xffffffffu;
@@ -249,9 +250,11 @@ fn sample(p: vec3<f32>) -> vec2<f32> {  // trilinear TSDF, and 1 if it is known 
                     + w011 * c011.x + w111 * c111.x) / total, 1.0);
 }
 @compute @workgroup_size(16, 16)
-fn main(@builtin(global_invocation_id) g: vec3<u32>) {
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let w = P.img.x;
-  if (g.x >= w || g.y >= P.img.y) { return; }
+  let g = gid.xy + P.rect.xy;
+  let whole = P.rect.z == 0u;
+  if (g.x >= select(P.rect.z, w, whole) || g.y >= select(P.rect.w, P.img.y, whole)) { return; }
   let i = g.y * w + g.x;
   vout[i] = vec4<f32>(0.0);
   nout[i] = vec4<f32>(0.0);
@@ -1026,13 +1029,24 @@ class Engine:
                    ("integrate", "indirect")])
         self.frames += 1
 
-    def raycast(self, pose, min_weight=gpu.RAY_MIN_WEIGHT, normal_px=0):
+    def raycast(self, pose, min_weight=gpu.RAY_MIN_WEIGHT, normal_px=0, rect=None):
         """Ray cast the volume from `pose` (camera -> world, mm) into the model maps (kept on the GPU);
         normals from the TSDF's gradient, or with `normal_px` from the hits that many pixels away (as
-        the frame's maps)."""
-        self._params("ray", pose=pose, min_weight=min_weight, normal_step=normal_px)
+        the frame's maps). `rect` (x0, y0, x1, y1): only those pixels, the rest of the maps cleared."""
         img = self._image_groups()
-        self._run([("raycast", img)] + ([("model_normals", img)] if normal_px else []))
+        if rect is None:
+            self._params("ray", pose=pose, min_weight=min_weight, normal_step=normal_px)
+            self._run([("raycast", img)] + ([("model_normals", img)] if normal_px else []))
+            return
+        x0, y0, x1, y1 = (int(v) for v in rect)
+        x1, y1 = max(x1, x0 + 1), max(y1, y0 + 1)
+        self._params("ray", pose=pose, min_weight=min_weight, normal_step=normal_px, rect=(x0, y0, x1, y1))
+        enc = self.device.create_command_encoder()
+        enc.clear_buffer(self.rvmap)
+        enc.clear_buffer(self.rnmap)
+        self.device.queue.submit([enc.finish()])
+        self._run([("raycast", ((x1 - x0 + 15) // 16, (y1 - y0 + 15) // 16))]
+                  + ([("model_normals", img)] if normal_px else []))
 
     def icp(self, pose, ref_pose, centre, **options):
         """ICP sums (gpu.icp_sums) of the last fused/uploaded frame's maps at `pose` against the last ray
