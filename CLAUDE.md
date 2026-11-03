@@ -1256,6 +1256,11 @@ cubes on the GPU; the CPU keeps the 6x6 solve, markers, base votes, pose graph, 
   - End to end with the scanner: Stop, then meshed 6 s later, "closed for printing".
   - Possible next: with no base, cut perpendicular to the turntable axis (from the tracked poses) at the lowest
     scanned point.
+- Optimise's message (2026-11-03) gives the largest correction AT THE OBJECT: how far a keyframe's view of the
+  object moves in the world, plus the turn in degrees. The camera's move ("largest_correction_mm") is still in
+  optimise.json and evaluate's "corr mm"; "corr obj" is the new one. First platform recording replayed with
+  all of 2026-11-03's code: 505 of 505 tracked (live 465), Optimise 117 loops, 0.32 mm at the object (0.51
+  degrees), 2.99 mm at the camera.
 - LIVE SPEED, step 4 (2026-11-02, plan approved): a live frame's depth decoded where it is used.
   - The decode paths:
     - `depth.decode_strided`: the first pixel of each packed group, every 4th row, plus the

@@ -307,7 +307,7 @@ def show(results, against=None):
             ("mesh.tracked.median", "mesh mm"), ("mesh.true_poses.median", "fused mm"),
             ("mesh.tracked.covered_1mm", "mesh cov"), ("mesh.closed.median", "closed mm"),
             ("mesh.closed.covered_1mm", "closed cov"),
-            ("optimise.loops_kept", "loops"), ("optimise.largest_correction_mm", "corr mm"), ("region_mm", "region mm"),
+            ("optimise.loops_kept", "loops"), ("optimise.largest_correction_mm", "corr mm"), ("optimise.largest_correction_at_object_mm", "corr obj"), ("region_mm", "region mm"),
             ("ms_per_frame", "ms")]
     print(f"{'dataset':9s} " + " ".join(f"{h:>14s}" for _, h in cols))
     for r in results:

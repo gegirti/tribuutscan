@@ -147,7 +147,15 @@ def optimise(scanner, log=print):
             k["feat"] = object_features(k["feat"], scanner.scene, k["pose"])
     new_poses, report = optimise_poses(kfs, scanner.rng, log)
     moved = [np.linalg.norm((np.linalg.inv(a["pose"]) @ b)[:3, 3]) * 1000 for a, b in zip(kfs, new_poses)]
-    report["largest_correction_mm"] = round(float(max(moved)), 2) if moved else 0.0
+    report["largest_correction_mm"] = round(float(max(moved)), 2) if moved else 0.0  # (at the camera)
+    at_object, turned = [], []
+    for k, b in zip(kfs, new_poses):  # where each keyframe's view of the object moves: what the surface feels
+        c = k["points"].mean(0) / 1000 if len(k["points"]) else np.zeros(3)
+        at_object.append(np.linalg.norm((b[:3, :3] - k["pose"][:3, :3]) @ c + b[:3, 3] - k["pose"][:3, 3]) * 1000)
+        r = (np.linalg.inv(k["pose"]) @ b)[:3, :3]
+        turned.append(np.degrees(np.arccos(np.clip((np.trace(r) - 1) / 2, -1, 1))))
+    report["largest_correction_at_object_mm"] = round(float(max(at_object)), 2) if at_object else 0.0
+    report["largest_correction_deg"] = round(float(max(turned)), 2) if turned else 0.0
     scanner.remerge({k["index"]: p for k, p in zip(kfs, new_poses)})
     return report
 
@@ -185,7 +193,7 @@ def process(scanner, directory, action, log=print):
         scanner.save(directory)
         (directory / "optimise.json").write_text(json.dumps(report, indent=2))
         return (f"optimised: {report['loops_kept']} loop closures, largest correction "
-                f"{report['largest_correction_mm']} mm")
+                f"{report['largest_correction_at_object_mm']} mm at the object ({report['largest_correction_deg']} degrees)")
     if action in cl.PRESETS_MM:
         scanner.remerge({}, point_mm=cl.PRESETS_MM[action])
         scanner.preset = action
