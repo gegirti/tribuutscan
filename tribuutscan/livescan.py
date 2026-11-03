@@ -125,7 +125,7 @@ class LiveSource:
                     "cue": dict(s.cue)}}
                 self.cached = ("-".join(map(str, key)), payload, info)
                 self.built_key, self.built_at = key, time.time()
-            return self.cached[0], self.cached[1], dict(self.cached[2], mesh=view3d.mesh_version(self.mesh_path()))
+            return self.cached[0], self.cached[1], dict(self.cached[2], **view3d.mesh_versions(self.mesh_path()))
 
 
     def process(self, action):

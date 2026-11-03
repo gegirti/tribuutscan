@@ -72,7 +72,8 @@
   <div class="menu"><button>Export</button><ul>
     <li id="dl-ply">Download cloud.ply</li>
     <li id="dl-mesh" class="later">Download mesh.ply<small>make a mesh first</small></li>
-    <li id="dl-stl" class="later">Download mesh.stl<small>mm, for slicers</small></li>
+    <li id="dl-stl" class="later">Download mesh.stl<small>mm, closed, for slicers</small></li>
+    <li id="dl-solid" class="later">Download solid.ply<small>closed, with colour: Blender</small></li>
     <li id="dl-png">Save view as PNG</li>
   </ul></div>
   <div class="menu"><button>View</button><ul>
@@ -93,6 +94,7 @@
   <select id="show">
     <option value="cloud">Cloud</option>
     <option value="mesh" disabled>Mesh (make one first)</option>
+    <option value="solid" disabled>Solid (make a mesh first)</option>
   </select>
   <div id="sizebox">
     <label for="size">Point size</label>
@@ -127,7 +129,8 @@ const headlight = new THREE.DirectionalLight(0xffffff, 1.6);
 camera.add(headlight);  // lights the mesh from where you look
 scene.add(camera);
 let points = null, data = null, version = null, pointMm = 1, framed = false, messageAt = 0;
-let mesh = null, meshVersion = null, meshRgb = null;
+const shapes = { mesh: { obj: null, version: null, rgb: null }, solid: { obj: null, version: null, rgb: null } };
+const SHAPE_NAMES = { mesh: "Mesh", solid: "Solid" };  // the scanned surface; the closed solid (as the STL)
 const $ = (id) => document.getElementById(id);
 
 function resize() {
@@ -163,42 +166,53 @@ function colours() {
   return out;
 }
 
-function meshColours() {  // camera colour, or plain grey for the shape
-  const n = meshRgb.length / 3, out = new Float32Array(n * 3);
-  if ($("mode").value === "rgb") for (let i = 0; i < n * 3; i++) out[i] = meshRgb[i] / 255;
+function meshColours(kind) {  // camera colour, or plain grey for the shape
+  const rgb = shapes[kind].rgb, n = rgb.length / 3, out = new Float32Array(n * 3);
+  if ($("mode").value === "rgb") for (let i = 0; i < n * 3; i++) out[i] = rgb[i] / 255;
   else out.fill(0.72);
   return out;
 }
 
-async function loadMesh() {
-  const buf = await (await fetch("mesh.bin")).arrayBuffer();
+async function loadMesh(kind) {  // "mesh" or "solid"
+  const buf = await (await fetch(`${kind}.bin`)).arrayBuffer();
   const [n, m] = new Uint32Array(buf, 0, 2);
   const xyz = new Float32Array(buf, 8, n * 3);
   const rgbAt = 8 + n * 12, idxAt = rgbAt + n * 3 + ((4 - (n * 3) % 4) % 4);
-  meshRgb = new Uint8Array(buf, rgbAt, n * 3);
+  const shape = shapes[kind];
+  shape.rgb = new Uint8Array(buf, rgbAt, n * 3);
   const geometry = new THREE.BufferGeometry();
   geometry.setAttribute("position", new THREE.BufferAttribute(xyz, 3));
-  geometry.setAttribute("color", new THREE.BufferAttribute(meshColours(), 3));
+  geometry.setAttribute("color", new THREE.BufferAttribute(meshColours(kind), 3));
   geometry.setIndex(new THREE.BufferAttribute(new Uint32Array(buf, idxAt, m * 3), 1));
   geometry.computeVertexNormals();
-  if (mesh) { scene.remove(mesh); mesh.geometry.dispose(); }
-  mesh = new THREE.Mesh(geometry, meshMaterial);
-  scene.add(mesh);
+  dropShape(kind);
+  shape.obj = new THREE.Mesh(geometry, meshMaterial);
+  scene.add(shape.obj);
   showWhich();
 }
 
-function showWhich() {  // the cloud or the mesh
-  const wantMesh = $("show").value === "mesh" && mesh;
-  if (points) points.visible = !wantMesh;
-  if (mesh) mesh.visible = !!wantMesh;
-  $("sizebox").style.display = wantMesh ? "none" : "";
+function dropShape(kind) {
+  const shape = shapes[kind];
+  if (shape.obj) { scene.remove(shape.obj); shape.obj.geometry.dispose(); shape.obj = null; }
+}
+
+function shown() {  // what is on screen: the chosen shape when it is there, else the cloud
+  const shape = shapes[$("show").value];
+  return shape && shape.obj ? shape.obj : points;
+}
+
+function showWhich() {  // the cloud, the mesh or the solid
+  const on = shown();
+  if (points) points.visible = on === points;
+  for (const kind in shapes) if (shapes[kind].obj) shapes[kind].obj.visible = shapes[kind].obj === on;
+  $("sizebox").style.display = on === points ? "" : "none";
 }
 
 function frame() {
-  const shown = $("show").value === "mesh" && mesh ? mesh : points;
-  if (!shown) return;
-  shown.geometry.computeBoundingSphere();
-  const s = shown.geometry.boundingSphere;
+  const shown_ = shown();
+  if (!shown_) return;
+  shown_.geometry.computeBoundingSphere();
+  const s = shown_.geometry.boundingSphere;
   controls.target.copy(s.center);
   camera.position.copy(s.center).add(new THREE.Vector3(0, 0, s.radius * 2.6));
   camera.near = s.radius / 100; camera.far = s.radius * 100;
@@ -249,17 +263,20 @@ async function poll() {
       $("status").innerHTML = info.phase === "optimising" ? "<b>●</b> optimising…" : "<b>●</b> connected";
     $("dl-mesh").classList.toggle("later", !info.mesh);
     $("dl-stl").classList.toggle("later", !info.mesh);
-    const meshOption = $("show").options[1];
-    meshOption.disabled = !info.mesh;
-    meshOption.textContent = info.mesh ? "Mesh" : "Mesh (make one first)";
-    if (info.mesh && info.mesh !== meshVersion) {
-      meshVersion = info.mesh;
-      await loadMesh();
-      $("show").value = "mesh";  // a new mesh: show it
-      showWhich();
-    } else if (!info.mesh && mesh) {
-      scene.remove(mesh); mesh.geometry.dispose(); mesh = null; meshVersion = null;
-      $("show").value = "cloud"; showWhich();
+    $("dl-solid").classList.toggle("later", !info.solid);
+    for (const kind in shapes) {
+      const option = $("show").querySelector(`option[value="${kind}"]`), shape = shapes[kind];
+      option.disabled = !info[kind];
+      option.textContent = info[kind] ? SHAPE_NAMES[kind] : `${SHAPE_NAMES[kind]} (make a mesh first)`;
+      if (info[kind] && info[kind] !== shape.version) {
+        shape.version = info[kind];
+        await loadMesh(kind);
+        if (kind === "mesh") { $("show").value = "mesh"; showWhich(); }  // a new mesh: show it
+      } else if (!info[kind] && shape.obj) {
+        dropShape(kind); shape.version = null;
+        if ($("show").value === kind) $("show").value = "cloud";
+        showWhich();
+      }
     }
   } catch (e) {
     $("status").textContent = "server stopped";
@@ -270,7 +287,8 @@ async function poll() {
 $("size").addEventListener("input", () => { material.size = pointMm / 1000 * $("size").value; });
 $("mode").addEventListener("change", () => {
   if (points) points.geometry.setAttribute("color", new THREE.BufferAttribute(colours(), 3));
-  if (mesh) mesh.geometry.setAttribute("color", new THREE.BufferAttribute(meshColours(), 3));
+  for (const kind in shapes)
+    if (shapes[kind].obj) shapes[kind].obj.geometry.setAttribute("color", new THREE.BufferAttribute(meshColours(kind), 3));
 });
 $("show").addEventListener("change", showWhich);
 $("reset").addEventListener("click", frame);
@@ -278,6 +296,7 @@ window.addEventListener("keydown", (e) => { if (e.key === "r" || e.key === "R") 
 $("dl-ply").addEventListener("click", () => { location.href = "cloud.ply"; });
 $("dl-mesh").addEventListener("click", () => { if (!$("dl-mesh").classList.contains("later")) location.href = "mesh.ply"; });
 $("dl-stl").addEventListener("click", () => { if (!$("dl-stl").classList.contains("later")) location.href = "mesh.stl"; });
+$("dl-solid").addEventListener("click", () => { if (!$("dl-solid").classList.contains("later")) location.href = "solid.ply"; });
 document.querySelectorAll("[data-action]").forEach((li) => li.addEventListener("click", async () => {
   $("status").textContent = `working: ${li.textContent.trim()}…`;
   messageAt = Date.now() + 600000;  // until the answer comes

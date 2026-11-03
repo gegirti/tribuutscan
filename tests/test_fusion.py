@@ -127,6 +127,13 @@ def test_a_scan_meshes_the_same_on_the_gpu_and_on_the_cpu():
                 meshes[choice] = (report, np.stack([rec_ply["x"], rec_ply["y"], rec_ply["z"]], 1) * 1000, faces)
                 assert json.loads((out / "mesh.json").read_text())["triangles"] == report["triangles"] > 1000
             assert meshes["0"][0]["engine"] == "open3d-cpu"
+            from tribuutscan import solid
+            assert report["solid"]["edges_closed"]  # the closed solid with its colours, for Blender
+            rec_solid, faces_solid = view3d.read_ply(out / "solid.ply", faces=True)
+            assert solid.edges_closed(faces_solid) and rec_solid["red"].max() > 0
+            assert view3d.mesh_versions(out / "mesh.ply")["solid"] is not None
+            fusion.make_mesh(out, log=lambda *a: None, close=False)  # an open mesh drops the old solid
+            assert not (out / "solid.ply").exists() and view3d.mesh_versions(out / "mesh.ply")["solid"] is None
             if meshes["auto"][0]["engine"].startswith("wgpu"):
                 import open3d as o3d
                 scene = o3d.t.geometry.RaycastingScene()

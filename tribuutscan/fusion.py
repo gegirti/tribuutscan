@@ -2,9 +2,9 @@
 
     .venv/bin/python -m tribuutscan.fusion captures/<stamp>-scan [--all] [--voxel 0.5] [--min-weight 4] [--force] [--open]
 
-Writes mesh.ply (metres, y up, z toward the scanner, vertex colour: like cloud.ply; the scanned surface) and
+Writes mesh.ply (metres, y up, z toward the scanner, vertex colour: like cloud.ply; the scanned surface),
 mesh.stl (mm, same axes, for slicers: the surface closed into a solid, solid.py; --open: the scanned
-surface as it is) into the scan. The frames come from the scan's source recordings
+surface as it is) and solid.ply (that solid with colour, metres: for Blender) into the scan. The frames come from the scan's source recordings
 (session.json "sources"), each at its tracked pose and only over its own object/base pixels
 (labels.npz). By default only the frames the cloud merged (the keyframes, whose poses Optimise
 corrects): on the marker scan they gave p90 0.34 mm against Creality's mesh, every tracked frame 0.53
@@ -305,14 +305,21 @@ def fuse_scan(directory, which="merged", voxel_mm=VOXEL_MM, trunc_voxels=TRUNC_V
 
 def write_mesh(directory, vertices, triangles, colours, printable=None):
     """mesh.ply (metres, like cloud.ply, vertex colour and normals: the scanned surface) and mesh.stl (mm, for
-    slicers: `printable` (vertices, triangles), the closed solid, else the scanned surface); same axes.
-    Written to temporary names first: a page polling for the mesh never reads half a file."""
+    slicers: `printable` (vertices, triangles, colours), the closed solid, else the scanned surface); with a
+    solid also solid.ply (the closed solid with its colours, metres: for Blender). Same axes. Written to
+    temporary names first: a page polling for the mesh never reads half a file."""
     directory = Path(directory)
     xyz = vertices @ FLIP.T
     tmp = directory / "mesh.ply.tmp"
     pc.write_mesh_ply(tmp, (xyz / 1000).astype(np.float32), colours, triangles, pc.vertex_normals(xyz, triangles))
     if printable is not None:
-        xyz, triangles = printable[0] @ FLIP.T, printable[1]
+        xyz, triangles, rgb = printable[0] @ FLIP.T, printable[1], printable[2]
+        rgb = np.full((len(xyz), 3), 200, np.uint8) if rgb is None else rgb
+        pc.write_mesh_ply(directory / "solid.ply.tmp", (xyz / 1000).astype(np.float32), rgb, triangles,
+                          pc.vertex_normals(xyz, triangles))
+        (directory / "solid.ply.tmp").replace(directory / "solid.ply")
+    elif (directory / "solid.ply").exists():
+        (directory / "solid.ply").unlink()  # (an older one: it no longer matches the mesh)
     mesh = o3d.geometry.TriangleMesh(o3d.utility.Vector3dVector(xyz), o3d.utility.Vector3iVector(triangles.astype(np.int32)))
     mesh.compute_triangle_normals()
     o3d.io.write_triangle_mesh(str(directory / "mesh.tmp.stl"), mesh)  # Open3D picks the format by the extension
@@ -346,8 +353,8 @@ def make_mesh(directory, which="merged", voxel_mm=VOXEL_MM, min_weight=MIN_WEIGH
         from . import solid
         plane = printing_plane(scanner, vertices)
         try:
-            v, t, _, report["solid"] = solid.close(vertices, triangles, colours, plane)
-            printable = (v, t) if report["solid"]["edges_closed"] else None
+            v, t, c, report["solid"] = solid.close(vertices, triangles, colours, plane)
+            printable = (v, t, c) if report["solid"]["edges_closed"] else None
         except Exception as e:  # (the scanned surface goes out as the STL then)
             report["solid"] = {"edges_closed": False, "error": str(e)}
     write_mesh(directory, vertices, triangles, colours, printable)
@@ -369,7 +376,8 @@ def main():
     report = make_mesh(paths[0], "all" if "--all" in sys.argv else "merged", voxel, weight, "--force" in sys.argv,
                        close="--open" not in sys.argv)
     print(json.dumps(report, indent=2))
-    print(f"-> {paths[0] / 'mesh.ply'}, mesh.stl")
+    solid_ply = ", solid.ply" if (paths[0] / "solid.ply").exists() else ""
+    print(f"-> {paths[0] / 'mesh.ply'}, mesh.stl{solid_ply}")
 
 
 if __name__ == "__main__":

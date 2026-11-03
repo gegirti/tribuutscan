@@ -84,7 +84,7 @@ right: Scanner, Capture, Scan, IMU and View.
 - **Start scan (c)**: stay 18-30 cm from the object in close range, 30-50 cm in long range (the
   guide line under the images shows the distance), move steadily, keep markers in view if there are
   any. **Stop scan (c)** saves `captures/<stamp>-scan/cloud.ply`, runs Optimise and makes the mesh
-  (`mesh.ply`, `mesh.stl`; *Mesh after Stop*, on by default, about 15-20 s with a GPU). *Remove base* (on
+  (`mesh.ply`, `mesh.stl`, `solid.ply`; *Mesh after Stop*, on by default, about 15-20 s with a GPU). *Remove base* (on
   by default) leaves the table under the object out of the result. While scanning, the depth view
   dims everything that is not the object and, with a GPU, paints the scan so far over it, as seen
   from where the scanner is: **grey** where the mesh will have the surface, **yellow** where it needs
@@ -106,11 +106,11 @@ right: Scanner, Capture, Scan, IMU and View.
     left out of the result.
 - **Open 3D view**: the scan in the browser. *Process* has Optimise again, merge again at
   0.5 / 1 / 2 mm point distance, Make mesh, and Remove base / Keep base; *Show* switches between
-  the cloud and the mesh (*Colour: Grey* shows its shape); *Export* downloads `cloud.ply`,
-  `mesh.ply` (metres, like the cloud: the scanned surface) and `mesh.stl` (millimetres, for
-  slicers). The STL is closed into a solid: what the scanner never saw (fingertips seen only from the
-  side, the bottom of a stand) is filled in smoothly, and it is cut flat where the object stood on its
-  base.
+  the cloud, the mesh and the solid (*Colour: Grey* shows the shape); *Export* downloads `cloud.ply`,
+  `mesh.ply` (metres, like the cloud: the scanned surface), `mesh.stl` (millimetres, for
+  slicers) and `solid.ply` (the STL's solid with the scan's colours, metres: for Blender). The STL is
+  closed into a solid: what the scanner never saw (fingertips seen only from the side, the bottom of a
+  stand) is filled in smoothly, and it is cut flat where the object stood on its base.
 - **Save frame (s)** writes one colour + IR + depth set (and a `cloud.ply`) to `captures/<stamp>/`.
   **Record (r)** writes colour + depth sets at 30 (or 10) a second, plus the IMU's samples
   (`imu.csv`, 200 a second), for processing later. Depth is compressed losslessly and IR is left

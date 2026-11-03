@@ -656,6 +656,10 @@ centre piece, and the table connected the part to its surroundings.
 See the README TODO. The USB-capture idea is no longer needed: vendor.py reads and switches the
 depth modes directly.
 
+LATER (the user, 2026-11-03): "tricks like creating pseudo geometry by texture": colour photos (the scanner's
+colour frames, or photos taken separately) adding surface detail the depth can't resolve: shading or
+photometric normals, normal or displacement maps for Blender, photogrammetric refinement. After Phase 5.
+
 GPU PIPELINE (approved 2026-11-01, the user's top priority, several sessions): a GPU-resident,
 KinectFusion-style pipeline (depth maps, TSDF fusion, ray casting, frame-to-model tracking, marching
 cubes on the GPU; the CPU keeps the 6x6 solve, markers, base votes, pose graph, ORB when lost).
@@ -1259,6 +1263,10 @@ cubes on the GPU; the CPU keeps the 6x6 solve, markers, base votes, pose graph, 
     degrees, pointing the way the cameras' up does), at the lowest scanned point (`fusion.printing_plane`).
     - synthturn's closed solid: 98.5% of the true block within 1 mm (Poisson's own bottom: 71.7%), added 29%
       (51%), median 0.104 mm.
+  - solid.ply (Phase 5, 2026-11-03): the closed solid with colour (Poisson's interpolated vertex colours), metres
+    and axes as mesh.ply, for Blender; only when the solid closed (a stale one is removed). The 3D page: Show
+    Solid, Export "Download solid.ply" (/solid.bin, /solid.ply; info.json "solid" = its mtime). The 09:22
+    platform replay: 18.7 MB, colours as on the open mesh (grey fingertips are what the scan saw).
     - The 17:07 replay (no view from above, no base): closed, flat-bottomed, 14% added.
 - Optimise's message (2026-11-03) gives the largest correction AT THE OBJECT: how far a keyframe's view of the
   object moves in the world, plus the turn in degrees. The camera's move ("largest_correction_mm") is still in

@@ -82,6 +82,12 @@ def mesh_version(path):
     return str(path.stat().st_mtime_ns) if path is not None and path.exists() else None
 
 
+def mesh_versions(mesh_path):
+    """info.json's "mesh" and "solid" (the closed solid beside the mesh, fusion.write_mesh) versions."""
+    return {"mesh": mesh_version(mesh_path),
+            "solid": mesh_version(None if mesh_path is None else mesh_path.with_name("solid.ply"))}
+
+
 def pack_arrays(xyz, rgb=None, seen=None):
     """Binary payload for the page: u32 count, u32 has_seen, f32 xyz, u8 rgb (padded to 4), u16 seen."""
     n = len(xyz)
@@ -129,7 +135,7 @@ class FileSource:
                 session = json.loads(self.session.read_text()) if self.session.exists() else {}
                 self.info = {"name": self.ply.parent.name, "points": len(rec), "session": session, "phase": "done"}
                 self.version = version
-            return self.version, self.payload, dict(self.info, mesh=mesh_version(self.mesh_path()))
+            return self.version, self.payload, dict(self.info, **mesh_versions(self.mesh_path()))
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -157,6 +163,11 @@ class Handler(BaseHTTPRequestHandler):
                               f"{self.source.download_name()}-mesh{path[-4:]}")
         if path == "/mesh.bin" and mesh is not None and mesh.exists():
             return self.reply(pack_mesh(mesh), "application/octet-stream")
+        solid = None if mesh is None else mesh.with_name("solid.ply")
+        if path == "/solid.bin" and solid is not None and solid.exists():
+            return self.reply(pack_mesh(solid), "application/octet-stream")
+        if path == "/solid.ply" and solid is not None and solid.exists():
+            return self.reply(solid.read_bytes(), "application/octet-stream", f"{self.source.download_name()}-solid.ply")
         self.send_error(404)
 
     def do_POST(self):
