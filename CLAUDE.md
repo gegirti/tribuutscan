@@ -344,8 +344,9 @@ python3 -m tribuutscan.view3d captures/<stamp>-scan    # browser 3D view at http
 .venv/bin/python -m tribuutscan.bench --live [rec] [--frames N] [--tracker gpu|joint]
                                             # the live worker's fps on a recording (simulated camera)
 ./setup-venv.sh [dir]                       # build .venv from pyproject's "scan" extra (PYTHON=... to pick)
-.venv/bin/python -m tribuutscan.fusion captures/<stamp>-scan [--all] [--min-weight 4] [--force]
-                                            # fuse a scan's keyframes -> mesh.ply (m) + mesh.stl (mm)
+.venv/bin/python -m tribuutscan.fusion captures/<stamp>-scan [--all] [--min-weight 4] [--force] [--open]
+                                            # fuse a scan's keyframes -> mesh.ply (m, scanned surface) +
+                                            # mesh.stl (mm, closed solid: solid.py; --open: as scanned)
                                             # (on the GPU when there is one; TRIBUUTSCAN_GPU=0: Open3D)
 .venv/bin/python -m tribuutscan.gpucheck [--frames N] [--out r.json]   # GPU self-check, no scanner
 .venv/bin/python -m tribuutscan.bakeoff slice captures/<stamp>-scan [--seconds S] [--capacity N]
@@ -1219,6 +1220,42 @@ cubes on the GPU; the CPU keeps the 6x6 solve, markers, base votes, pose graph, 
     - the rest identical or within noise.
   - End to end with the scanner (still scene): 187 frames in 12 s; Stop gave saved, optimised (1 s) and meshed
     (3 s: 133k triangles, mesh.ply / mesh.stl).
+- PRINTABLE MESHES (2026-11-03, plan approved; Phase 5 part 1): mesh.stl is now a CLOSED solid (`solid.py`);
+  mesh.ply stays the scanned surface.
+  - Why: the fused mesh is open where nothing looked: fingertips, the stand's bottom, the wrist/rim gap, ~100
+    pinholes. The 09:22 replay had 102 boundary loops (11 over 10 mm) and non-manifold vertices.
+  - Measured and dropped: Open3D's fill_holes (VTK): 110 s, still open, non-manifold and self-intersecting.
+  - `solid.close`:
+    1. screened Poisson (depth 10) on the fused mesh's own vertices and normals: the scan lies a median 0.007
+       mm from it (p95 0.04);
+    2. its largest piece after Open3D's clean-ups;
+    3. with a base plane (`scene.plane`, when the base is left out), cut there (crossing triangles split) and
+       each cut loop capped flat by ear clipping. Poisson otherwise bulges below the stand into a toothed
+       fringe, where most of its defects were;
+    4. fan fills for loops up to 200 edges;
+    5. `weld`: vertices float32 cannot tell apart are merged, as an STL reader joins them by position.
+       ON_PLANE_MM is 1e-3: at 1e-6 a cut point fell beside a vertex, and the STL had 2 collapsed
+       triangles;
+    6. `repair`: a pinched spot is opened a little wider and filled again (one Poisson spot 136 mm up the
+       hand: 6 open edges);
+    7. `edges_closed`: every edge in two triangles, once each way.
+  - Report in mesh.json "solid": the added area beyond 1 mm of the scan, and its largest distance.
+    `fusion.make_mesh(close=True)`, `fusion --open`; the viewer's "meshed" line says closed or not.
+  - The two platform replays: closed (the STL read back as a slicer joins it), 693-705k triangles, +8-9 s.
+    11-12% of the area added (bottom cap, fingertips, rim gap), at most ~24 mm out. Volumes 392.7 / 398.6 cm3
+    (the same hand, two scans, 1.5% apart).
+  - Left: 37 tiny self-intersections (71 triangles, 3.6 mm2; Poisson folds between close parts). Slicers
+    ignore them. Open3D needs 199 s to find them, so they are not checked routinely.
+  - evaluate --mesh (synthetic, captures/eval/*-closed-mesh): every closed mesh is edges_closed. On observed
+    parts it is as close to the truth as the open mesh (median 0.055 / 0.052 / 0.118 / 0.106 mm against
+    0.061 / 0.049 / 0.113 / 0.099). The added surface is a smooth guess. synthturn found no base, so its
+    bottom is Poisson's bulge.
+  - FOUND: evaluate's true-pose fusion (whole frames, Open3D CPU grid) SEGFAULTED on synthturn: the turntable's
+    still room smeared round the object and overran the voxel blocks. For turntable sets it now fuses only the
+    tracked run's labels.
+  - End to end with the scanner: Stop, then meshed 6 s later, "closed for printing".
+  - Possible next: with no base, cut perpendicular to the turntable axis (from the tracked poses) at the lowest
+    scanned point.
 - LIVE SPEED, step 4 (2026-11-02, plan approved): a live frame's depth decoded where it is used.
   - The decode paths:
     - `depth.decode_strided`: the first pixel of each packed group, every 4th row, plus the

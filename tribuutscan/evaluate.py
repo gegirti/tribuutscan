@@ -151,6 +151,17 @@ def surface_check(directory, vertices, triangles):
     return out
 
 
+def coverage(directory, vertices, triangles, within_mm=1.0, n=200000):
+    """Share of a synthetic set's true surface (sampled evenly) within `within_mm` of a mesh: what the mesh
+    covers of the object, the faces it never saw included."""
+    import open3d as o3d
+    truth = o3d.io.read_triangle_mesh(str(Path(directory) / "true_surface.ply"))
+    pts = np.asarray(truth.sample_points_uniformly(n).points) @ np.diag([1000.0, -1000.0, -1000.0])  # scan world mm
+    scene = o3d.t.geometry.RaycastingScene()
+    scene.add_triangles(o3d.core.Tensor(np.asarray(vertices, np.float32)), o3d.core.Tensor(np.asarray(triangles, np.uint32)))
+    return round(float((scene.compute_distance(o3d.core.Tensor(pts.astype(np.float32))).numpy() < within_mm).mean()), 3)
+
+
 def mesh_result(name, directory, scanner):
     """The merged frames fused at their tracked poses (and on synthetic sets at the true ones)."""
     from . import fusion
@@ -163,8 +174,19 @@ def mesh_result(name, directory, scanner):
            "integrate_ms": ms["integrate"]}
     if base_of(name) in SYNTH:
         out["tracked"] = surface_check(directory, vertices, triangles)
+        out["tracked"]["covered_1mm"] = coverage(directory, vertices, triangles)
+        from . import solid  # the printable solid (fusion.make_mesh's STL) against the truth too
+        plane = scanner.scene.plane if scanner.remove_base and scanner.scene.mode == "still" else None
+        cv, ct, _, closing = solid.close(vertices, triangles, None, plane)
+        out["closed"] = dict(surface_check(directory, cv, ct), covered_1mm=coverage(directory, cv, ct),
+                             edges_closed=closing["edges_closed"], added_share=closing["added_share"])
         truth = synth.read_truth(directory)
-        engine, _ = fusion.fuse(((f, truth[i], None) for i, f in enumerate(fr.read_recording(directory)) if i in truth),
+        turning = json.loads((Path(directory) / "info.json").read_text()).get("kind") == "turntable"
+        # (whole frames, cut at extraction; but a turntable's still room smears round the object at its poses and
+        # overran Open3D's voxel blocks (a segfault): there only the object, by the tracked run's labels)
+        engine, _ = fusion.fuse(((f, truth[i], scanner.labels.get(i) if turning else None)
+                                 for i, f in enumerate(fr.read_recording(directory))
+                                 if i in truth and (not turning or i in scanner.labels)),
                                 log=lambda m: None)
         vertices, triangles, _ = fusion.extract(engine, lambda xyz: synth.height_above_table(directory, xyz) > 1.0)
         out["true_poses"] = surface_check(directory, vertices, triangles)
@@ -283,6 +305,8 @@ def show(results, against=None):
             ("keyframe_marker_scatter.scatter_mm", "kf mk mm"), ("loop_gap.mm", "gap mm"),
             ("ground_truth.ate_mm", "ATE mm"), ("keyframe_ground_truth.ate_mm", "kf ATE"), ("truth_mm.median", "truth mm"),
             ("mesh.tracked.median", "mesh mm"), ("mesh.true_poses.median", "fused mm"),
+            ("mesh.tracked.covered_1mm", "mesh cov"), ("mesh.closed.median", "closed mm"),
+            ("mesh.closed.covered_1mm", "closed cov"),
             ("optimise.loops_kept", "loops"), ("optimise.largest_correction_mm", "corr mm"), ("region_mm", "region mm"),
             ("ms_per_frame", "ms")]
     print(f"{'dataset':9s} " + " ".join(f"{h:>14s}" for _, h in cols))

@@ -1,9 +1,10 @@
 """Fuse a scan's depth frames into one surface (a truncated signed distance volume, TSDF) and mesh it.
 
-    .venv/bin/python -m tribuutscan.fusion captures/<stamp>-scan [--all] [--voxel 0.5] [--min-weight 4] [--force]
+    .venv/bin/python -m tribuutscan.fusion captures/<stamp>-scan [--all] [--voxel 0.5] [--min-weight 4] [--force] [--open]
 
-Writes mesh.ply (metres, y up, z toward the scanner, vertex colour: like cloud.ply) and mesh.stl (mm,
-same axes, for slicers) into the scan. The frames come from the scan's source recordings
+Writes mesh.ply (metres, y up, z toward the scanner, vertex colour: like cloud.ply; the scanned surface) and
+mesh.stl (mm, same axes, for slicers: the surface closed into a solid, solid.py; --open: the scanned
+surface as it is) into the scan. The frames come from the scan's source recordings
 (session.json "sources"), each at its tracked pose and only over its own object/base pixels
 (labels.npz). By default only the frames the cloud merged (the keyframes, whose poses Optimise
 corrects): on the marker scan they gave p90 0.34 mm against Creality's mesh, every tracked frame 0.53
@@ -302,13 +303,16 @@ def fuse_scan(directory, which="merged", voxel_mm=VOXEL_MM, trunc_voxels=TRUNC_V
     return vertices, triangles, colours, report
 
 
-def write_mesh(directory, vertices, triangles, colours):
-    """mesh.ply (metres, like cloud.ply, vertex colour and normals) and mesh.stl (mm, for slicers);
-    same axes. Written to temporary names first: a page polling for the mesh never reads half a file."""
+def write_mesh(directory, vertices, triangles, colours, printable=None):
+    """mesh.ply (metres, like cloud.ply, vertex colour and normals: the scanned surface) and mesh.stl (mm, for
+    slicers: `printable` (vertices, triangles), the closed solid, else the scanned surface); same axes.
+    Written to temporary names first: a page polling for the mesh never reads half a file."""
     directory = Path(directory)
     xyz = vertices @ FLIP.T
     tmp = directory / "mesh.ply.tmp"
     pc.write_mesh_ply(tmp, (xyz / 1000).astype(np.float32), colours, triangles, pc.vertex_normals(xyz, triangles))
+    if printable is not None:
+        xyz, triangles = printable[0] @ FLIP.T, printable[1]
     mesh = o3d.geometry.TriangleMesh(o3d.utility.Vector3dVector(xyz), o3d.utility.Vector3iVector(triangles.astype(np.int32)))
     mesh.compute_triangle_normals()
     o3d.io.write_triangle_mesh(str(directory / "mesh.tmp.stl"), mesh)  # Open3D picks the format by the extension
@@ -316,11 +320,26 @@ def write_mesh(directory, vertices, triangles, colours):
     tmp.replace(directory / "mesh.ply")
 
 
-def make_mesh(directory, which="merged", voxel_mm=VOXEL_MM, min_weight=MIN_WEIGHT, force=False, log=print, scanner=None):
-    """Fuse a scan and write mesh.ply, mesh.stl and mesh.json; returns the report."""
+def make_mesh(directory, which="merged", voxel_mm=VOXEL_MM, min_weight=MIN_WEIGHT, force=False, log=print, scanner=None,
+              close=True):
+    """Fuse a scan and write mesh.ply (the scanned surface), mesh.stl (with `close`, the closed solid for
+    printing: solid.close, cut flat at the base when it is left out) and mesh.json; returns the report (its
+    "solid": the closing's, or why the STL stayed open)."""
+    if scanner is None:
+        scanner = cl.Scanner.restore(directory, log=lambda m: None)
     vertices, triangles, colours, report = fuse_scan(directory, which, voxel_mm, min_weight=min_weight, force=force,
                                                      log=log, scanner=scanner)
-    write_mesh(directory, vertices, triangles, colours)
+    printable = None
+    if close and len(triangles):
+        from . import solid
+        scene = scanner.scene
+        plane = scene.plane if scanner.remove_base and scene.mode == "still" else None
+        try:
+            v, t, _, report["solid"] = solid.close(vertices, triangles, colours, plane)
+            printable = (v, t) if report["solid"]["edges_closed"] else None
+        except Exception as e:  # (the scanned surface goes out as the STL then)
+            report["solid"] = {"edges_closed": False, "error": str(e)}
+    write_mesh(directory, vertices, triangles, colours, printable)
     (Path(directory) / "mesh.json").write_text(json.dumps(report, indent=2))
     return report
 
@@ -336,7 +355,8 @@ def main():
             paths.append(Path(a))
     if not paths:
         sys.exit(__doc__)
-    report = make_mesh(paths[0], "all" if "--all" in sys.argv else "merged", voxel, weight, "--force" in sys.argv)
+    report = make_mesh(paths[0], "all" if "--all" in sys.argv else "merged", voxel, weight, "--force" in sys.argv,
+                       close="--open" not in sys.argv)
     print(json.dumps(report, indent=2))
     print(f"-> {paths[0] / 'mesh.ply'}, mesh.stl")
 

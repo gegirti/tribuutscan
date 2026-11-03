@@ -197,8 +197,10 @@ def process(scanner, directory, action, log=print):
             report = fusion.make_mesh(directory, log=log, scanner=scanner)
         except (ValueError, FileNotFoundError) as e:  # no recordings noted or kept, or another camera
             return f"{e}. Made a rough mesh from the cloud instead: {make_mesh(scanner, directory):,} triangles"
+        closed = report.get("solid", {}).get("edges_closed")
         return (f"mesh: {report['triangles']:,} triangles from {report['frames']} frames in "
-                f"{report['fuse_s'] + report['extract_s']:.0f} s -> mesh.ply, mesh.stl")
+                f"{report['fuse_s'] + report['extract_s'] + report.get('solid', {}).get('seconds', 0):.0f} s -> mesh.ply, "
+                + ("mesh.stl (closed for printing)" if closed else "mesh.stl (left open)"))
     if action in ("base-off", "base-on"):
         if scanner.scene.plane is None:
             return "no base was found in this scan: nothing to remove"

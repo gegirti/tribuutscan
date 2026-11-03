@@ -107,7 +107,10 @@ right: Scanner, Capture, Scan, IMU and View.
 - **Open 3D view**: the scan in the browser. *Process* has Optimise again, merge again at
   0.5 / 1 / 2 mm point distance, Make mesh, and Remove base / Keep base; *Show* switches between
   the cloud and the mesh (*Colour: Grey* shows its shape); *Export* downloads `cloud.ply`,
-  `mesh.ply` (metres, like the cloud) and `mesh.stl` (millimetres, for slicers).
+  `mesh.ply` (metres, like the cloud: the scanned surface) and `mesh.stl` (millimetres, for
+  slicers). The STL is closed into a solid: what the scanner never saw (fingertips seen only from the
+  side, the bottom of a stand) is filled in smoothly, and it is cut flat where the object stood on its
+  base.
 - **Save frame (s)** writes one colour + IR + depth set (and a `cloud.ply`) to `captures/<stamp>/`.
   **Record (r)** writes colour + depth sets at 30 (or 10) a second, plus the IMU's samples
   (`imu.csv`, 200 a second), for processing later. Depth is compressed losslessly and IR is left
