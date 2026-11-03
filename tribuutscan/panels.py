@@ -89,7 +89,8 @@ class ScanPanel(Panel):
     """Live scan into one merged cloud (worker process), continue, browser 3D view."""
     title = "Scan"
     STATES = {"idle": ("Start scan (c)", "normal"), "scanning": ("Stop scan (c)", "normal"),
-              "saving": ("Saving...", "disabled"), "optimising": ("Optimising...", "disabled")}
+              "saving": ("Saving...", "disabled"), "optimising": ("Optimising...", "disabled"),
+              "meshing": ("Making the mesh...", "disabled")}
 
     def build(self, body):
         row = tk.Frame(body)
@@ -105,6 +106,9 @@ class ScanPanel(Panel):
         row.pack(fill="x")
         tk.Checkbutton(row, text="Remove base", variable=self.app.remove_base).pack(side="left")
         tk.Checkbutton(row, text="keep raw frames", variable=self.app.keep_raw).pack(side="left")
+        row = tk.Frame(body)
+        row.pack(fill="x")
+        tk.Checkbutton(row, text="Mesh after Stop", variable=self.app.mesh_after).pack(side="left")
 
     def refresh(self):
         text, state = self.STATES[self.app.scan_state]

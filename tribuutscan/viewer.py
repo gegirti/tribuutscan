@@ -365,7 +365,7 @@ class App:
                      "inflight": 0, "sent": 0.0, "raw": {},  # raw: depth buffers in work, by capture time
                      "done": collections.deque(maxlen=60), "last": None, "name": "", "gpu": "", "merging": ""}
         # (done: when frames came back; last: (merged, frames, points, tracking); gpu / merging: from its log)
-        self.scan_state = "idle"  # idle | scanning | saving | optimising
+        self.scan_state = "idle"  # idle | scanning | saving | optimising | meshing
         self.imu, self.imu_note, self.imu_want = None, "", usbdepth.available()
         self.retry_at = 0.0  # time.monotonic() before which a lost scanner is not reconnected again
         self.lost = False  # a stream lost its device and the scanner is not back yet
@@ -374,6 +374,7 @@ class App:
         self.range_var = tk.StringVar(value=self.range_name())
         self.preset, self.keep_raw = tk.StringVar(value="small"), tk.BooleanVar(value=True)
         self.remove_base = tk.BooleanVar(value=True)
+        self.mesh_after = tk.BooleanVar(value=True)  # the mesh made after Stop (and Optimise)
         self.imu_wanted, self.find_markers = tk.BooleanVar(value=self.imu_want), tk.BooleanVar(value=True)
         self.panels, self.images, self.shown = [], {}, {}
 
@@ -548,7 +549,7 @@ class App:
             fps = (len(done) - 1) / (done[-1] - done[0]) if len(done) > 1 and done[-1] > done[0] else 0.0
             now.append(f"scanning {live['name']}: {frames} frames ({fps:.1f} a second), {merged} merged, {points:,} points"
                        + ("" if tracking else ", TRACKING LOST"))
-        elif self.scan_state in ("saving", "optimising"):
+        elif self.scan_state in ("saving", "optimising", "meshing"):
             now.append(f"{self.scan_state} the scan {live['name']}")
         recorder = self.rec["recorder"]
         if recorder:
@@ -977,7 +978,7 @@ class App:
         live = self.live
         if self.scan_state == "scanning":
             self.scan_state = "saving"
-            live["commands"].put(("stop",))
+            live["commands"].put(("stop", bool(self.mesh_after.get())))
             self.log("scan stopped, saving ...")
             return
         if self.scan_state != "idle" or self.switching["busy"]:
@@ -1068,6 +1069,9 @@ class App:
                 self.log(f"scan saved: {points:,} points -> {Path(path).parent.name}/cloud.ply; optimising ...")
                 self.scan_state = "optimising"
             elif kind == "optimised":
+                self.log(rest[0] + ("; making the mesh ..." if len(rest) > 1 and rest[1] else ""))
+                self.scan_state = "meshing" if len(rest) > 1 and rest[1] else "idle"
+            elif kind == "meshed":
                 self.log(rest[0])
                 self.scan_state = "idle"
 

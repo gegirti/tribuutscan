@@ -83,7 +83,8 @@ right: Scanner, Capture, Scan, IMU and View.
 
 - **Start scan (c)**: stay 18-30 cm from the object in close range, 30-50 cm in long range (the
   guide line under the images shows the distance), move steadily, keep markers in view if there are
-  any. **Stop scan (c)** saves `captures/<stamp>-scan/cloud.ply` and runs Optimise. *Remove base* (on
+  any. **Stop scan (c)** saves `captures/<stamp>-scan/cloud.ply`, runs Optimise and makes the mesh
+  (`mesh.ply`, `mesh.stl`; *Mesh after Stop*, on by default, about 15-20 s with a GPU). *Remove base* (on
   by default) leaves the table under the object out of the result. While scanning, the depth view
   dims everything that is not the object and, with a GPU, paints the scan so far over it, as seen
   from where the scanner is: **grey** where the mesh will have the surface, **yellow** where it needs
@@ -100,6 +101,9 @@ right: Scanner, Capture, Scan, IMU and View.
   - From then on it ignores the room's colour features: they would say nothing moved.
   - Turn slowly where the object looks thin (THIN VIEW): there its shape barely shows how far it
     turned.
+  - Turn once with the scanner about level, then once more looking down at about 45°, from 30-35 cm.
+    The second pass sees the top, and once the platform top shows depth it is found as the base and
+    left out of the result.
 - **Open 3D view**: the scan in the browser. *Process* has Optimise again, merge again at
   0.5 / 1 / 2 mm point distance, Make mesh, and Remove base / Keep base; *Show* switches between
   the cloud and the mesh (*Colour: Grey* shows its shape); *Export* downloads `cloud.ply`,

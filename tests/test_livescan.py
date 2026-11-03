@@ -68,3 +68,60 @@ def test_the_reader_decodes_every_4th_pixel_beside_tracking_and_keeps_the_order(
             assert g[:-2] == c and (g[-2] == full[::4, ::4]).all() and g[-1] is None  # (no garbled rows)
         else:
             assert g == c
+
+
+def test_stop_makes_the_mesh_after_optimise():
+    """The live worker, as the viewer runs it, on a short synthetic scan: Stop with the mesh flag replies
+    saved, optimised (a mesh follows) and meshed, and mesh.ply / mesh.stl are there."""
+    try:
+        from tribuutscan import synth
+    except ImportError:  # needs Open3D (.venv)
+        return
+    import multiprocessing
+    import os
+    import queue
+    import tempfile
+    from pathlib import Path
+    from tribuutscan import calib, livescan
+    from tribuutscan import frames as fr
+    before, env = calib.CAMERA.spec, os.environ.get("TRIBUUTSCAN_CAMERA")
+    calib.use(calib.ESTIMATES)
+    os.environ["TRIBUUTSCAN_CAMERA"] = "estimate"  # (the spawned worker: the camera the set is rendered with)
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            rec = synth.generate(Path(tmp) / "t-rec", n_frames=40)
+            ctx = multiprocessing.get_context("spawn")
+            commands, replies = ctx.Queue(), ctx.Queue()
+            proc = ctx.Process(target=livescan.run, args=(commands, replies, 0), daemon=True)
+            proc.start()
+            got = []
+
+            def reply(want):
+                while True:
+                    try:
+                        kind, *rest = replies.get(timeout=120)
+                    except queue.Empty:
+                        raise AssertionError(f"no {want} from the worker; got {got}")
+                    got.append(kind)
+                    if kind == want:
+                        return rest
+
+            reply("ready")
+            commands.put(("start", "small", Path(tmp) / "scan", True, None, calib.CAMERA.mode, True))
+            for bufs in fr.read_raw(rec):
+                commands.put(("frame", bufs["color"], None, bufs["depth"], bufs["bytesperline"], bufs["t"]))
+                reply("frame_done")
+            commands.put(("stop", True))
+            reply("saved")
+            assert reply("optimised")[1] is True
+            message = reply("meshed")[0]
+            commands.put(("quit",))
+            proc.join(30)
+            assert message.startswith("mesh:"), message
+            assert (Path(tmp) / "scan" / "mesh.ply").exists() and (Path(tmp) / "scan" / "mesh.stl").exists()
+    finally:
+        calib.use(before)
+        if env is None:
+            os.environ.pop("TRIBUUTSCAN_CAMERA", None)
+        else:
+            os.environ["TRIBUUTSCAN_CAMERA"] = env

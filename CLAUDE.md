@@ -1187,6 +1187,38 @@ cubes on the GPU; the CPU keeps the 6x6 solve, markers, base votes, pose graph, 
       marker check never fires.
     - Not fixed. Candidate: refuse a frame that shows >= 3 markers when the map has some in view yet none
       match, then re-find it by markers.
+- FOURTH PLATFORM SCAN (2026-11-03 09:22, captures/20261103-092240-scan). 1290 frames at 14.5 fps, 0 lost, 380
+  degrees, nearly level (2-9 degrees up, a brief raise to ~31 at frame ~1100), the hand ~40 cm away. Optimise
+  largest correction 0.6 mm. Mesh 515k triangles. Fingertips open (no view from above); ragged platform bits at
+  the stand's foot; a softer palm than at 34 cm. The user: fast and good models first, accuracy after the phases.
+- COMPLETE, CLEAN MODELS RIGHT AFTER STOP (2026-11-03, plan approved):
+  - `Scanner.marker_check` (GPU tracker; MARKER_CHECK_MM 5 / DEG 2 / MIN 3). When an accepted solve used none
+    of the >= 3 markers the frame shows, `marker_map.match_global` places the frame by them. If that disagrees,
+    the solve is redone from the marker pose: taken ("re-found by markers", motion reset) when it holds >= 3
+    markers, else the frame is lost. It stops synthhard's slide (frames 54-72: the guess carried on ~14 mm a
+    frame after the scanner stopped, the box's flat faces did not resist, 8-9 markers in view matched nothing).
+    Now synthhard holds under other random draws.
+  - Base votes go on after VOTE_LIMIT while none is known, on every VOTE_LATE_EVERY (10th) frame. When the
+    centre piece doesn't touch the plane, `stands_on` takes tracking's piece (from above, the middle of the
+    view missed the hand). A late base fits the cylinder on tracking's piece.
+  - While no base is known, `_ball_mask` takes tracking's piece (`masks(piece=)`, as the cylinder path
+    already did), so the pass from above is merged.
+    - It also saves a plane search + flood fill a frame: bench --live, the 09:22 recording, 500 frames,
+      alternating with 1c2aab1: 20.4 / 20.1 fps against 15.9 / 15.1.
+  - The live worker makes the mesh after Optimise: ("stop", mesh); "optimised" says a mesh follows, then
+    "meshed". The viewer's Scan panel has "Mesh after Stop" (default on) and the state "meshing".
+  - Replays:
+    - 20:31 scan: base found at frame ~550 (the pass from above), 730/730 tracked, platform ring gone from the
+      mesh. Fingertips still a little open (a short, shallow pass).
+    - 09:22 scan: base found at ~1080 (its brief raise), 1289/1290, Optimise 3.6 mm, doubled 0.31%, the foot
+      clean.
+  - evaluate (captures/eval/20261103-094020-topclean against 20261103-085856-ballcore-only):
+    - synthhard 0.468 -> 0.457 mm (1 marker re-find);
+    - synth 0.356 -> 0.333 (kf 0.45 -> 0.35);
+    - platform2 Optimise correction 11.1 -> 9.0 mm;
+    - the rest identical or within noise.
+  - End to end with the scanner (still scene): 187 frames in 12 s; Stop gave saved, optimised (1 s) and meshed
+    (3 s: 133k triangles, mesh.ply / mesh.stl).
 - LIVE SPEED, step 4 (2026-11-02, plan approved): a live frame's depth decoded where it is used.
   - The decode paths:
     - `depth.decode_strided`: the first pixel of each packed group, every 4th row, plus the

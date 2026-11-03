@@ -66,6 +66,8 @@ REFIND_MM_S, REFIND_DEG_S, REFIND_SLACK = 300.0, 60.0, (50.0, 15.0)  # ...and mu
     # mirrored re-find turned 136 degrees in 1.35 s (truly ~45); the real ones 18-31 degrees after 19-27 s
 REFIND_HOLD = 2  # frames tracked after a pose found anywhere before merging resumes
 SHAPE_EVERY_S = 0.25  # refind_shape: at most one try per this much frame time while lost (~50-150 ms each)
+MARKER_CHECK_MM, MARKER_CHECK_DEG, MARKER_CHECK_MIN = 5.0, 2.0, 3  # marker_check: a solve this far from the markers' own
+    # placement is redone from it, and must then hold this many of them
 GAP_S = 0.5  # the first frame tracked after this long without one (lost frames, or none came) is checked by shape:
     # its solve began at the last good pose, and a turn about a vertical axis hides in horizontal faces (the
     # synthetic block on a platform, 3 s left out: "tracked" 37 degrees off)
@@ -789,6 +791,14 @@ class Scanner:
                             step, info, status = alt[0], alt[1], "re-found by shape"
                             stats["relocked"] += 1
                             stats["shape_refinds"] += 1
+                    if ok and status == "tracked" and not info["markers_used"] and len(marker_pts) >= 3 \
+                            and len(self.marker_map) >= 3:  # markers in view, none of them used: do they agree?
+                        checked = self.marker_check(xyz, marker_pts, step)
+                        if checked is not None:
+                            step, info, ok = checked
+                            if ok:
+                                status, alt = "re-found by markers", True
+                                stats["relocked"] += 1
                     self.note(index, info)
                     if self.live_view and alt is not None:  # (the last ray cast was the candidate's: one at the pose)
                         self.view_codes = self.gpu.ghost(self.pose @ step, self.gpu_base(), self.preview_weight())
@@ -833,7 +843,7 @@ class Scanner:
         self.track_log.append((index, status, self.pose.copy()))
         if scene.mode == "still":  # the object (above the kept base, in its region) and the base under it
             to_world = scene_transform(self.pose)  # (every tracked frame: the region grows per frame)
-            scene.observe(all_xyz, all_pix, shape, to_world)
+            scene.observe(all_xyz, all_pix, shape, to_world, keep)
             obj, base = scene.masks(all_xyz, all_pix, shape, to_world, keep, table_plane)
             pix = all_pix[obj | base]
             self.last_view = (all_pix, obj, base, shape)
@@ -1382,6 +1392,23 @@ class Scanner:
                 and self.reachable(step, xyz, t)):
             return None
         return step, info
+
+    def marker_check(self, xyz, marker_pts, step):
+        """An accepted solve used none of the >= 3 markers the frame shows: are they where it put them? Placed by
+        the marker map alone (match_global), they either agree with the solve (None: keep it), or the solve is
+        done again from their pose with them (step, info, True when it passes and holds MARKER_CHECK_MIN of them),
+        or the frame is not taken (step, info, False). synthhard, coming back from beyond the depth window: the
+        motion guess carried on (~14 mm a frame) after the scanner stopped, the box's flat faces did not resist,
+        and 8-9 markers in view matched nothing at the sliding pose (ATE 0.47 -> 122 mm on other random draws)."""
+        found = self.marker_map.match_global(marker_pts)
+        if found is None:
+            return None
+        start = np.linalg.inv(self.pose) @ found
+        if same_pose(start, step, xyz, mm=MARKER_CHECK_MM, deg=MARKER_CHECK_DEG):
+            return None
+        step2, info2 = self.gpu_step(xyz, marker_pts, start)
+        ok = self.solve_ok(info2, xyz) and info2["markers_used"] >= MARKER_CHECK_MIN and self.floor_agrees(step2)
+        return step2, info2, ok
 
     def after_gap(self, t):
         """Is this the first frame after GAP_S without a tracked one (or after lost frames, without stamps)?"""

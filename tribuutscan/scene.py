@@ -3,7 +3,8 @@
 Modes:
   still      the object stands still on a table and the scanner moves (default, like Creality's
              handheld mode). The base (table) plane is found once and kept in WORLD coordinates (3
-             frames must agree, looked for during the first VOTE_LIMIT frames, and the object at the
+             frames must agree, looked for on every frame of the first VOTE_LIMIT and then every
+             VOTE_LATE_EVERY-th while none is known, and the object at the
              image centre must stand on it); each frame re-fits it near its kept place.
   turntable  the scanner stays still and the object turns (turntable or by hand on the table).
              The plane is found once and kept in CAMERA coordinates; only the object is tracked.
@@ -30,7 +31,9 @@ from . import cloud as cl
 
 MODES = ("still", "turntable", "free")
 VOTE_FRAMES, VOTES_NEEDED = 5, 3  # 3 votes must agree; found after VOTE_FRAMES frames counts as late
-VOTE_LIMIT = 300  # frames to keep looking for the base
+VOTE_LIMIT, VOTE_LATE_EVERY = 300, 10  # frames to look for the base on every frame; after that, while none is
+    # known, every 10th (a platform's top shows depth only once the scanner looks down at it, and turning with the
+    # object it is a fixed plane in the object's frame: the fourth platform scan looked down after frame 1000)
 # The base may be a thin rim around an object that fills the view: on the marker part the table was
 # 7-9% of the points and 55-151 cm2, under the 10% / 80 cm2 that tracking's per-frame plane test uses.
 # Votes must agree in world coordinates, which a slice through a curved surface does not do.
@@ -66,16 +69,20 @@ def mm_transform(pose):
     return out
 
 
-def stands_on(xyz, pix, shape, n, c):
+def stands_on(xyz, pix, shape, n, c, tracked=None):
     """Does the object at the image centre stand on plane (n, c)? Its centre piece above the plane must
     come within CONTACT_MM of it (a table under the object does, a wall behind it does not), and the
     plane's points must lie AROUND the object's outline seen along the normal, not inside it: under the
-    object a table is hidden, while one of the object's own flat sides lies within its outline."""
+    object a table is hidden, while one of the object's own flat sides lies within its outline. When the
+    centre piece does not touch the plane, tracking's piece (`tracked`, a mask of the points) may: looking
+    down on a platform the middle of the view can miss the object."""
     h = xyz @ n + c
     idx = np.nonzero(h > OBJECT_ABOVE_MM)[0]
     if len(idx) < 50:
         return False
     piece = cl.centre_piece(xyz[idx], pix[idx], shape)
+    if (not piece.any() or h[idx][piece].min() >= CONTACT_MM) and tracked is not None:
+        piece = tracked[idx]
     if not piece.any() or h[idx][piece].min() >= CONTACT_MM:
         return False
     a = np.cross(n, [1.0, 0, 0] if abs(n[0]) < 0.9 else [0, 1.0, 0])
@@ -101,13 +108,16 @@ class Scene:
         self.late_plane = False  # the plane was settled after objects had been merged
         self.off_centre = 0  # frames whose view centre missed the object (masks fell back to the core)
 
-    def observe(self, xyz_cam, pix, shape, cam_to_region):
-        """Vote for a support plane during the first frames. cam_to_region: 4x4, mm."""
-        if self.mode == "free" or self.plane is not None or self.seen_frames >= VOTE_LIMIT:
+    def observe(self, xyz_cam, pix, shape, cam_to_region, tracked=None):
+        """Vote for a support plane: on every frame of the first VOTE_LIMIT, then on every VOTE_LATE_EVERY-th
+        while none is known. cam_to_region: 4x4, mm; tracked: tracking's piece (stands_on)."""
+        if self.mode == "free" or self.plane is not None:
             return
         self.seen_frames += 1
+        if self.seen_frames > VOTE_LIMIT and self.seen_frames % VOTE_LATE_EVERY:
+            return
         found = cl.support_plane(xyz_cam, self.rng, pix, shape, tries=BASE_TRIES, min_share=BASE_MIN_SHARE,
-                                 min_cm2=BASE_MIN_CM2, accept=lambda n, c: stands_on(xyz_cam, pix, shape, n, c))
+                                 min_cm2=BASE_MIN_CM2, accept=lambda n, c: stands_on(xyz_cam, pix, shape, n, c, tracked))
         if found is None:
             return
         self.votes.append(plane_to(found, cam_to_region))
@@ -220,7 +230,7 @@ class Scene:
         already re-fitted to this frame (table_in_camera at the pose guess), instead of fitting it again."""
         mask = np.zeros(len(xyz_cam), bool)
         if self.plane is None:
-            return self._ball_mask(xyz_cam, pix, shape, cam_to_region), mask.copy()
+            return self._ball_mask(xyz_cam, pix, shape, cam_to_region, piece), mask.copy()
         n, c = self.plane_in_camera(xyz_cam, cam_to_region) if plane is None else plane
         h = xyz_cam @ n + c
         above = h > OBJECT_ABOVE_MM
@@ -230,8 +240,10 @@ class Scene:
         idx = np.nonzero(above)[0]
         pts = xyz_cam[idx]
         to_cam = np.linalg.inv(cam_to_region)
-        if self.axis is None:  # first view: the object is the piece above the table at the image centre
-            first = cl.centre_piece(pts, pix[idx], shape)
+        if self.axis is None:  # first view: the object is the piece above the table at the image centre, or for a
+            # base found late, tracking's piece (from above the middle of the view missed the hand: the room, a crumb)
+            late = self.late_plane and piece is not None and piece[idx].any()
+            first = piece[idx] if late else cl.centre_piece(pts, pix[idx], shape)
             self._fit_region(pts[first] @ cam_to_region[:3, :3].T + cam_to_region[:3, 3],
                              self.plane[0])
         axis = to_cam[:3, :3] @ self.axis + to_cam[:3, 3]
@@ -258,10 +270,12 @@ class Scene:
         base[near[np.linalg.norm(flat_near - axis, axis=1) <= self.radius]] = True
         return mask, base
 
-    def _ball_mask(self, xyz_cam, pix, shape, cam_to_region):
-        """No base known: the frame's centre piece (cl.isolate_mask), kept inside a ball around the
-        first one; the ball grows by REGION_GROW_MM per frame toward what is kept, up to BALL_MAX."""
-        keep = cl.isolate_mask(xyz_cam, pix, shape, self.rng)[0]
+    def _ball_mask(self, xyz_cam, pix, shape, cam_to_region, piece=None):
+        """No base known: the frame's piece as tracking found it (seeded by the ball: core), else its centre piece
+        (cl.isolate_mask), kept inside a ball around the first one; the ball grows by REGION_GROW_MM per frame
+        toward what is kept, up to BALL_MAX. (With its own centre piece, the third platform scan's pass from
+        above merged crumbs while it tracked the hand.)"""
+        keep = cl.isolate_mask(xyz_cam, pix, shape, self.rng)[0] if piece is None else piece.copy()
         if self.mode != "still" or not keep.any():
             return keep
         idx = np.nonzero(keep)[0]

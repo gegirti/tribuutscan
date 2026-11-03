@@ -308,6 +308,33 @@ def test_without_a_base_the_source_follows_the_ball_when_the_centre_misses():
     assert scene.core(xyz, np.eye(4)) is None
 
 
+def test_a_base_seen_late_is_found_and_the_region_fitted_on_tracking_s_piece():
+    """A platform seen with depth only after VOTE_LIMIT frames (looking down at it), the middle of the view on
+    something 50 mm above it: the base is still looked for (every VOTE_LATE_EVERY-th frame), stands_on takes
+    tracking's piece, and the region is fitted on that piece, not on what the middle of the view hits."""
+    from tribuutscan import scene as sc
+    xyz, pix, shape, scene, box = _off_centre_scene()
+    xyz = xyz.copy()
+    xyz[-5:, 2] = 250.0  # the crumb, now 50 mm up: standing on nothing
+    f, (h, w) = 1000.0, shape
+    pix = np.c_[xyz[:, 0] * f / xyz[:, 2] + w / 2, xyz[:, 1] * f / xyz[:, 2] + h / 2].astype(int)
+    tracked = np.zeros(len(xyz), bool)
+    tracked[box] = True
+    found = []
+    for piece in (None, tracked):
+        s = sc.Scene("still", np.random.default_rng(3))
+        s.seen_frames = sc.VOTE_LIMIT
+        for _ in range(40):
+            s.observe(xyz, pix, shape, np.eye(4), piece)
+        found.append(s)
+    assert found[0].plane is None  # the middle of the view alone: no base
+    late = found[1]
+    assert late.plane is not None and late.late_plane and abs(late.plane[0] @ [0, 0, -1]) > 0.99
+    obj, base = late.masks(xyz, pix, shape, np.eye(4), piece=tracked)
+    assert np.linalg.norm(late.axis[:2] - [130.0, 0.0]) < 15  # round the box, not the crumb at the centre
+    assert obj[box].mean() > 0.9 and base[:box.start].any() and not obj[-5:].any()
+
+
 def test_the_base_cuts_the_source_when_the_frame_shows_no_table_of_its_own():
     xyz, pix, shape, scene, box = _off_centre_scene()
     near = (np.abs(xyz[:, 0] - 130) < 45) & (np.abs(xyz[:, 1]) < 45)  # a frame showing too little table to fit
@@ -637,3 +664,47 @@ def test_shape_match_finds_a_shape_turned_and_moved():
     err = np.linalg.inv(move) @ found
     # coarse (RANSAC on 3 mm features: 1.7-2.5 mm, 0.9-3.7 degrees over seeds); the tracking solve refines it
     assert np.linalg.norm(err[:3, 3]) * 1000 < 5.0 and np.degrees(np.arccos(np.clip((np.trace(err[:3, :3]) - 1) / 2, -1, 1))) < 6.0
+
+
+def test_markers_in_view_correct_a_solve_that_used_none():
+    """marker_check: a solve accepted 20 mm off (as synthhard's slide was, its 8-9 markers matching nothing at
+    the sliding pose) is placed by the markers alone and solved again with them, close to the truth."""
+    try:
+        from tribuutscan import synth
+        from tribuutscan import gputrack
+    except ImportError:  # needs Open3D and wgpu (.venv)
+        return
+    if not gputrack.kind():
+        return
+    import tempfile
+    from pathlib import Path
+    from tribuutscan import calib
+    from tribuutscan import frames as fr
+    before = calib.CAMERA.spec
+    calib.use(calib.ESTIMATES)
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            rec = synth.generate(Path(tmp) / "m-rec", n_frames=44, every=2)
+            truth = synth.read_truth(rec)
+            sc = cl.Scanner(log=lambda *a: None, track_with="gpu")
+            for i, frame in enumerate(fr.read_recording(rec)):
+                if i < 20:
+                    sc.feed(frame, i)
+                    continue
+                all_xyz, _, all_pix = cl.frame_points(frame, sc.seg_stride, colour=False)
+                keep, _ = cl.isolate_mask(all_xyz, all_pix, cl.frame_shape(frame), sc.rng)
+                xyz, pix = all_xyz[keep], all_pix[keep]
+                sc.gpu_source(frame, xyz, pix)
+                marker_pts = sc.frame_markers(frame)
+                assert len(marker_pts) >= 3
+                true_step = np.linalg.inv(sc.pose) @ truth[i]
+                wrong = true_step.copy()
+                wrong[:3, 3] += [0.02, 0.0, 0.0]
+                step, info, ok = sc.marker_check(xyz, marker_pts, wrong)
+                err = np.linalg.inv(true_step) @ step
+                assert ok and info["markers_used"] >= 3 and np.linalg.norm(err[:3, 3]) * 1000 < 2.0, (ok, info)
+                assert sc.marker_check(xyz, marker_pts, true_step) is None  # the markers agree: nothing to do
+                break
+            sc.close()
+    finally:
+        calib.use(before)

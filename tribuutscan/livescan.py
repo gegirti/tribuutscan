@@ -7,8 +7,9 @@ to it over two queues. The worker also serves the browser 3D view of the growing
 Commands:  ("start", preset, out_dir, keep_raw, continue_from or None, depth mode name, remove_base[, tracker])
            (tracker: "gpu", the default, which falls back to the CPU solve without a GPU; or "joint")
            | ("frame", yuyv, grey or None, depth_buf, bytesperline, (t_colour, t_ir, t_depth))
-           | ("stop",) | ("quit",)   (times: camera capture times, seconds)
-Replies:   ("ready", url) | ("log", text)
+           | ("stop"[, mesh]) | ("quit",)   (times: camera capture times, seconds; mesh: make the mesh after
+           Optimise, fusion on the GPU, so Stop ends with a finished model)
+Replies:   ("ready", url) | ("log", text) | ("optimised", message, a mesh follows) | ("meshed", message)
            | ("frame_done", merged, frames, points, tracking, cue, view, model, t_depth) | ("saved", path, points)
            cue: {"markers": used, "features": ORB start, "flat": shape alone slides, "base": base found,
                  "turning": the object turns and the scanner stands (Scanner.check_room)}
@@ -267,13 +268,22 @@ def run(commands, replies, port=view3d.PORT):
                                 f"; lost {source.scanner.stats['lost']}, found again {source.scanner.stats['relocked']} "
                                 f"({source.scanner.stats['shape_refinds']} by shape)"
                                 + (f"; GPU {source.scanner.stats['gpu_ms']}" if source.scanner.stats.get("gpu_ms") else "")))
+            make_mesh = len(cmd) > 1 and bool(cmd[1])
             try:  # Optimise right away (user decision): loop closures, pose graph, merge again
                 from . import optimise
                 with source.busy:
                     message = optimise.process(source.scanner, out_dir, "optimise", log=lambda m: None)
-                replies.put(("optimised", message))
+                replies.put(("optimised", message, make_mesh))
+                if make_mesh:  # and the mesh (the 3D page's Make mesh, ~15-20 s on the GPU): a finished model
+                    source.phase = "meshing"
+                    try:
+                        with source.busy:
+                            message = optimise.process(source.scanner, out_dir, "mesh", log=lambda m: None)
+                    except Exception as e:  # (the viewer waits for this reply)
+                        message = f"mesh not made: {e}"
+                    replies.put(("meshed", message))
             except ImportError:
-                replies.put(("optimised", "not optimised: needs Open3D (.venv)"))
+                replies.put(("optimised", "not optimised: needs Open3D (.venv)", False))
             finally:
                 source.phase, source.built_key = "done", None
         elif kind == "quit":
