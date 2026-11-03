@@ -8,9 +8,9 @@ closed solid, so `close` makes one:
    the scanned one (on the fourth platform scan the scan lay a median 0.007 mm from it, p95 0.04 mm) and
    rounds off what was not seen;
 2. its largest piece, without degenerate, duplicated or non-manifold faces (Open3D's clean-ups);
-3. with the scan's base plane: everything below it cut away (triangles crossing it split) and each cut
-   loop capped flat, so the object stands as it stood (Poisson bulged below the stand into a toothed
-   fringe, where most of its defects were);
+3. at the scan's base plane (and the crop box's faces): everything beyond it cut away (triangles crossing
+   it split) and each cut loop capped flat, so the object stands as it stood (Poisson bulged below the
+   stand into a toothed fringe, where most of its defects were); one plane after the other;
 4. the boundary loops left fan-filled, up to SMALL_LOOP edges each.
 
 Open3D's own fill_holes (VTK) was tried first: 110 s on that mesh, and still open and self-intersecting.
@@ -29,8 +29,9 @@ REPAIR_ROUNDS = 6  # repair: rounds of opening a pinched spot a little wider and
 
 def close(vertices, triangles, colours=None, plane=None, depth=POISSON_DEPTH):
     """(vertices mm, triangles, colours uint8, report) of a closed solid around a fused surface (world mm,
-    triangles facing out); `plane` (n, c): the base, n . x + c > 0 above it (scene.Scene.plane), or None.
-    The report says whether the result is closed (`edges_closed`) and how much surface was added."""
+    triangles facing out); `plane` (n, c): the base, n . x + c > 0 above it (scene.Scene.plane), a list of
+    such planes (fusion.printing_planes), or None. The report says whether the result is closed
+    (`edges_closed`) and how much surface was added."""
     import open3d as o3d
     from .pointcloud import vertex_normals
     t0 = time.time()
@@ -49,8 +50,9 @@ def close(vertices, triangles, colours=None, plane=None, depth=POISSON_DEPTH):
     mesh.remove_unreferenced_vertices()
     v, t = np.asarray(mesh.vertices), np.asarray(mesh.triangles)
     rgb = np.asarray(mesh.vertex_colors) * 255 if colours is not None and mesh.has_vertex_colors() else None
-    report = {"poisson_depth": depth, "cut": plane is not None}
-    if plane is not None:
+    planes = [] if plane is None else plane if isinstance(plane, list) else [plane]
+    report = {"poisson_depth": depth, "cut": len(planes)}
+    for plane in planes:
         v, t, rgb = clip(v, t, rgb, plane)
         t = np.concatenate([t, cap(v, t, plane)])
     v, t, rgb, filled = fill_loops(v, t, rgb)

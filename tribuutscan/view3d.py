@@ -14,6 +14,7 @@ import webbrowser
 from functools import partial
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import parse_qs
 
 import numpy as np
 
@@ -108,14 +109,14 @@ class FileSource:
         self.version, self.payload, self.info = None, b"", {}
         self.lock = threading.Lock()
 
-    def process(self, action):
+    def process(self, action, box=None):
         """A Process-menu action on the saved session (needs keyframes.npz and merged.npz)."""
         from . import cloud as cl
         from . import optimise
         if not (self.ply.parent / "merged.npz").exists():
             return "this session has no saved frames to process (scanned before sessions kept them)"
         scanner = cl.Scanner.restore(self.ply.parent, log=lambda m: None)
-        return optimise.process(scanner, self.ply.parent, action, log=lambda m: None)
+        return optimise.process(scanner, self.ply.parent, action, log=lambda m: None, box=box)
 
     def mesh_path(self):
         return self.ply.parent / "mesh.ply"
@@ -127,12 +128,15 @@ class FileSource:
         return self.ply.parent.name if self.ply.name == "cloud.ply" else self.ply.stem
 
     def current(self):
-        version = self.ply.stat().st_mtime_ns
+        version = f"{self.ply.stat().st_mtime_ns}-{mesh_version(self.session)}"  # (session.json is written after the ply)
         with self.lock:
             if version != self.version:
                 rec = read_ply(self.ply)
                 self.payload = pack_cloud(rec)
                 session = json.loads(self.session.read_text()) if self.session.exists() else {}
+                if "crop_axes" not in session:  # (saved before the crop box)
+                    from . import cloud as cl
+                    session["crop_axes"] = cl.saved_crop_axes(self.ply.parent, session).round(6).tolist()
                 self.info = {"name": self.ply.parent.name, "points": len(rec), "session": session, "phase": "done"}
                 self.version = version
             return self.version, self.payload, dict(self.info, **mesh_versions(self.mesh_path()))
@@ -171,12 +175,15 @@ class Handler(BaseHTTPRequestHandler):
         self.send_error(404)
 
     def do_POST(self):
-        """/process/<action>: optimise, small/medium/large (merge again) or mesh, on a finished scan."""
-        parts = self.path.split("?")[0].strip("/").split("/")
+        """/process/<action>[?box=6 numbers]: an optimise.process action on a finished scan."""
+        path, _, query = self.path.partition("?")
+        parts = path.strip("/").split("/")
         if len(parts) != 2 or parts[0] != "process" or not hasattr(self.source, "process"):
             return self.send_error(404)
         try:
-            message = self.source.process(parts[1])
+            box = parse_qs(query).get("box")
+            box = None if box is None else [float(v) for v in box[0].split(",")]
+            message = self.source.process(parts[1], box=box)
         except Exception as e:  # report to the page instead of dropping the connection
             message = f"failed: {e}"
         self.reply(json.dumps({"message": message}).encode(), "application/json")

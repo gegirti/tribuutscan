@@ -44,6 +44,7 @@ MIN_WEIGHT = 4  # a surface must be seen in at least this many frames (marker sc
 MIN_PIXELS = 100  # frames with less depth than this (after masking and cleaning) are skipped
 PIECE_SHARE = 0.01  # pieces with less area than this share of the largest piece are crumbs: dropped
 BLOCK = 8  # voxels per block side (4 mm blocks at 0.5 mm: little empty space stored)
+CROP_CUT_MM = 1.0  # the mesh comes this close to the crop box's bottom: the solid is cut flat there
 FLIP = np.diag([1.0, -1.0, -1.0])  # camera axes -> y up, z toward the scanner (cloud.FLIP)
 
 
@@ -327,16 +328,30 @@ def write_mesh(directory, vertices, triangles, colours, printable=None):
     tmp.replace(directory / "mesh.ply")
 
 
-def printing_plane(scanner, vertices):
-    """Where the printable solid is cut flat (n, c), or None: the base, when it is left out of the result; with
-    no base on a platform scan, square to the axis it turned about (Scanner.turn_axis) at the lowest scanned
-    point (the object stood there; otherwise Poisson rounds the bottom off: synthturn's added surface 51%)."""
-    if not scanner.remove_base or scanner.scene.mode != "still" or not len(vertices):
-        return None
+def printing_planes(scanner, vertices):
+    """Where the printable solid is cut flat: [(n, c)], n . x + c > 0 kept. Each face of the crop box the mesh
+    reaches (Poisson rounded a cut side off: 26% of a cropped hand's surface added, up to 30 mm out); unless the
+    box's bottom is one of them, the base when it is left out of the result, or with no base on a platform
+    scan, square to the axis it turned about (Scanner.turn_axis) at the lowest scanned point (the object stood
+    there; otherwise Poisson rounds the bottom off: synthturn's added surface 51%)."""
+    if not len(vertices):
+        return []
+    planes, bottom = [], False
+    if scanner.crop is not None:
+        for k in range(3):
+            n = FLIP @ np.asarray(scanner.crop["axes"][k], float)
+            for side, face in enumerate(((n, -float(scanner.crop["lo"][k])), (-n, float(scanner.crop["hi"][k])))):
+                if (vertices @ face[0] + face[1]).min() < CROP_CUT_MM:
+                    planes.append(face)
+                    bottom |= k == 1 and side == 0
+    if bottom:  # (the stand is cut off)
+        return planes
+    if not scanner.remove_base or scanner.scene.mode != "still":
+        return planes
     if scanner.scene.plane is not None:
-        return scanner.scene.plane
+        return planes + [scanner.scene.plane]
     axis = scanner.turn_axis()
-    return None if axis is None else (axis, -float((vertices @ axis).min()))
+    return planes if axis is None else planes + [(axis, -float((vertices @ axis).min()))]
 
 
 def make_mesh(directory, which="merged", voxel_mm=VOXEL_MM, min_weight=MIN_WEIGHT, force=False, log=print, scanner=None,
@@ -351,9 +366,8 @@ def make_mesh(directory, which="merged", voxel_mm=VOXEL_MM, min_weight=MIN_WEIGH
     printable = None
     if close and len(triangles):
         from . import solid
-        plane = printing_plane(scanner, vertices)
         try:
-            v, t, c, report["solid"] = solid.close(vertices, triangles, colours, plane)
+            v, t, c, report["solid"] = solid.close(vertices, triangles, colours, printing_planes(scanner, vertices))
             printable = (v, t, c) if report["solid"]["edges_closed"] else None
         except Exception as e:  # (the scanned surface goes out as the STL then)
             report["solid"] = {"edges_closed": False, "error": str(e)}

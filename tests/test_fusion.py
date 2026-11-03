@@ -134,6 +134,23 @@ def test_a_scan_meshes_the_same_on_the_gpu_and_on_the_cpu():
             assert view3d.mesh_versions(out / "mesh.ply")["solid"] is not None
             fusion.make_mesh(out, log=lambda *a: None, close=False)  # an open mesh drops the old solid
             assert not (out / "solid.ply").exists() and view3d.mesh_versions(out / "mesh.ply")["solid"] is None
+            os.environ.pop("TRIBUUTSCAN_GPU", None)
+            from tribuutscan import optimise  # the 3D page's Crop: the lower 30% cut off, then all back
+            sc = cl.Scanner.restore(out, log=lambda *a: None)
+            ply = lambda name: (lambda r: np.stack([r["x"], r["y"], r["z"]], 1) * 1000)(view3d.read_ply(out / name))
+            whole, axes = ply("cloud.ply"), np.asarray(sc.crop_axes())  # (page axes, mm)
+            q = whole @ axes.T
+            lo, hi = q.min(0) - 1, q.max(0) + 1
+            lo[1] = q[:, 1].min() + 0.3 * np.ptp(q[:, 1])
+            message = optimise.process(sc, out, "crop", log=lambda *a: None, box=[*lo, *hi])
+            assert message.startswith("cropped") and "mesh:" in message, message
+            assert json.loads((out / "session.json").read_text())["crop"]["lo"][1] == lo[1]
+            for name in ("cloud.ply", "mesh.ply", "solid.ply"):
+                assert (ply(name) @ axes[1]).min() >= lo[1] - 0.01, name
+            assert (ply("solid.ply") @ axes[1]).min() < lo[1] + 0.01  # the solid cut flat at the box's bottom
+            assert len(ply("cloud.ply")) < len(whole)  # (a box seen mostly from above: its top kept)
+            assert optimise.process(sc, out, "crop-off", log=lambda *a: None).startswith("crop cleared")
+            assert len(ply("cloud.ply")) == len(whole) and json.loads((out / "session.json").read_text())["crop"] is None
             if meshes["auto"][0]["engine"].startswith("wgpu"):
                 import open3d as o3d
                 scene = o3d.t.geometry.RaycastingScene()

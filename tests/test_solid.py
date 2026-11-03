@@ -51,3 +51,16 @@ def test_edges_closed_and_ear_clipping():
     p = xy[tris]
     area = 0.5 * ((p[:, 1, 0] - p[:, 0, 0]) * (p[:, 2, 1] - p[:, 0, 1]) - (p[:, 1, 1] - p[:, 0, 1]) * (p[:, 2, 0] - p[:, 0, 0]))
     assert len(tris) == 4 and np.all(area > 0) and abs(area.sum() - 7.0) < 1e-9  # its 7 mm2, in its winding
+
+
+def test_two_planes_cut_one_after_the_other_each_capped_flat():
+    if solid is None:
+        return
+    v, t, _ = open_cylinder()
+    V, T, _, report = solid.close(v, t, None, plane=[(np.array([0.0, 0.0, 1.0]), 0.0), (np.array([-1.0, 0.0, 0.0]), 10.0)])
+    assert report["edges_closed"] and report["cut"] == 2 and solid.edges_closed(T)
+    assert V[:, 2].min() > -1e-6 and V[:, 0].max() < 10 + 1e-6  # nothing below the base, nothing beyond x = 10
+    tri = V[T]
+    area = 0.5 * np.linalg.norm(np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0]), axis=1)
+    side = np.abs(tri[:, :, 0] - 10).max(1) < 1e-3
+    assert abs(area[side].sum() / (2 * np.sqrt(20.0 ** 2 - 10.0 ** 2) * 40) - 1) < 0.05  # the cylinder's flat chord face

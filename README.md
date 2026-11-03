@@ -111,6 +111,10 @@ right: Scanner, Capture, Scan, IMU and View.
   slicers) and `solid.ply` (the STL's solid with the scan's colours, metres: for Blender). The STL is
   closed into a solid: what the scanner never saw (fingertips seen only from the side, the bottom of a
   stand) is filled in smoothly, and it is cut flat where the object stood on its base.
+  **Crop › Crop box** draws a box around the object, with its faces level with the table (or square
+  to the platform's turn). Six sliders move its faces in, and the view shows only what is inside.
+  *Apply* keeps that in the cloud and makes the mesh, the STL and the solid again (the solid is cut
+  flat at each face that cuts the object). *Clear crop* brings everything back.
 - **Save frame (s)** writes one colour + IR + depth set (and a `cloud.ply`) to `captures/<stamp>/`.
   **Record (r)** writes colour + depth sets at 30 (or 10) a second, plus the IMU's samples
   (`imu.csv`, 200 a second), for processing later. Depth is compressed losslessly and IR is left

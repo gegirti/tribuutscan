@@ -428,6 +428,30 @@ def test_output_leaves_out_base_background_and_floating_bits():
         assert keep[kinds == "obj"].all()
 
 
+def test_the_crop_box_is_level_with_the_base_and_keeps_what_is_inside():
+    s = cl.Scanner("small", log=lambda m: None)
+    assert np.allclose(s.crop_axes(), np.eye(3))  # no base, no platform: the first camera's axes
+    a = np.radians(35.0)
+    up = np.array([0.0, -np.cos(a), -np.sin(a)])  # world: the base's normal, the scanner looking down 35 degrees
+    s.scene.plane, s.scene.axis = (up, 0.0), np.zeros(3)
+    s.scene.radius, s.scene.top = 60.0, 100.0
+    axes = s.crop_axes()
+    assert np.allclose(axes @ axes.T, np.eye(3)) and np.isclose(np.linalg.det(axes), 1.0)
+    assert np.allclose(axes[1], cl.FLIP @ up) and abs(axes[0, 1]) < 1e-12  # y up from the base, x level
+    side = np.cross(up, [1.0, 0.0, 0.0])
+    t, h = np.meshgrid(np.linspace(0, 2 * np.pi, 120), np.arange(4.0, 50.0, 1.5))
+    ring = np.outer(np.cos(t.ravel()), [1.0, 0.0, 0.0]) + np.outer(np.sin(t.ravel()), side)
+    can = 25 * ring + np.outer(h.ravel(), up)  # a can standing on the base
+    s.cloud.add(can, np.zeros((len(can), 3), np.uint8))
+    centre = s.cloud.xyz / s.cloud.n[:, None]
+    height, x = centre @ up, (centre @ cl.FLIP.T) @ axes[0]
+    assert s.output_mask(centre).all()
+    s.crop = {"axes": axes.tolist(), "lo": [-100.0, 20.0, -100.0], "hi": [0.0, 100.0, 100.0]}
+    keep = s.output_mask(centre)
+    assert keep.any() and np.all(height[keep] >= 20 - 1e-9) and np.all(x[keep] <= 1e-9)
+    assert keep[(height > 21) & (x < -1)].all()  # the half above 20 mm, cut level with the base
+
+
 def test_a_saved_scan_keeps_what_fusing_again_needs():
     """Every tracked frame's pose, its labels, the source recording and the camera survive save and
     restore, and Optimise's corrections move the frames between merged ones too."""
@@ -713,12 +737,12 @@ def test_markers_in_view_correct_a_solve_that_used_none():
 def test_a_platform_scan_knows_the_axis_it_turned_about():
     """turn_axis: poses turned up to 120 degrees about a vertical line 300 mm in front of the first camera give
     that line's direction, pointing up (the cameras' up: -y); a scan that did not turn on a platform gives none."""
-    from tribuutscan import track
     sc = cl.Scanner(log=lambda *a: None)
     axis, point = np.array([0.0, -1.0, 0.0]), np.array([0.0, 0.0, 0.3])
+    cross = np.array([[0, -axis[2], axis[1]], [axis[2], 0, -axis[0]], [-axis[1], axis[0], 0]])
     for i, deg in enumerate(np.linspace(0, 120, 61)):
-        m = np.eye(4)
-        m[:3, :3] = track.exp_se3(np.r_[axis * np.radians(deg), 0, 0, 0])[:3, :3]
+        m, a = np.eye(4), np.radians(deg)
+        m[:3, :3] = np.eye(3) + np.sin(a) * cross + (1 - np.cos(a)) * cross @ cross  # (Rodrigues: needs no Open3D)
         m[:3, 3] = point - m[:3, :3] @ point
         sc.track_log.append((i, "tracked", m))
     assert sc.turn_axis() is None  # (not noticed as a platform)

@@ -1267,6 +1267,30 @@ cubes on the GPU; the CPU keeps the 6x6 solve, markers, base votes, pose graph, 
     and axes as mesh.ply, for Blender; only when the solid closed (a stale one is removed). The 3D page: Show
     Solid, Export "Download solid.ply" (/solid.bin, /solid.ply; info.json "solid" = its mtime). The 09:22
     platform replay: 18.7 MB, colours as on the open mesh (grey fingertips are what the scan saw).
+  - CROP (Phase 5, 2026-11-03): the 3D page's Crop › Crop box: a box (Box3Helper wireframe) with six sliders
+    and a live preview (three.js clipping planes on the cloud and mesh materials); Apply posts
+    /process/crop?box=lo xyz,hi xyz (mm along the box's axes), Clear crop /process/crop-off.
+    - `Scanner.crop` {"axes", "lo", "hi"} in session.json; `in_crop` is part of `output_mask` (before the
+      connectivity step), so cloud, live view, mesh vertices, solid and STL follow. Continued and merged
+      scans drop it.
+    - Axes (`cloud.crop_axes`): y along the base's normal, else the platform's turn axis (`cloud.turn_axis`,
+      now a function), x the first camera's x laid square to it; else the first camera's axes. session.json
+      "crop_axes"; for older sessions the file server works them out from scene.json + frame poses
+      (`saved_crop_axes`, equal to the restored Scanner's on three replays).
+    - The solid is cut flat at every box face the mesh comes within CROP_CUT_MM 1 of
+      (`fusion.printing_planes`, solid.close takes a list, each cut capped before the next); unless the
+      bottom face is one of them, the base / turn-axis cut too. A cut side left to Poisson: 26% added, up
+      to 30 mm out; cut flat: 21-24% (the caps), 14 mm.
+    - A face left at 0 stands 5 mm clear of the cloud: the fused mesh reaches up to 1.3 mm past the cloud
+      (fingertips, both platform replays), and a face 1 mm out trimmed it. With a saved crop the sliders
+      start at its faces.
+    - After Apply the mesh is made again when there is one (09:22 replay copy: 31 s; 184,949 points kept);
+      Clear crop gave back the same 334,801 points and 491,968 triangles. Checked in headless Chrome:
+      the box, the clipping, and the page's own Apply.
+  - FIXED with it: `Scanner.restore` now takes the saved scan's depth mode (`use_mode`; continue_from keeps
+    the scanner's). The stand-alone 3D view's Process actions (Optimise again, Merge again, base, crop)
+    re-saved a long-range scan under the close law's mode and camera fingerprint, and its mesh was then
+    refused ("tracked with the board camera (...), this is the board one (...)").
     - The 17:07 replay (no view from above, no base): closed, flat-bottomed, 14% added.
 - Optimise's message (2026-11-03) gives the largest correction AT THE OBJECT: how far a keyframe's view of the
   object moves in the world, plus the turn in degrees. The camera's move ("largest_correction_mm") is still in

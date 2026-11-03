@@ -29,7 +29,7 @@ from . import frames as fr
 from . import markers
 from . import pointcloud as pc
 from . import prep
-from .calib import CAMERA
+from .calib import CAMERA, CLOSE
 from .image import yuyv_pixels, yuyv_to_rgb
 
 PRESETS_MM = {"small": 0.5, "medium": 1.0, "large": 2.0}  # point distance; depth noise ~1 mm (estimate)
@@ -518,6 +518,57 @@ def write_poses(path, poses):
             f.write(f"{i} " + " ".join(f"{v:.6f}" for v in p.ravel()) + "\n")
 
 
+def turn_axis(poses, min_deg=TURN_AXIS_MIN_DEG):
+    """The axis a platform turned the object about (unit, world, pointing the way the cameras' up does) over
+    the tracked camera poses, or None: turned less than `min_deg`. Each pose relative to the first is a turn
+    about it (rotations of 150 degrees and more, where the axis is ill-defined, left out)."""
+    if len(poses) < 10:
+        return None
+    axes = []
+    for p in poses[::5]:
+        r = (p @ np.linalg.inv(poses[0]))[:3, :3]
+        angle = np.arccos(np.clip((np.trace(r) - 1) / 2, -1, 1))
+        if np.radians(min_deg) <= angle <= np.radians(150):
+            a = np.array([r[2, 1] - r[1, 2], r[0, 2] - r[2, 0], r[1, 0] - r[0, 1]])
+            axes.append(a / np.linalg.norm(a))
+    if not axes:
+        return None
+    axes = np.array(axes)
+    axes[axes @ axes[0] < 0] *= -1
+    axis = axes.mean(0)
+    axis /= np.linalg.norm(axis)
+    up = -np.mean([p[:3, 1] for p in poses], axis=0)  # (a camera's y axis points down)
+    return axis if axis @ up >= 0 else -axis
+
+
+def crop_axes(up):
+    """The axes of the 3D page's crop box (rows, in cloud.ply's axes: x right, y up, z toward the first camera)
+    for `up` (world: the base's normal or a platform's turn axis): y along it, so the box's faces cut level with
+    the table, x the first camera's x laid square to it; without `up` the first camera's own."""
+    if up is None:
+        return np.eye(3)
+    y = FLIP @ up
+    x = np.array([1.0, 0.0, 0.0]) - y[0] * y
+    if np.linalg.norm(x) < 0.1:  # (up along the camera's x: the scanner held on its side)
+        x = np.array([0.0, 0.0, 1.0]) - y[2] * y
+    x /= np.linalg.norm(x)
+    return np.stack([x, y, np.cross(x, y)])
+
+
+def saved_crop_axes(directory, session):
+    """Scanner.crop_axes of a saved scan, from its scene.json and tracked poses (for sessions saved before
+    session.json noted them)."""
+    directory = Path(directory)
+    scene = json.loads((directory / "scene.json").read_text()) if (directory / "scene.json").exists() else {}
+    up = None
+    if scene.get("mode", "still") == "still" and scene.get("plane"):
+        up = np.array(scene["plane"][0])
+    elif session.get("object_turns"):
+        path = next((p for p in (directory / "frame_poses.txt", directory / "poses.txt") if p.exists()), None)
+        up = None if path is None else turn_axis([p for _, p in read_poses(path)])
+    return crop_axes(up)
+
+
 def read_poses(path):
     """[(index, 4x4 pose)] from a poses.txt-format file."""
     text = Path(path).read_text()
@@ -683,6 +734,7 @@ class Scanner:
         self.track_log = []  # per frame: (index, status, pose or None); for evaluation
         self.on_merge = None  # optional callback(index, world_xyz_mm, rgb, world_normals, pose)
         self.remove_base = remove_base  # the saved/shown cloud leaves the base out (it is merged either way)
+        self.crop = None  # the 3D page's crop box, {"axes", "lo", "hi"} (in_crop): the output keeps what is inside
         self.last_view = None  # (pixels, object mask, base mask, shape) of the last tracked frame, for the viewer
         self.labels = {}  # index -> view_mask of every tracked frame (what fusion takes as object / base)
         self.sources = []  # [{"rec": recording dir, "first_index": scanner index of its frame 0}]
@@ -913,30 +965,9 @@ class Scanner:
         return [(i, p) for i, _, p in self.track_log if p is not None] or list(self.poses)
 
     def turn_axis(self, min_deg=TURN_AXIS_MIN_DEG):
-        """The axis a platform turned the object about (unit, world, pointing the way the cameras' up does), or
-        None: not a platform scan (object_turns), or turned less than `min_deg`. Each tracked pose relative to
-        the first is a turn about it (rotations of 150 degrees and more, where the axis is ill-defined, left
-        out). With no base found, the printable solid is cut square to it (fusion.printing_plane)."""
-        if not self.object_turns:
-            return None
-        poses = [p for _, p in self.frame_poses()]
-        if len(poses) < 10:
-            return None
-        axes = []
-        for p in poses[::5]:
-            r = (p @ np.linalg.inv(poses[0]))[:3, :3]
-            angle = np.arccos(np.clip((np.trace(r) - 1) / 2, -1, 1))
-            if np.radians(min_deg) <= angle <= np.radians(150):
-                a = np.array([r[2, 1] - r[1, 2], r[0, 2] - r[2, 0], r[1, 0] - r[0, 1]])
-                axes.append(a / np.linalg.norm(a))
-        if not axes:
-            return None
-        axes = np.array(axes)
-        axes[axes @ axes[0] < 0] *= -1
-        axis = axes.mean(0)
-        axis /= np.linalg.norm(axis)
-        up = -np.mean([p[:3, 1] for p in poses], axis=0)  # (a camera's y axis points down)
-        return axis if axis @ up >= 0 else -axis
+        """The axis a platform turned the object about (turn_axis), or None: not a platform scan (object_turns).
+        With no base found, the printable solid is cut square to it (fusion.printing_planes)."""
+        return turn_axis([p for _, p in self.frame_poses()], min_deg) if self.object_turns else None
 
     def merge(self, frame, index, pose, pix, step=1):
         """Merge one tracked frame's object pixels (cleaned, with normals) into the cloud; `pix` sampled every
@@ -1004,10 +1035,14 @@ class Scanner:
         self.model_levels = None  # rebuilt from the corrected cloud
 
     @classmethod
-    def restore(cls, directory, log=print):
-        """A Scanner rebuilt from a saved session (keyframes, merged frames, scene), for Optimise."""
+    def restore(cls, directory, log=print, use_mode=True):
+        """A Scanner rebuilt from a saved session (keyframes, merged frames, scene), for Optimise. With
+        `use_mode` the camera takes the scan's depth mode: what is saved again notes it (a long-range scan
+        re-saved by the 3D page's Process under the close law no longer matched its camera for the mesh)."""
         directory = Path(directory)
         session = json.loads((directory / "session.json").read_text())
+        if use_mode:
+            CAMERA.set_mode(session.get("depth_mode") or CLOSE)
         sc = cls(session.get("preset", "small"), log=log, mode=session.get("mode", "still"),
                  remove_base=session.get("remove_base", True))
         kf = load_npz(directory / "keyframes.npz")
@@ -1026,6 +1061,7 @@ class Scanner:
         sc.pose = sc.last_merged = sc.poses[-1][1]
         sc.stats.update({k: session[k] for k in ("frames", "merged", "lost", "relocked", "shape_refinds") if k in session})
         sc.object_turns = sc.stats["object_turns"] = bool(session.get("object_turns", False))
+        sc.crop = session.get("crop")
         sc.sources = list(session.get("sources", []))
         if (directory / "frame_poses.txt").exists():  # every tracked frame (scans saved before 2026-11-01: none)
             status = {}
@@ -1044,8 +1080,9 @@ class Scanner:
     @classmethod
     def continue_from(cls, directory, log=print):
         """A Scanner that goes on with a saved scan: restored, and re-finding its place first."""
-        sc = cls.restore(directory, log=log)
+        sc = cls.restore(directory, log=log, use_mode=False)  # (the scanner's own mode goes on)
         sc.refind_needed = True
+        sc.crop = None  # (it would hide what is scanned next)
         sc.prev, sc.prev_feat = None, None
         return sc
 
@@ -1534,22 +1571,37 @@ class Scanner:
             xyz = xyz[scene.height(xyz) > OBJECT_ABOVE_MM]
         return xyz
 
+    def crop_axes(self):
+        """The axes of the 3D page's crop box (crop_axes): along the base's normal, or the platform's turn axis."""
+        scene = self.scene
+        return crop_axes(scene.plane[0] if scene.mode == "still" and scene.plane is not None else self.turn_axis())
+
+    def in_crop(self, xyz):
+        """Which points (world mm) lie inside the crop box: `crop` {"axes": crop_axes rows, "lo", "hi": mm
+        along them}; all of them without one."""
+        if self.crop is None:
+            return np.ones(len(xyz), bool)
+        q = xyz @ (np.asarray(self.crop["axes"]) @ FLIP).T
+        return np.all((q >= self.crop["lo"]) & (q <= self.crop["hi"]), axis=1)
+
     def output_mask(self, xyz, connect=True):
         """Which cubes (world centres, mm) are shown and saved: inside the object's region (the
         cylinder on the base, or the ball when no base was found), above the base when remove_base,
-        and (`connect`) only what is connected to the object's core, which drops floating leftovers."""
-        scene, keep = self.scene, np.ones(len(xyz), bool)
+        inside the crop box when there is one, and (`connect`) only what is connected to the object's
+        core, which drops floating leftovers."""
+        scene, keep = self.scene, self.in_crop(xyz)
         if scene.mode != "still" or not len(xyz):
             return keep
         if scene.plane is not None and scene.axis is not None:
             n, h = scene.plane[0], scene.height(xyz)
             r = np.linalg.norm(xyz - np.outer((xyz - scene.axis) @ n, n) - scene.axis, axis=1)
-            keep = (r <= scene.radius) & (h <= scene.top) & (h > (OBJECT_ABOVE_MM if self.remove_base else -PLANE_TOL_MM))
+            keep &= (r <= scene.radius) & (h <= scene.top) & (h > (OBJECT_ABOVE_MM if self.remove_base else -PLANE_TOL_MM))
             core = keep & (h > OBJECT_ABOVE_MM) & (r <= max(scene.radius - scene_margin(), scene.radius / 2))
         elif scene.ball is not None:
             centre, radius, _ = scene.ball
             d = np.linalg.norm(xyz - centre, axis=1)
-            keep, core = d <= radius, d <= radius / 2
+            keep &= d <= radius
+            core = keep & (d <= radius / 2)
         else:
             return keep
         if connect and core.any() and keep.sum() > core.sum():
@@ -1571,6 +1623,7 @@ class Scanner:
         self.trim_table()
         self.stats["remove_base"], self.stats["base_found"] = self.remove_base, self.scene.plane is not None
         self.stats["sources"] = self.sources
+        self.stats["crop"], self.stats["crop_axes"] = self.crop, self.crop_axes().round(6).tolist()
         out = save(directory, self.output_cloud(), self.poses, self.stats, self.preset, min_seen)
         self.save_state(directory)
         return out

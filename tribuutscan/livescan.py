@@ -122,13 +122,15 @@ class LiveSource:
                     "preset": s.preset, "point_distance_mm": s.cloud.point_mm,
                     "raw_points": s.cloud.raw_points,
                     **{k: s.stats[k] for k in ("frames", "merged", "lost", "relocked", "tracking")},
-                    "cue": dict(s.cue)}}
+                    "cue": dict(s.cue), "crop": s.crop}}
+                if self.phase != "scanning":  # (turn_axis reads every tracked pose: only for a finished scan's Crop)
+                    info["session"]["crop_axes"] = s.crop_axes().round(6).tolist()
                 self.cached = ("-".join(map(str, key)), payload, info)
                 self.built_key, self.built_at = key, time.time()
             return self.cached[0], self.cached[1], dict(self.cached[2], **view3d.mesh_versions(self.mesh_path()))
 
 
-    def process(self, action):
+    def process(self, action, box=None):
         """A Process-menu action from the page, on the last finished scan."""
         from . import optimise
         if self.scanner is None or self.phase in ("scanning", "optimising"):
@@ -136,7 +138,7 @@ class LiveSource:
         with self.busy:
             self.phase = "optimising"
             try:
-                return optimise.process(self.scanner, self.out_dir, action, log=lambda m: None)
+                return optimise.process(self.scanner, self.out_dir, action, log=lambda m: None, box=box)
             finally:
                 self.phase = "done"
                 self.built_key = None

@@ -182,10 +182,12 @@ def make_mesh(scanner, directory, depth=9):
     return len(mesh.triangles)
 
 
-def process(scanner, directory, action, log=print):
+def process(scanner, directory, action, log=print, box=None):
     """A Process-menu action on a finished scan: "optimise", "small"/"medium"/"large" (merge again at
-    that point distance), "mesh", or "base-off"/"base-on" (save the cloud without / with the base it
-    stands on). Saves the result into `directory`; returns a short message."""
+    that point distance), "mesh", "base-off"/"base-on" (save the cloud without / with the base it
+    stands on), or "crop" (keep what lies inside `box`: lo xyz, hi xyz, mm along Scanner.crop_axes) /
+    "crop-off". Saves the result into `directory` (after a crop the mesh too, when there is one);
+    returns a short message."""
     from . import cloud as cl
     directory = Path(directory)
     if action == "optimise":
@@ -215,6 +217,20 @@ def process(scanner, directory, action, log=print):
         scanner.remove_base = action == "base-off"
         _, kept = scanner.save(directory)
         return f"base {'removed' if scanner.remove_base else 'kept'}: {kept:,} points (make the mesh again)"
+    if action in ("crop", "crop-off"):
+        if action == "crop":
+            box = np.asarray([] if box is None else box, float)
+            if box.shape != (6,) or not np.isfinite(box).all() or (box[:3] >= box[3:]).any():
+                return "crop needs a box: six numbers in mm, each low below its high"
+            axes = scanner.crop["axes"] if scanner.crop is not None else scanner.crop_axes().round(6).tolist()
+            scanner.crop = {"axes": axes, "lo": box[:3].tolist(), "hi": box[3:].tolist()}
+        else:
+            scanner.crop = None
+        _, kept = scanner.save(directory)
+        message = f"{'cropped' if scanner.crop else 'crop cleared'}: {kept:,} points"
+        if (directory / "mesh.ply").exists():  # the mesh, its solid and the STL follow
+            message += "; " + process(scanner, directory, "mesh", log)
+        return message
     raise ValueError(f"unknown action {action}")
 
 

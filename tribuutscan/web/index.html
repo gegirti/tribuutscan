@@ -48,7 +48,15 @@
   #empty { position: fixed; inset: 0; display: none; place-items: center; text-align: center;
     color: var(--muted); pointer-events: none; z-index: 1; padding: 0 24px; }
   #empty.show { display: grid; }
-  @media (max-width: 600px) { aside { left: 12px; right: 12px; width: auto; top: auto; bottom: 12px; } }
+  #cropbox { right: auto; left: 12px; }
+  #cropbox label { display: flex; justify-content: space-between; margin: 8px 0 2px; }
+  #cropbox output { color: var(--text); font-variant-numeric: tabular-nums; }
+  .buttons { display: flex; gap: 8px; margin-top: 12px; }
+  .buttons button { flex: 1; padding: 6px; border-radius: 6px; border: 1px solid var(--line); font: inherit;
+    background: var(--bg); color: var(--text); cursor: pointer; }
+  .buttons button.main { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+  @media (max-width: 600px) { aside { left: 12px; right: 12px; width: auto; top: auto; bottom: 12px; }
+    #cropbox { top: 52px; bottom: auto; } }
 </style>
 <script type="importmap">{ "imports": { "three": "./three.module.min.js" } }</script>
 </head>
@@ -68,6 +76,10 @@
     <li data-action="mesh">Make mesh<small>fuse the frames</small></li>
     <li data-action="base-off">Remove base<small>save without the table</small></li>
     <li data-action="base-on">Keep base<small>save with the table under it</small></li>
+  </ul></div>
+  <div class="menu"><button>Crop</button><ul>
+    <li id="crop-open">Crop box…<small>keep what is inside</small></li>
+    <li id="crop-off" data-action="crop-off" class="later">Clear crop<small>everything back</small></li>
   </ul></div>
   <div class="menu"><button>Export</button><ul>
     <li id="dl-ply">Download cloud.ply</li>
@@ -109,6 +121,25 @@
   </select>
   <div class="hint">Drag to orbit, right-drag to pan, scroll to zoom. Colour: grey shows the mesh's shape.</div>
 </aside>
+<aside id="cropbox" hidden>
+  <h2>Crop box</h2>
+  <label for="c0">Left<output id="v0">0 mm</output></label>
+  <input id="c0" type="range" min="0" max="1" step="1" value="0">
+  <label for="c3">Right<output id="v3">0 mm</output></label>
+  <input id="c3" type="range" min="0" max="1" step="1" value="0">
+  <label for="c1">Bottom<output id="v1">0 mm</output></label>
+  <input id="c1" type="range" min="0" max="1" step="1" value="0">
+  <label for="c4">Top<output id="v4">0 mm</output></label>
+  <input id="c4" type="range" min="0" max="1" step="1" value="0">
+  <label for="c2">Back<output id="v2">0 mm</output></label>
+  <input id="c2" type="range" min="0" max="1" step="1" value="0">
+  <label for="c5">Front<output id="v5">0 mm</output></label>
+  <input id="c5" type="range" min="0" max="1" step="1" value="0">
+  <div class="buttons"><button id="crop-apply" class="main">Apply</button><button id="crop-cancel">Cancel</button></div>
+  <div class="hint">Each slider moves one face of the box in; at 0 it stands 5 mm clear of the object. The faces
+    are level with the table (or square to the platform's turn). Apply keeps what is inside: cloud, mesh, STL and solid (the solid is cut flat at the
+    bottom face). Crop › Clear crop brings everything back.</div>
+</aside>
 <script type="module">
 import * as THREE from "three";
 import { OrbitControls } from "./OrbitControls.js";
@@ -128,10 +159,19 @@ scene.add(new THREE.HemisphereLight(0xffffff, 0x404048, 1.2));
 const headlight = new THREE.DirectionalLight(0xffffff, 1.6);
 camera.add(headlight);  // lights the mesh from where you look
 scene.add(camera);
-let points = null, data = null, version = null, pointMm = 1, framed = false, messageAt = 0;
+let points = null, data = null, version = null, pointMm = 1, framed = false, messageAt = 0, session = {};
 const shapes = { mesh: { obj: null, version: null, rgb: null }, solid: { obj: null, version: null, rgb: null } };
 const SHAPE_NAMES = { mesh: "Mesh", solid: "Solid" };  // the scanned surface; the closed solid (as the STL)
 const $ = (id) => document.getElementById(id);
+
+renderer.localClippingEnabled = true;  // the crop box, while it is set up
+const cropGroup = new THREE.Group(), cropBox = new THREE.Box3();
+cropGroup.add(new THREE.Box3Helper(cropBox, 0xe0457b));
+cropGroup.matrixAutoUpdate = false;
+cropGroup.visible = false;
+scene.add(cropGroup);
+let cropExt = null, unclipOnMesh = false;  // the box with every slider at 0: [lo, hi], mm along the crop axes
+const CROP_MARGIN_MM = 5;  // a face left at 0 stands this far clear of the cloud (the mesh reaches up to ~1.3 mm past it)
 
 function resize() {
   renderer.setSize(window.innerWidth, window.innerHeight, false);
@@ -237,9 +277,101 @@ async function load() {
   if (!framed && n > 0) { frame(); framed = true; }
 }
 
+function cropAxes() {  // the box's axes (rows, the page's axes): the saved crop's, else the scan's (server)
+  return (session.crop && session.crop.axes) || session.crop_axes || [[1, 0, 0], [0, 1, 0], [0, 0, 1]];
+}
+
+function openCrop() {
+  if (!data || !data.n) return;
+  const A = cropAxes(), lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity], xyz = data.xyz;
+  for (let i = 0; i < data.n; i++) {
+    const x = xyz[3 * i], y = xyz[3 * i + 1], z = xyz[3 * i + 2];
+    for (let k = 0; k < 3; k++) {
+      const q = 1000 * (A[k][0] * x + A[k][1] * y + A[k][2] * z);
+      if (q < lo[k]) lo[k] = q;
+      if (q > hi[k]) hi[k] = q;
+    }
+  }
+  const saved = session.crop, start = [];  // with a saved box the sliders start at its faces (whole mm from 0)
+  for (let k = 0; k < 3; k++) {
+    if (saved) {
+      lo[k] = saved.lo[k] - Math.max(0, Math.ceil(saved.lo[k] - (lo[k] - CROP_MARGIN_MM)));
+      hi[k] = saved.hi[k] + Math.max(0, Math.ceil(hi[k] + CROP_MARGIN_MM - saved.hi[k]));
+    } else {
+      lo[k] = Math.floor(lo[k] - CROP_MARGIN_MM);
+      hi[k] = Math.ceil(hi[k] + CROP_MARGIN_MM);
+    }
+  }
+  for (let f = 0; f < 6; f++) start.push(!saved ? 0 : f < 3 ? saved.lo[f] - lo[f] : hi[f - 3] - saved.hi[f - 3]);
+  cropExt = [lo, hi];
+  for (let f = 0; f < 6; f++) {
+    $(`c${f}`).max = String(Math.max(1, Math.round(hi[f % 3] - lo[f % 3] - 1)));
+    $(`c${f}`).value = String(Math.round(start[f]));
+  }
+  cropGroup.matrix.makeBasis(...A.map((a) => new THREE.Vector3(...a)));  // box axes -> the page's
+  cropGroup.matrixWorldNeedsUpdate = true;
+  cropGroup.visible = true;
+  $("cropbox").hidden = false;
+  cropChanged();
+}
+
+function cropBoxMm() {  // the box as the sliders set it: [lo, hi], mm along the axes
+  const [elo, ehi] = cropExt, lo = [], hi = [];
+  for (let k = 0; k < 3; k++) {
+    let a = elo[k] + Number($(`c${k}`).value), b = ehi[k] - Number($(`c${k + 3}`).value);
+    if (b - a < 1) { a = (a + b) / 2 - 0.5; b = a + 1; }  // (two faces met)
+    lo.push(a); hi.push(b);
+  }
+  return [lo, hi];
+}
+
+function setClipping(box) {  // show only what lies inside the box (null: everything)
+  const planes = [];
+  if (box) {
+    const A = cropAxes();
+    for (let k = 0; k < 3; k++) {  // kept where normal . p + constant >= 0
+      const a = new THREE.Vector3(...A[k]);
+      planes.push(new THREE.Plane(a.clone(), -box[0][k] / 1000), new THREE.Plane(a.clone().negate(), box[1][k] / 1000));
+    }
+  }
+  for (const m of [material, meshMaterial]) {
+    if ((m.clippingPlanes || []).length !== planes.length) m.needsUpdate = true;  // (another shader)
+    m.clippingPlanes = planes;
+  }
+}
+
+function cropChanged() {
+  const box = cropBoxMm();
+  cropBox.min.set(...box[0].map((v) => v / 1000));
+  cropBox.max.set(...box[1].map((v) => v / 1000));
+  for (let f = 0; f < 6; f++) $(`v${f}`).textContent = `${$(`c${f}`).value} mm`;
+  setClipping(box);
+}
+
+function closeCrop(keepClipping) {
+  $("cropbox").hidden = true;
+  cropGroup.visible = false;
+  if (!keepClipping) setClipping(null);
+}
+
+async function runAction(action, label, query = "") {  // a Process action; its message in the status line
+  $("status").textContent = `working: ${label}…`;
+  messageAt = Date.now() + 600000;  // until the answer comes
+  try {
+    const r = await (await fetch(`process/${action}${query}`, { method: "POST" })).json();
+    $("status").textContent = r.message;
+    messageAt = Date.now();
+    return r.message;
+  } catch (e) {
+    $("status").textContent = "failed: server stopped";
+    return "";
+  }
+}
+
 async function poll() {
   try {
     const info = await (await fetch("info.json")).json();
+    session = info.session || {};
     if (info.version !== version) {
       version = info.version;
       await load();
@@ -264,6 +396,8 @@ async function poll() {
     $("dl-mesh").classList.toggle("later", !info.mesh);
     $("dl-stl").classList.toggle("later", !info.mesh);
     $("dl-solid").classList.toggle("later", !info.solid);
+    $("crop-off").classList.toggle("later", !session.crop);
+    let reloaded = false;
     for (const kind in shapes) {
       const option = $("show").querySelector(`option[value="${kind}"]`), shape = shapes[kind];
       option.disabled = !info[kind];
@@ -271,6 +405,7 @@ async function poll() {
       if (info[kind] && info[kind] !== shape.version) {
         shape.version = info[kind];
         await loadMesh(kind);
+        reloaded = true;
         if (kind === "mesh") { $("show").value = "mesh"; showWhich(); }  // a new mesh: show it
       } else if (!info[kind] && shape.obj) {
         dropShape(kind); shape.version = null;
@@ -278,6 +413,7 @@ async function poll() {
         showWhich();
       }
     }
+    if (reloaded && unclipOnMesh) { unclipOnMesh = false; setClipping(null); }  // the cropped mesh is here
   } catch (e) {
     $("status").textContent = "server stopped";
   }
@@ -297,17 +433,19 @@ $("dl-ply").addEventListener("click", () => { location.href = "cloud.ply"; });
 $("dl-mesh").addEventListener("click", () => { if (!$("dl-mesh").classList.contains("later")) location.href = "mesh.ply"; });
 $("dl-stl").addEventListener("click", () => { if (!$("dl-stl").classList.contains("later")) location.href = "mesh.stl"; });
 $("dl-solid").addEventListener("click", () => { if (!$("dl-solid").classList.contains("later")) location.href = "solid.ply"; });
-document.querySelectorAll("[data-action]").forEach((li) => li.addEventListener("click", async () => {
-  $("status").textContent = `working: ${li.textContent.trim()}…`;
-  messageAt = Date.now() + 600000;  // until the answer comes
-  try {
-    const r = await (await fetch(`process/${li.dataset.action}`, { method: "POST" })).json();
-    $("status").textContent = r.message;
-    messageAt = Date.now();
-  } catch (e) {
-    $("status").textContent = "failed: server stopped";
-  }
+document.querySelectorAll("[data-action]").forEach((li) => li.addEventListener("click", () => {
+  if (!li.classList.contains("later")) runAction(li.dataset.action, li.textContent.trim());
 }));
+$("crop-open").addEventListener("click", openCrop);
+for (let f = 0; f < 6; f++) $(`c${f}`).addEventListener("input", cropChanged);
+$("crop-cancel").addEventListener("click", () => closeCrop(false));
+$("crop-apply").addEventListener("click", async () => {
+  const [lo, hi] = cropBoxMm(), meshBefore = shapes.mesh.version;
+  closeCrop(true);  // the clipping shows the result until the cropped mesh arrives
+  const message = await runAction("crop", "cropping", `?box=${[...lo, ...hi].map((v) => v.toFixed(1)).join(",")}`);
+  if (meshBefore && shapes.mesh.version === meshBefore && message.startsWith("cropped")) unclipOnMesh = true;
+  else setClipping(null);  // (no mesh, it came already, or the crop failed)
+});
 $("dl-png").addEventListener("click", () => {
   const a = document.createElement("a");
   a.href = canvas.toDataURL("image/png"); a.download = "triBUUTSCAN-view.png"; a.click();

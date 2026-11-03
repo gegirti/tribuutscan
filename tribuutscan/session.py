@@ -105,6 +105,7 @@ def merge(dir_a, dir_b, out, log=print):
     a.labels.update({i + offset: m for i, m in b.labels.items()})
     a.sources += [{**src, "first_index": src["first_index"] + offset} for src in b.sources]
     a.remerge({})
+    a.crop = None  # (A's crop would cut B)
     report = optimise.optimise(a, log)
     Path(out).mkdir(parents=True, exist_ok=True)
     a.save(Path(out))
