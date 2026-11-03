@@ -1273,6 +1273,21 @@ cubes on the GPU; the CPU keeps the 6x6 solve, markers, base votes, pose graph, 
   optimise.json and evaluate's "corr mm"; "corr obj" is the new one. First platform recording replayed with
   all of 2026-11-03's code: 505 of 505 tracked (live 465), Optimise 117 loops, 0.32 mm at the object (0.51
   degrees), 2.99 mm at the camera.
+- LIVE SPEED, step 5 (2026-11-03, Phase 5, plan approved): hand-held scans at 20 fps, tracking unchanged.
+  - The room test settles: after ROOM_SETTLED 5 "moved" verdicts and no "still", check_room stops (each check
+    ~80 ms of nearest-point trees, ~4.5 ms a frame over a hand-held scan; a platform scan stops at object_turns).
+  - One axial geometry per frame (`scene.axial`, `Scene._axial`, cached by the points' id, the transform and the
+    region): height above the kept base and squared radius from the region's axis, computed once at the pose
+    guess and shared by table_in_camera, core and the source cut; masks computes it once at the solved pose.
+  - Markers when none are seen: after MARKER_IDLE_FRAMES 30, every 8th frame (was every 4th after 15).
+  - evaluate (captures/eval/20261103-122738-speed5 against 20261103-094020-topclean): every dataset identical
+    except synth (158 vs 159 tracked) in that run; run alone, new code and HEAD both gave 159 / ATE 0.333 twice
+    each (the full run shared the GPU with a fusion job). evaluate's ms a frame hand 47.9 -> 40.9, markers 77 -> 74.
+  - bench (hand2, captures/bench/20261103-141209-stages-new vs -141252-stages-head): feed 50.0 -> 37.5 ms a frame
+    (base masks 6.2 -> 2.6, markers 2.9 -> 1.8). bench --live hand2, alternating with HEAD at load 6-7: 20.2 /
+    20.9 fps against 17.8 / 17.7, 440 tracked each.
+  - Next lever (not done): the 6x6 solve on the GPU (whole ICP levels in one submission; the wgpu layer is ~11 ms
+    a frame, ~7 of it GPU work).
 - LIVE SPEED, step 4 (2026-11-02, plan approved): a live frame's depth decoded where it is used.
   - The decode paths:
     - `depth.decode_strided`: the first pixel of each packed group, every 4th row, plus the

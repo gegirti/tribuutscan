@@ -76,12 +76,14 @@ ROOM_EVERY_S, ROOM_GRID_PX, ROOM_POINTS = 1.0, 8, 5000  # check_room: once per s
     # pixels on an 8-pixel grid (the same pixels in every frame: a still room's samples stay where they were), at most
     # ROOM_POINTS of a keyframe's looked for in a later one. At every keyframe on the full stride-4 room it cost the
     # live worker 10-25% of its frame rate on the hand-held hand scan
-ROOM_SHIFT_MM, ROOM_MIN, ROOM_TOL_MM, ROOM_CLEAR, ROOM_VERDICTS = 10.0, 300, 4.0, 0.5, 3
+ROOM_SHIFT_MM, ROOM_MIN, ROOM_TOL_MM, ROOM_CLEAR, ROOM_VERDICTS, ROOM_SETTLED = 10.0, 300, 4.0, 0.5, 3, 5
     # points the tracked motion moves ROOM_SHIFT_MM or more count (ROOM_MIN of them for a verdict); a point is where a
     # hypothesis puts it within ROOM_TOL_MM; a verdict needs ROOM_CLEAR of the points and twice the other
     # hypothesis's share; ROOM_VERDICTS "still" ones set object_turns (the room stands while the object turns: a
-    # platform, the scanner standing)
-MARKER_IDLE_FRAMES, MARKER_IDLE_EVERY = 15, 4  # no markers seen for this long: look on every 4th frame only
+    # platform, the scanner standing); ROOM_SETTLED "moved" ones and no "still" end the test (a hand-held scan: each
+    # check costs ~80 ms, ~4.5 ms a frame over a scan)
+MARKER_IDLE_FRAMES, MARKER_IDLE_EVERY = 30, 8  # no markers seen for this long: look on every 8th frame only (a
+    # search costs ~10 ms; at every 4th after 15 it was still 2.6 ms of a hand-held frame)
 GPU_MAX_RMSE_MM, GPU_RMSE_Z_MM = 1.0, 450.0  # the GPU solve's residual limit, growing with the piece's distance
     # squared beyond 450 mm (depth noise does; long range reaches 720 mm: 2.6 mm there). synthhard's jerk frame
     # was taken 10 mm off with 1.36 mm, fused, and tracking stayed ~4 mm off; good frames on every dataset (hand
@@ -863,7 +865,7 @@ class Scanner:
             if fuse is not None and move < KEY_MOVE_MM and turn < KEY_TURN_DEG and self.since_merge < KEY_EVERY:
                 return False
         self.since_merge, self.last_merged = 0, self.pose.copy()
-        if scene.mode == "still" and fuse is not None and not self.object_turns \
+        if scene.mode == "still" and fuse is not None and not self.object_turns and not self.room_settled() \
                 and (t is None or self.room_t is None or not 0 <= t - self.room_t < ROOM_EVERY_S):
             self.room_t = t
             room = ~(obj | base) & np.all(all_pix % ROOM_GRID_PX == 0, axis=1)  # (neither object nor base)
@@ -1470,6 +1472,10 @@ class Scanner:
                 and self.room_votes["still"] > self.room_votes["moved"]:
             self.object_turns = self.stats["object_turns"] = True
             self.log("the object turns and the scanner stands (a platform): the room's colour features are left out")
+
+    def room_settled(self):
+        """Has check_room settled on "the scanner moves" (ROOM_SETTLED verdicts, none "still")?"""
+        return self.room_votes["moved"] >= ROOM_SETTLED and not self.room_votes["still"]
 
     def show_ghost(self):
         """While lost, the live view shows the scan so far where it was last seen (the last good pose, over

@@ -54,6 +54,20 @@ REFIT_MAX_DEG, REFIT_MAX_MM = 3.0, 5.0  # ...and a re-fit that turns or moves it
 FIT_POINTS = 5000  # a re-fit takes at most this many of the points near the plane
 
 
+def axial(xyz, axis, n):
+    """(height along n above the point `axis`, squared distance from the line through it along n) of points: one
+    subtraction and two products for both (an outer product and a second pass for the distance cost the region
+    steps ~3x as much: 22 ms of a hand-held frame)."""
+    d = xyz - axis
+    dn = d @ n
+    return dn, np.maximum(np.einsum("ij,ij->i", d, d) - dn * dn, 0.0)
+
+
+def within(r2, radius):
+    """r <= radius from squared distances (none when the radius is negative)."""
+    return r2 <= radius * radius if radius >= 0 else np.zeros(len(r2), bool)
+
+
 def plane_to(plane, transform_mm):
     """Plane (n, c) with n.p + c = 0 moved by a rigid transform (4x4, translation in mm)."""
     n, c = plane
@@ -107,6 +121,7 @@ class Scene:
         self.ball = None  # (centre, radius, start radius) while no base is known, region frame (mm)
         self.late_plane = False  # the plane was settled after objects had been merged
         self.off_centre = 0  # frames whose view centre missed the object (masks fell back to the core)
+        self.axial_cache = None  # _axial's values for the frame they were made for
 
     def observe(self, xyz_cam, pix, shape, cam_to_region, tracked=None):
         """Vote for a support plane: on every frame of the first VOTE_LIMIT, then on every VOTE_LATE_EVERY-th
@@ -151,17 +166,14 @@ class Scene:
         False and (n, c) is the prior. Each fit takes at most FIT_POINTS of the points (the 3 x 3
         covariance's smallest axis), which made the re-fit 6 -> ~2 ms a frame.
         """
-        to_cam = np.linalg.inv(cam_to_region)
-        prior = plane_to(self.plane, to_cam)
-        pts_all, where = xyz_cam, None
-        if self.axis is not None:
-            where = to_cam[:3, :3] @ self.axis + to_cam[:3, 3]
-            n0 = prior[0]
-            flat = xyz_cam - np.outer((xyz_cam - where) @ n0, n0)
-            pts_all = xyz_cam[np.linalg.norm(flat - where, axis=1) > self.radius - REGION_MARGIN_MM]
+        prior, where, h0, r2 = self._axial(xyz_cam, cam_to_region)
+        pts_all = xyz_cam
+        if where is not None:
+            outside = ~within(r2, self.radius - REGION_MARGIN_MM)
+            pts_all, h0 = xyz_cam[outside], h0[outside]
         n, c, span, fitted = *prior, 0.0, False
         for band in (REFIT_BAND_MM, cl.PLANE_TOL_MM):
-            near = np.abs(pts_all @ n + c) < band
+            near = np.abs(h0 if band == REFIT_BAND_MM else pts_all @ n + c) < band
             if near.sum() < 50:
                 return (*prior, 0.0, False) if band == REFIT_BAND_MM else (n, c, span, fitted)
             pts = pts_all[near][::max(1, int(near.sum()) // FIT_POINTS)]
@@ -190,12 +202,26 @@ class Scene:
             to_cam = np.linalg.inv(cam_to_region)
             centre = to_cam[:3, :3] @ self.ball[0] + to_cam[:3, 3]
             return np.linalg.norm(xyz_cam - centre, axis=1) <= self.ball[2]
+        _, _, h, r2 = self._axial(xyz_cam, cam_to_region)
+        return within(r2, self.radius - REGION_MARGIN_MM) & (h > GROW_ABOVE_MM) & (h <= self.top - REGION_MARGIN_MM)
+
+    def _axial(self, xyz_cam, cam_to_region):
+        """(the kept plane in the camera (n, c), the region's axis point in the camera or None, every point's height
+        above the plane, its squared distance from the axis or None) at `cam_to_region`, kept for the frame: core and
+        table_in_camera both want them at the pose guess."""
+        key = (id(xyz_cam), len(xyz_cam), cam_to_region.tobytes(), self.radius, self.top)
+        if self.axial_cache is not None and self.axial_cache[0] == key:
+            return self.axial_cache[1]
         to_cam = np.linalg.inv(cam_to_region)
         n, c = plane_to(self.plane, to_cam)
-        axis = to_cam[:3, :3] @ self.axis + to_cam[:3, 3]
-        h = xyz_cam @ n + c
-        r = np.linalg.norm(xyz_cam - np.outer((xyz_cam - axis) @ n, n) - axis, axis=1)
-        return (r <= self.radius - REGION_MARGIN_MM) & (h > GROW_ABOVE_MM) & (h <= self.top - REGION_MARGIN_MM)
+        if self.axis is None:
+            out = (n, c), None, xyz_cam @ n + c, None
+        else:
+            where = to_cam[:3, :3] @ self.axis + to_cam[:3, 3]
+            dn, r2 = axial(xyz_cam, where, n)
+            out = (n, c), where, dn + (where @ n + c), r2
+        self.axial_cache = (key, out)
+        return out
 
     def away(self, xyz_cam, cam_to_region):
         """Which points (camera coordinates) lie clear of the object's region (outside its cylinder plus
@@ -232,25 +258,30 @@ class Scene:
         if self.plane is None:
             return self._ball_mask(xyz_cam, pix, shape, cam_to_region, piece), mask.copy()
         n, c = self.plane_in_camera(xyz_cam, cam_to_region) if plane is None else plane
-        h = xyz_cam @ n + c
+        to_cam = np.linalg.inv(cam_to_region)
+        if self.axis is not None:  # heights and squared distances from the axis in one pass (axial)
+            axis = to_cam[:3, :3] @ self.axis + to_cam[:3, 3]
+            dn, r2_all = axial(xyz_cam, axis, n)
+            h = dn + (axis @ n + c)
+        else:
+            h = xyz_cam @ n + c
         above = h > OBJECT_ABOVE_MM
         base = np.zeros(len(xyz_cam), bool)
         if not above.any():
             return mask, base
         idx = np.nonzero(above)[0]
         pts = xyz_cam[idx]
-        to_cam = np.linalg.inv(cam_to_region)
         if self.axis is None:  # first view: the object is the piece above the table at the image centre, or for a
             # base found late, tracking's piece (from above the middle of the view missed the hand: the room, a crumb)
             late = self.late_plane and piece is not None and piece[idx].any()
             first = piece[idx] if late else cl.centre_piece(pts, pix[idx], shape)
             self._fit_region(pts[first] @ cam_to_region[:3, :3].T + cam_to_region[:3, 3],
                              self.plane[0])
-        axis = to_cam[:3, :3] @ self.axis + to_cam[:3, 3]
-        flat = pts - np.outer((pts - axis) @ n, n)  # projected onto the table
-        r = np.linalg.norm(flat - axis, axis=1)
-        inside = (r <= self.radius) & (h[idx] <= self.top)
-        core = inside & (r <= self.radius - REGION_MARGIN_MM) & (h[idx] <= self.top - REGION_MARGIN_MM)
+            axis = to_cam[:3, :3] @ self.axis + to_cam[:3, 3]
+            _, r2_all = axial(xyz_cam, axis, n)
+        r2 = r2_all[idx]
+        inside = within(r2, self.radius) & (h[idx] <= self.top)
+        core = inside & within(r2, self.radius - REGION_MARGIN_MM) & (h[idx] <= self.top - REGION_MARGIN_MM)
         piece = cl.centre_piece(pts, pix[idx], shape) if piece is None else piece[idx]  # what the middle of
         if not (piece & core).any():  # the view hits, unless that is not the object: then whatever is in its core
             self.off_centre += 1
@@ -260,14 +291,13 @@ class Scene:
         aimed = (piece & (np.abs(u - ww / 2) <= GROW_WINDOW * ww / 2) & (np.abs(v - hh / 2) <= GROW_WINDOW * hh / 2)
                  & (h[idx] > GROW_ABOVE_MM))
         if aimed.any():  # grow the region toward what the middle of the view sees, a little per frame
-            reach = r[aimed].max() + REGION_MARGIN_MM
+            reach = float(np.sqrt(r2[aimed].max())) + REGION_MARGIN_MM
             self.radius = min(max(self.radius, reach), self.radius + REGION_GROW_MM)
             self.top = min(max(self.top, h[idx][aimed].max() + REGION_MARGIN_MM), self.top + REGION_GROW_MM)
-        piece &= (r <= self.radius) & (h[idx] <= self.top)
+        piece &= within(r2, self.radius) & (h[idx] <= self.top)
         mask[idx[piece]] = True
         near = np.nonzero((h > -cl.PLANE_TOL_MM) & ~above)[0]  # the base under and around the object
-        flat_near = xyz_cam[near] - np.outer((xyz_cam[near] - axis) @ n, n)
-        base[near[np.linalg.norm(flat_near - axis, axis=1) <= self.radius]] = True
+        base[near[within(r2_all[near], self.radius)]] = True
         return mask, base
 
     def _ball_mask(self, xyz_cam, pix, shape, cam_to_region, piece=None):
