@@ -294,6 +294,20 @@ def test_the_tracking_source_follows_the_region_when_the_centre_misses():
     assert cl.isolate_mask(xyz, pix, shape, np.random.default_rng(0), seeds & False)[0].sum() <= 5  # no seeds
 
 
+def test_without_a_base_the_source_follows_the_ball_when_the_centre_misses():
+    """No base known (the platform scans: a white top without depth): the object's ball seeds the tracking
+    source, where the middle of the view hits only a crumb."""
+    xyz, pix, shape, scene, box = _off_centre_scene()
+    scene.plane = scene.axis = None
+    scene.ball = (np.array([130.0, 0.0, 270.0]), 90.0, 60.0)  # (centre, radius, start radius) around the box
+    seeds = scene.core(xyz, np.eye(4))
+    assert seeds[box].mean() > 0.6  # the box's points near the ball's centre (table ones too: the plane cut drops them)
+    keep, _ = cl.isolate_mask(xyz, pix, shape, np.random.default_rng(0), seeds)
+    assert keep[box].mean() > 0.99 and keep.sum() <= box.stop - box.start + 2
+    scene.ball = None
+    assert scene.core(xyz, np.eye(4)) is None
+
+
 def test_the_base_cuts_the_source_when_the_frame_shows_no_table_of_its_own():
     xyz, pix, shape, scene, box = _off_centre_scene()
     near = (np.abs(xyz[:, 0] - 130) < 45) & (np.abs(xyz[:, 1]) < 45)  # a frame showing too little table to fit

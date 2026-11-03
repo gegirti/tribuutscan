@@ -1162,13 +1162,31 @@ cubes on the GPU; the CPU keeps the 6x6 solve, markers, base votes, pose graph, 
     top had no depth during the first VOTE_LIMIT 300 frames), so the tracking source is the view-centre piece
     (`Scene.core` returns None without a base). From above the centre hit the room (~665 mm) or nothing, leaving a
     crumb of 2-36 points. Edge-on, it fell between the fingers.
-  - PROPOSED, NOT DONE (waiting for the user's go, 2026-11-03): `Scene.core` in ball mode returns the points
-    within the ball's start radius (ball[2]) of its centre at the pose guess; feed then seeds isolate_mask with
-    them, the frame's own plane cut as before.
-    - Replay of this scan (scratch monkeypatch): 729 of 730 tracked (was 585), 165 merged (124), 256k points
-      (216k), doubled 0.02% either way. Both lost stretches hold.
-    - Before committing: evaluate --tracker gpu --optimise on all datasets (only scans without a base should
-      change), a unit test, the notes.
+  - DONE (2026-11-03, the user's "Continue"): `Scene.core` without a base returns the points within the ball's
+    start radius (ball[2]) of its centre at the pose guess. feed seeds isolate_mask with them, after the
+    frame's own plane cut as before, and falls back to the view-centre piece under MIN_SEEDS.
+    - This scan replayed: 729 of 730 tracked (live 585), 165 merged (124), Optimise 206 loops, largest
+      correction 5.2 mm, 258k points, 0.04% doubled.
+    - evaluate (captures/eval/20261103-085856-ballcore-only against 20261102-195748-turn-final3):
+      - platform: 325 -> 492 tracked, doubled 0.40 -> 0.0%, Optimise 42 -> 115 loops (correction 3.1 mm);
+      - markers: keyframe marker scatter 0.785 -> 0.748 mm (its first frames are in ball mode);
+      - every other dataset identical or within run-to-run noise (synthhard 0.468 mm, unchanged).
+  - MEASURED AND HELD BACK: the ball's MERGE labels following the tracking piece (`_ball_mask` given `masks`'s
+    `piece`, instead of its own centre piece).
+    - It merged the pass from above too (286k points, a fuller mesh: 511k triangles from 163 frames), but
+      left a ragged ring of platform top around the stand's foot in the mesh. Without a base nothing removes
+      the platform once it shows depth. Candidate fix: look for the base after VOTE_LIMIT while none is
+      known.
+    - It also skipped `_ball_mask`'s own isolate_mask, so the scene's RNG draws changed, and synthhard ran
+      away (ATE 0.47 -> 122 mm, reproducible). The same code with the old draws: 0.468 again.
+  - FOUND: synthhard's slide (frames 54-72, the scanner coming back from beyond the window), a fragility that
+    other RANDOM DRAWS can tip.
+    - The true motion slows to ~0.5 mm a frame, but each solve keeps taking the last motion's ~14 mm (the
+      guess plus the prior). On the box's flat faces the shape cannot push back, and fitness ~0.6 passes.
+    - 8-9 markers are detected per frame but none are used: at the drifted pose none match the map, so the
+      marker check never fires.
+    - Not fixed. Candidate: refuse a frame that shows >= 3 markers when the map has some in view yet none
+      match, then re-find it by markers.
 - LIVE SPEED, step 4 (2026-11-02, plan approved): a live frame's depth decoded where it is used.
   - The decode paths:
     - `depth.decode_strided`: the first pixel of each packed group, every 4th row, plus the

@@ -168,9 +168,18 @@ class Scene:
     def core(self, xyz_cam, cam_to_region):
         """Which points (camera coordinates) lie in the object region's core with the camera at
         `cam_to_region` (a pose guess: the kept plane is moved, not re-fitted), GROW_ABOVE_MM clear of the
-        plane: where tracking finds the object when the middle of the view misses it (cloud.Scanner)."""
-        if self.mode != "still" or self.plane is None or self.axis is None:
+        plane: where tracking finds the object when the middle of the view misses it (cloud.Scanner).
+        While no base is known, the points within the ball's start radius of its centre: on the third
+        platform scan (no base ever found) the middle of the view fell between the edge-on fingers and,
+        from above, on the room, leaving crumbs of 2-36 points (585 of 730 frames tracked; 729 with this)."""
+        if self.mode != "still":
             return None
+        if self.plane is None or self.axis is None:
+            if self.ball is None:
+                return None
+            to_cam = np.linalg.inv(cam_to_region)
+            centre = to_cam[:3, :3] @ self.ball[0] + to_cam[:3, 3]
+            return np.linalg.norm(xyz_cam - centre, axis=1) <= self.ball[2]
         to_cam = np.linalg.inv(cam_to_region)
         n, c = plane_to(self.plane, to_cam)
         axis = to_cam[:3, :3] @ self.axis + to_cam[:3, 3]
