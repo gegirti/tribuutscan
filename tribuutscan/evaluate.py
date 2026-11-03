@@ -176,8 +176,7 @@ def mesh_result(name, directory, scanner):
         out["tracked"] = surface_check(directory, vertices, triangles)
         out["tracked"]["covered_1mm"] = coverage(directory, vertices, triangles)
         from . import solid  # the printable solid (fusion.make_mesh's STL) against the truth too
-        plane = scanner.scene.plane if scanner.remove_base and scanner.scene.mode == "still" else None
-        cv, ct, _, closing = solid.close(vertices, triangles, None, plane)
+        cv, ct, _, closing = solid.close(vertices, triangles, None, fusion.printing_plane(scanner, vertices))
         out["closed"] = dict(surface_check(directory, cv, ct), covered_1mm=coverage(directory, cv, ct),
                              edges_closed=closing["edges_closed"], added_share=closing["added_share"])
         truth = synth.read_truth(directory)

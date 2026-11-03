@@ -708,3 +708,20 @@ def test_markers_in_view_correct_a_solve_that_used_none():
             sc.close()
     finally:
         calib.use(before)
+
+
+def test_a_platform_scan_knows_the_axis_it_turned_about():
+    """turn_axis: poses turned up to 120 degrees about a vertical line 300 mm in front of the first camera give
+    that line's direction, pointing up (the cameras' up: -y); a scan that did not turn on a platform gives none."""
+    from tribuutscan import track
+    sc = cl.Scanner(log=lambda *a: None)
+    axis, point = np.array([0.0, -1.0, 0.0]), np.array([0.0, 0.0, 0.3])
+    for i, deg in enumerate(np.linspace(0, 120, 61)):
+        m = np.eye(4)
+        m[:3, :3] = track.exp_se3(np.r_[axis * np.radians(deg), 0, 0, 0])[:3, :3]
+        m[:3, 3] = point - m[:3, :3] @ point
+        sc.track_log.append((i, "tracked", m))
+    assert sc.turn_axis() is None  # (not noticed as a platform)
+    sc.object_turns = True
+    found = sc.turn_axis()
+    assert found is not None and found @ axis > 0.9999

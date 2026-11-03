@@ -68,6 +68,7 @@ REFIND_HOLD = 2  # frames tracked after a pose found anywhere before merging res
 SHAPE_EVERY_S = 0.25  # refind_shape: at most one try per this much frame time while lost (~50-150 ms each)
 MARKER_CHECK_MM, MARKER_CHECK_DEG, MARKER_CHECK_MIN = 5.0, 2.0, 3  # marker_check: a solve this far from the markers' own
     # placement is redone from it, and must then hold this many of them
+TURN_AXIS_MIN_DEG = 20.0  # turn_axis: poses turned at least this far from the first one count
 GAP_S = 0.5  # the first frame tracked after this long without one (lost frames, or none came) is checked by shape:
     # its solve began at the last good pose, and a turn about a vertical axis hides in horizontal faces (the
     # synthetic block on a platform, 3 s left out: "tracked" 37 degrees off)
@@ -908,6 +909,32 @@ class Scanner:
     def frame_poses(self):
         """[(index, pose)] of every tracked frame (a scan saved before these were kept: its merged ones)."""
         return [(i, p) for i, _, p in self.track_log if p is not None] or list(self.poses)
+
+    def turn_axis(self, min_deg=TURN_AXIS_MIN_DEG):
+        """The axis a platform turned the object about (unit, world, pointing the way the cameras' up does), or
+        None: not a platform scan (object_turns), or turned less than `min_deg`. Each tracked pose relative to
+        the first is a turn about it (rotations of 150 degrees and more, where the axis is ill-defined, left
+        out). With no base found, the printable solid is cut square to it (fusion.printing_plane)."""
+        if not self.object_turns:
+            return None
+        poses = [p for _, p in self.frame_poses()]
+        if len(poses) < 10:
+            return None
+        axes = []
+        for p in poses[::5]:
+            r = (p @ np.linalg.inv(poses[0]))[:3, :3]
+            angle = np.arccos(np.clip((np.trace(r) - 1) / 2, -1, 1))
+            if np.radians(min_deg) <= angle <= np.radians(150):
+                a = np.array([r[2, 1] - r[1, 2], r[0, 2] - r[2, 0], r[1, 0] - r[0, 1]])
+                axes.append(a / np.linalg.norm(a))
+        if not axes:
+            return None
+        axes = np.array(axes)
+        axes[axes @ axes[0] < 0] *= -1
+        axis = axes.mean(0)
+        axis /= np.linalg.norm(axis)
+        up = -np.mean([p[:3, 1] for p in poses], axis=0)  # (a camera's y axis points down)
+        return axis if axis @ up >= 0 else -axis
 
     def merge(self, frame, index, pose, pix, step=1):
         """Merge one tracked frame's object pixels (cleaned, with normals) into the cloud; `pix` sampled every

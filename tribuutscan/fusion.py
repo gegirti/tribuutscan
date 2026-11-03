@@ -320,6 +320,18 @@ def write_mesh(directory, vertices, triangles, colours, printable=None):
     tmp.replace(directory / "mesh.ply")
 
 
+def printing_plane(scanner, vertices):
+    """Where the printable solid is cut flat (n, c), or None: the base, when it is left out of the result; with
+    no base on a platform scan, square to the axis it turned about (Scanner.turn_axis) at the lowest scanned
+    point (the object stood there; otherwise Poisson rounds the bottom off: synthturn's added surface 51%)."""
+    if not scanner.remove_base or scanner.scene.mode != "still" or not len(vertices):
+        return None
+    if scanner.scene.plane is not None:
+        return scanner.scene.plane
+    axis = scanner.turn_axis()
+    return None if axis is None else (axis, -float((vertices @ axis).min()))
+
+
 def make_mesh(directory, which="merged", voxel_mm=VOXEL_MM, min_weight=MIN_WEIGHT, force=False, log=print, scanner=None,
               close=True):
     """Fuse a scan and write mesh.ply (the scanned surface), mesh.stl (with `close`, the closed solid for
@@ -332,8 +344,7 @@ def make_mesh(directory, which="merged", voxel_mm=VOXEL_MM, min_weight=MIN_WEIGH
     printable = None
     if close and len(triangles):
         from . import solid
-        scene = scanner.scene
-        plane = scene.plane if scanner.remove_base and scene.mode == "still" else None
+        plane = printing_plane(scanner, vertices)
         try:
             v, t, _, report["solid"] = solid.close(vertices, triangles, colours, plane)
             printable = (v, t) if report["solid"]["edges_closed"] else None

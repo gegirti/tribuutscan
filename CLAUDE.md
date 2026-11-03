@@ -1254,8 +1254,12 @@ cubes on the GPU; the CPU keeps the 6x6 solve, markers, base votes, pose graph, 
     still room smeared round the object and overran the voxel blocks. For turntable sets it now fuses only the
     tracked run's labels.
   - End to end with the scanner: Stop, then meshed 6 s later, "closed for printing".
-  - Possible next: with no base, cut perpendicular to the turntable axis (from the tracked poses) at the lowest
-    scanned point.
+  - With no base on a platform scan, the cut is square to the axis the object turned about
+    (`Scanner.turn_axis`: the mean rotation axis of the tracked poses against the first, turns of 20-150
+    degrees, pointing the way the cameras' up does), at the lowest scanned point (`fusion.printing_plane`).
+    - synthturn's closed solid: 98.5% of the true block within 1 mm (Poisson's own bottom: 71.7%), added 29%
+      (51%), median 0.104 mm.
+    - The 17:07 replay (no view from above, no base): closed, flat-bottomed, 14% added.
 - Optimise's message (2026-11-03) gives the largest correction AT THE OBJECT: how far a keyframe's view of the
   object moves in the world, plus the turn in degrees. The camera's move ("largest_correction_mm") is still in
   optimise.json and evaluate's "corr mm"; "corr obj" is the new one. First platform recording replayed with
