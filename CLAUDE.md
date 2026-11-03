@@ -1297,6 +1297,26 @@ cubes on the GPU; the CPU keeps the 6x6 solve, markers, base votes, pose graph, 
   optimise.json and evaluate's "corr mm"; "corr obj" is the new one. First platform recording replayed with
   all of 2026-11-03's code: 505 of 505 tracked (live 465), Optimise 117 loops, 0.32 mm at the object (0.51
   degrees), 2.99 mm at the camera.
+- PHASE 5 DONE (2026-11-03, plan approved: "Finish Phase 5"): finishing. Each part has its own entry.
+  - Mesh after Stop, the closed STL (PRINTABLE MESHES), the late base and the pass from above (COMPLETE, CLEAN
+    MODELS), the correction at the object, the mesh at Optimise's poses (fusion.scan_frames uses the corrected
+    poses).
+  - Hand-held live scans at 20 fps (LIVE SPEED, step 5).
+  - solid.ply with colour for Blender, and the crop box in the 3D view (both under PRINTABLE MESHES).
+  - Per-mode voxel size, MEASURED AND NOT TAKEN: both platform replays (long range, ~30-40 cm) fused at
+    0.5 / 1.5 mm truncation, 0.75 / 2.25 and 0.75 / 1.5 (scratch only). The 0.75 meshes lie 0.014-0.027 mm
+    (median) from the 0.5 ones. The two scans agree with each other no better: 0.160 / 0.498 mm (median /
+    p90, 12 seeds) at 0.5, 0.166 / 0.526 at 0.75 / 2.25, 0.160 / 0.502 at 0.75 / 1.5. Half the triangles
+    (481-492k -> 211-217k) and 20-30% faster (9.4-14.1 -> 6.4-11.1 s). Open boundary edges 5220-5329 at 0.5,
+    2290-3030 at 0.75 / 2.25; 0.75 / 1.5 has more small holes (131-282 loops against 100-125). Not better,
+    so 0.5 mm stays for both modes; the closed solid fills the holes either way.
+  - End to end with the scanner (no window, the real worker, 12 s still scene): 163 frames, 0 lost; Stop gave
+    saved, optimised (1 s), meshed (6 s): mesh.ply, mesh.stl (closed) and solid.ply.
+  - Full suite 137 tests pass; the turn-axis test no longer needs Open3D (it failed under /usr/bin/python3
+    since 920d771).
+  - Next: the user's live check of it all (platform: one level pass and one ~45 degrees down at 30-35 cm;
+    Blender with solid.ply; the STL in their slicer); then the accuracy session (test block); later texture
+    tricks (the LATER note under Roadmap); 30 fps needs the 6x6 solve on the GPU.
 - LIVE SPEED, step 5 (2026-11-03, Phase 5, plan approved): hand-held scans at 20 fps, tracking unchanged.
   - The room test settles: after ROOM_SETTLED 5 "moved" verdicts and no "still", check_room stops (each check
     ~80 ms of nearest-point trees, ~4.5 ms a frame over a hand-held scan; a platform scan stops at object_turns).

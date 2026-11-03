@@ -210,7 +210,7 @@ def process(scanner, directory, action, log=print, box=None):
         closed = report.get("solid", {}).get("edges_closed")
         return (f"mesh: {report['triangles']:,} triangles from {report['frames']} frames in "
                 f"{report['fuse_s'] + report['extract_s'] + report.get('solid', {}).get('seconds', 0):.0f} s -> mesh.ply, "
-                + ("mesh.stl (closed for printing)" if closed else "mesh.stl (left open)"))
+                + ("mesh.stl (closed for printing), solid.ply" if closed else "mesh.stl (left open)"))
     if action in ("base-off", "base-on"):
         if scanner.scene.plane is None:
             return "no base was found in this scan: nothing to remove"
