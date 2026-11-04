@@ -18,7 +18,7 @@ dependencies = ["numpy>=1.24"]
 scan = ["open3d>=0.20", "opencv-python-headless>=4.10"]
 # The GPU engine (meshes in seconds; fusion.py falls back to Open3D on the CPU without it): WebGPU,
 # so any GPU with the system's stock Vulkan (or Metal / DirectX 12) driver, and llvmpipe on the CPU.
-gpu = ["wgpu>=0.32"]
+gpu = ["wgpu>=0.32; python_version >= '3.11'"]  # wgpu 0.32 needs Python 3.11+; 3.10 gets the CPU fallback
 
 [tool.setuptools]
 packages = ["tribuutscan"]
@@ -28,3 +28,12 @@ tribuutscan = ["web/*"]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
+
+[tool.uv]
+# The viewer runs on the system python3 and starts the live-scan worker with .venv's Python. Spawn
+# re-imports the viewer module (numpy at the top) in the worker, so the worker runs on the SYSTEM numpy
+# with Open3D and OpenCV from .venv. So .venv must be built on that same system interpreter, and must
+# resolve for the system numpy's major version (e.g. OpenCV 5 needs numpy 2). Ubuntu 24.04
+# (Python 3.12) ships numpy 1.26; newer releases ship numpy 2.
+python-preference = "only-system"
+constraint-dependencies = ["numpy<2; python_version < '3.13'"]

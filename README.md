@@ -73,9 +73,10 @@ that the viewer finds by itself. `setup-venv.sh` builds it on any distro from th
 
 ```
 ./setup-venv.sh                      # or: PYTHON=python3.13 ./setup-venv.sh
+uv sync --all-extras                 # or with uv (https://docs.astral.sh/uv/): exact versions from uv.lock
 ```
 
-Tested with Python 3.12 (numpy 1.26, OpenCV 4.10) and Python 3.14 (numpy 2.5, OpenCV 5.0, Tk 9),
+Tested with Python 3.12 (numpy 1.26, OpenCV 4.10 and 4.11) and Python 3.14 (numpy 2.5, OpenCV 5.0, Tk 9),
 both with Open3D 0.20: the same results on every test and evaluation.
 
 The viewer shows depth large in the middle, colour and IR on the left, and folding panels on the

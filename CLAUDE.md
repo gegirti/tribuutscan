@@ -344,6 +344,8 @@ python3 -m tribuutscan.view3d captures/<stamp>-scan    # browser 3D view at http
 .venv/bin/python -m tribuutscan.bench --live [rec] [--frames N] [--tracker gpu|joint]
                                             # the live worker's fps on a recording (simulated camera)
 ./setup-venv.sh [dir]                       # build .venv from pyproject's "scan" extra (PYTHON=... to pick)
+uv sync --all-extras                        # the same .venv with uv, exact versions from uv.lock (how this
+                                            #   machine's .venv is built; plain `uv sync` drops the extras)
 .venv/bin/python -m tribuutscan.fusion captures/<stamp>-scan [--all] [--min-weight 4] [--force] [--open]
                                             # fuse a scan's keyframes -> mesh.ply (m, scanned surface) +
                                             # mesh.stl (mm, closed solid: solid.py; --open: as scanned)
@@ -763,6 +765,18 @@ cubes on the GPU; the CPU keeps the 6x6 solve, markers, base votes, pose graph, 
   963.51, law a 289570 / 289564, same 28 views, reprojection 0.346 / 0.319 / 0.340 px vs 0.346 /
   0.321 / 0.340); the viewer's PPM previews and a panel render the same under Tk 9.0. So Ubuntu 26.04's
   likely stack needs no code change today; the checkpoint re-runs this on the real install.
+- uv (2026-11-04): the user's .venv is now built by `uv sync --all-extras` from uv.lock (plain
+  `uv sync` removes the extras), on the system /usr/bin/python3.12, no --system-site-packages; the
+  hand-made one sits in ../tribuutscan-venv-pip-backup until a real scan has run on the new one.
+  pyproject `[tool.uv]`: python-preference only-system, and numpy<2 below Python 3.13. Why: the live
+  worker (.venv Python) imports the SYSTEM numpy (apt 1.26): spawn re-imports tribuutscan.viewer (numpy
+  at the top) before livescan.run reorders sys.path; only Open3D/OpenCV come from .venv. So .venv's
+  packages must resolve for numpy 1.x (unpinned, the lock picks OpenCV 5.0, which needs numpy 2). And if
+  the worker ever did load a numpy 2, its pickled arrays would not load in the viewer's numpy 1.26
+  (checked: "No module named 'numpy._core.numeric'"). The "gpu" extra got `python_version >= '3.11'` (wgpu 0.32 needs
+  3.11; 3.10 gets the CPU fallback): uv's lock found it, `pip install .[scan,gpu]` failed on 3.10.
+  Lock on 3.12: numpy 1.26.4, OpenCV 4.11.0, Open3D 0.20.0, wgpu 0.32.0; all 137 tests pass (same as
+  the old .venv). pyusb (installed by hand before, no code imports it) is not in the new .venv.
 - PHASE 2 DONE (2026-11-01 night, the user away): ENGINE = WEBGPU (wgpu-py 0.32, `gpu_wgpu.py`). Shared layout,
   inputs and numpy references in `gpu.py`; the bake-off harness `bakeoff.py` (dump / run / slice); a
   no-scanner self-check for testers `gpucheck.py`. Installed into .venv: wgpu (+ cffi, rendercanvas,
