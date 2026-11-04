@@ -1,6 +1,7 @@
 """Live viewer: depth in the middle, colour and IR on the left, setting panels on the right.
 
-Run with `python -m tribuutscan.viewer`. Panels (panels.py, each folds):
+Run with `python -m tribuutscan.viewer` (`--force-cpu`: tracking and meshes on the CPU even with a GPU).
+Panels (panels.py, each folds):
 - Scanner: Range switches close range (15-33 cm) / long range (20-72 cm; the law from the scanner's own
   disparity offsets);
   the streams pause about 10 s while it switches (vendor.py). IR exposure and gain are controls on the
@@ -27,6 +28,7 @@ import os
 import queue
 import shutil
 import subprocess
+import sys
 import threading
 import time
 import tkinter as tk
@@ -38,7 +40,7 @@ from pathlib import Path
 import numpy as np
 
 from . import frames as fr
-from . import calib, cloud, imu, livescan, markers, panels, pointcloud, sysinfo, usbdepth, v4l2, vendor
+from . import calib, cloud, gpu, imu, livescan, markers, panels, pointcloud, sysinfo, usbdepth, v4l2, vendor
 from .depth import decode_depth, garbled
 from .image import depth_to_rgb, ppm, yuyv_pixels
 
@@ -63,7 +65,7 @@ RECORD_RATES = {"30 fps": 30, "10 fps": 10}  # colour + compressed depth: about 
 GOOD, EDGE, BAD = "#2e7d32", "#ef6c00", "#c62828"
 
 REPO = Path(__file__).resolve().parent.parent
-VENV_PYTHON = REPO / ".venv" / "bin" / "python"  # has Open3D (setup-venv.sh)
+VENV_PYTHON = REPO / ".venv" / "bin" / "python"  # has Open3D (uv sync --all-extras)
 
 
 LOG = fr.CAPTURES / "viewer.log"
@@ -439,7 +441,8 @@ class App:
         on_usb = isinstance(self.depth.cap, usbdepth.DepthCapture)
         self.log(f"viewer started (pid {os.getpid()}, depth {'14-bit over USB' if on_usb else '10-bit V4L2'}, "
                  f"{calib.CAMERA.mode}{', distances are estimates' if calib.CAMERA.law_estimate else ''}, "
-                 f"camera: {SOURCES.get(calib.CAMERA.source, calib.CAMERA.source)})")
+                 f"camera: {SOURCES.get(calib.CAMERA.source, calib.CAMERA.source)})"
+                 + (", tracking and meshes on the CPU (--force-cpu)" if gpu.choice() == "0" else ""))
         if self.imu_want:
             self.imu_on()
         else:
@@ -597,14 +600,15 @@ class App:
         free, total = sysinfo.memory_mb()
         rows.append(("Memory", ", ".join(f"{name} {mb:.0f} MB" for name, mb in rss if mb is not None)
                                + (f"; {free / 1024:.1f} of {total / 1024:.1f} GB free" if free else "")))
-        gpu = []
+        used = []
         for name, pid in procs[1:]:
             usage = sysinfo.gpu_usage(pid)
             busy = rates.gpu_busy(pid, usage)
             if usage and usage["memory_mib"]:
-                gpu.append(f"{name} {sum(usage['memory_mib'].values()):.0f} MB"
-                           + (f", busy {busy:.0f}%" if busy is not None else ""))
-        rows.append(("GPU", "; ".join(gpu) if gpu else "not in use (scans and meshes use it)"))
+                used.append(f"{name} {sum(usage['memory_mib'].values()):.0f} MB"
+                            + (f", busy {busy:.0f}%" if busy is not None else ""))
+        rows.append(("GPU", "not used: --force-cpu (scans and meshes on the CPU)" if gpu.choice() == "0" else
+                            "; ".join(used) if used else "not in use (scans and meshes use it)"))
         rows.append(("Disk", f"{fr.free_gb(fr.CAPTURES):.0f} GB free for captures/"))
         return [f"{label:{LABEL_W}s}{text}" for label, text in rows]
 
@@ -930,7 +934,7 @@ class App:
             self.log("no recording yet: press r to record")
             return
         if not VENV_PYTHON.exists():
-            self.log("meshing needs Open3D in .venv (README: setup-venv.sh)")
+            self.log("meshing needs Open3D in .venv (README: uv sync --all-extras)")
             return
         scope = ["systemd-run", "--user", "--scope", "-q", "-p", "MemoryMax=8G"] if shutil.which("systemd-run") else []
         job["process"] = subprocess.Popen(
@@ -1103,6 +1107,7 @@ def open_app(root, ask=tkinter.messagebox.askretrycancel):
 
 
 def main():
+    gpu.force_cpu(sys.argv)  # (before the worker and meshing jobs start: they inherit it)
     LOCK.parent.mkdir(exist_ok=True)
     lock = open(LOCK, "w")
     try:

@@ -13,7 +13,6 @@ Weights: a pixel counts by its footprint, z^2 / (fx fy) mm^2 for every sampled p
 voxel area, so the shape weighs what track.solve's voxel-downsampled points weighed against the
 markers and the prior.
 """
-import os
 import time
 
 import numpy as np
@@ -45,9 +44,9 @@ PREVIEW_STEP = 2  # the live view (preview): every 2nd pixel each way, 640 x 400
 
 def kind():
     """The WebGPU adapter to track on ("gpu", or "cpu" with TRIBUUTSCAN_GPU=cpu), or None (no wgpu, no
-    adapter, or TRIBUUTSCAN_GPU=0)."""
-    choice = os.environ.get("TRIBUUTSCAN_GPU", "auto").lower()
-    if choice in ("0", "no", "off"):
+    adapter, or --force-cpu / TRIBUUTSCAN_GPU=0: gpu.choice)."""
+    choice = gpu.choice()
+    if choice == "0":
         return None
     try:
         from . import gpu_wgpu

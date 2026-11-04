@@ -2,7 +2,7 @@
 
     python3 -m tribuutscan.cloud captures/<stamp>-rec [small|medium|large] [--keep-base]
     .venv/bin/python -m tribuutscan.cloud ...      # with Open3D: tracks motion (on the GPU when there is one;
-                                                   # TRIBUUTSCAN_GPU=0: on the CPU)
+                                                   # --force-cpu or TRIBUUTSCAN_GPU=0: on the CPU)
     .venv/bin/python -m tribuutscan.cloud captures/<stamp>-rec --optimise --mesh   # then Optimise, fusion.py
 
 Space is cut into cubes of side `point distance`. Every point that lands in a cube is averaged into
@@ -670,10 +670,11 @@ class Scanner:
         self.marker_sigma, self.marker_accept = 1.0, 2.0
         self.gpu, self.gpu_kind = None, None  # gputrack.Tracker (made on the first frame) and its adapter
         if track_with == "gpu":
-            from . import gputrack
+            from . import gpu, gputrack
             self.gpu_kind = gputrack.kind()
             if self.gpu_kind is None:
-                log("tracking on the CPU (no WebGPU adapter, or TRIBUUTSCAN_GPU=0)")
+                log("tracking on the CPU (" + ("forced: --force-cpu or TRIBUUTSCAN_GPU=0" if gpu.choice() == "0"
+                                               else "no WebGPU adapter") + ")")
                 track_with = "joint"
         self.track_with, self.marker_map = track_with, MarkerMap(add_mm=3.0)
         self.stats["tracker"] = track_with
@@ -1677,6 +1678,8 @@ def save(directory, cloud, poses, stats, preset, min_seen=MIN_SEEN):
 
 
 def main():
+    from . import gpu
+    gpu.force_cpu(sys.argv)
     directory = Path(sys.argv[1])
     args = [a for a in sys.argv[2:] if not a.startswith("--")]
     preset = args[0] if args else "small"

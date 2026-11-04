@@ -1,6 +1,7 @@
 """Fuse a scan's depth frames into one surface (a truncated signed distance volume, TSDF) and mesh it.
 
     .venv/bin/python -m tribuutscan.fusion captures/<stamp>-scan [--all] [--voxel 0.5] [--min-weight 4] [--force] [--open]
+                                                                 [--force-cpu]
 
 Writes mesh.ply (metres, y up, z toward the scanner, vertex colour: like cloud.ply; the scanned surface),
 mesh.stl (mm, same axes, for slicers: the surface closed into a solid, solid.py; --open: the scanned
@@ -15,12 +16,11 @@ unless --force. The base and the surroundings are cut at extraction with the clo
 `Engine` is the volume itself and knows nothing about the scanner: depth in mm on a pinhole grid,
 colour on the same grid, a camera -> world pose. This one is Open3D's VoxelBlockGrid on the CPU (the
 reference); the GPU engine (gpu_wgpu.Engine, WebGPU) gives the same volume and mesh and is used when
-the machine has a GPU it can run on (`open_engine`; TRIBUUTSCAN_GPU=0 forces this one). Depth is fused as float mm (14-bit steps kept), after the lens
+the machine has a GPU it can run on (`open_engine`; --force-cpu or TRIBUUTSCAN_GPU=0 forces this one). Depth is fused as float mm (14-bit steps kept), after the lens
 distortion is taken out by a fixed nearest-pixel lookup (the board model has some; the factory
 model's depth is already pinhole) and after the merge's cleaning (prep.clean).
 """
 import json
-import os
 import sys
 import time
 from pathlib import Path
@@ -32,6 +32,7 @@ import open3d.core as o3c
 from . import calib
 from . import cloud as cl
 from . import frames as fr
+from . import gpu
 from . import pointcloud as pc
 from . import prep
 from .calib import CAMERA
@@ -192,11 +193,12 @@ def cut(vertices, triangles, keep):
 
 def open_engine(K, size, voxel_mm, trunc_voxels, far_mm, bounds=None, log=print):
     """The GPU engine (WebGPU) over `bounds` ((lo, hi) world mm) when there are bounds and a GPU to run on,
-    else Open3D on the CPU. TRIBUUTSCAN_GPU: 0 = always the CPU, "cpu" = WebGPU on the CPU (llvmpipe)."""
-    choice = os.environ.get("TRIBUUTSCAN_GPU", "auto").lower()
-    if bounds is not None and choice not in ("0", "no", "off"):
+    else Open3D on the CPU. TRIBUUTSCAN_GPU (gpu.choice): 0 = always the CPU (--force-cpu), "cpu" = WebGPU on
+    the CPU (llvmpipe)."""
+    choice = gpu.choice()
+    if bounds is not None and choice != "0":
         try:
-            from . import gpu, gpu_wgpu
+            from . import gpu_wgpu
             kind = "cpu" if choice == "cpu" else "gpu"
             if kind in gpu_wgpu.adapters():
                 layout = gpu.Layout(*bounds, voxel_mm=voxel_mm, trunc_voxels=trunc_voxels)
@@ -377,6 +379,7 @@ def make_mesh(directory, which="merged", voxel_mm=VOXEL_MM, min_weight=MIN_WEIGH
 
 
 def main():
+    gpu.force_cpu(sys.argv)
     paths, voxel, weight, rest = [], VOXEL_MM, MIN_WEIGHT, iter(sys.argv[1:])
     for a in rest:
         if a == "--voxel":

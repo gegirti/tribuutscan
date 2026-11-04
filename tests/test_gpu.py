@@ -48,6 +48,29 @@ def closed_and_oriented(triangles):
     return all(c == 1 and directed.get((b, a)) == 1 for (a, b), c in directed.items())
 
 
+def test_force_cpu_keeps_tracking_and_fusion_off_the_gpu():
+    """--force-cpu (viewer, cloud.py, fusion.py) sets TRIBUUTSCAN_GPU=0 for this process and the ones it
+    starts: no GPU tracker (gputrack.kind), and fusion takes Open3D's engine (fusion.open_engine)."""
+    import os
+    before = os.environ.get("TRIBUUTSCAN_GPU")
+    try:
+        os.environ.pop("TRIBUUTSCAN_GPU", None)
+        assert gpu.choice() == "auto" and not gpu.force_cpu(["viewer"]) and "TRIBUUTSCAN_GPU" not in os.environ
+        assert gpu.force_cpu(["viewer", "--force-cpu"]) and gpu.choice() == "0"
+        try:
+            from tribuutscan import fusion, gputrack
+        except ImportError:  # needs Open3D (.venv)
+            return
+        assert gputrack.kind() is None
+        K = np.array([[120.0, 0, 80], [0, 120, 50], [0, 0, 1]])
+        engine = fusion.open_engine(K, (160, 100), 0.5, 3.0, 600.0, bounds=(np.zeros(3), np.full(3, 50.0)))
+        assert isinstance(engine, fusion.Engine)
+    finally:
+        os.environ.pop("TRIBUUTSCAN_GPU", None)
+        if before is not None:
+            os.environ["TRIBUUTSCAN_GPU"] = before
+
+
 def test_triangle_table_gives_closed_surfaces_facing_out():
     g = np.mgrid[0:16, 0:16, 0:16].astype(float)
     v, t = marching_cubes(np.sqrt(((g - 7.6) ** 2).sum(0)) - 5.3)  # a sphere

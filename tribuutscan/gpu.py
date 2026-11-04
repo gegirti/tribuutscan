@@ -16,7 +16,10 @@ per kernel (WebGPU's default limits; llvmpipe allows no more).
 A frame comes in as depth in mm on a pinhole grid (0 = none), colour (8-bit RGB) on the same grid and a
 pose camera -> world with its translation in mm. Kernels: vertex/normal maps, allocate (bricks a frame
 touches) + integrate, ray cast, ICP sums. The numpy functions here define what each must return.
+
+Which engine runs: TRIBUUTSCAN_GPU (choice), which --force-cpu sets (force_cpu).
 """
+import os
 import struct
 
 import numpy as np
@@ -35,6 +38,22 @@ ICP_GROUPS = 256  # work-groups of the ICP sums; each writes ICP_VALUES partial 
 ICP_VALUES = 32  # 21 of the 6x6 J^T W J (upper triangle, row by row), 6 of J^T W r, then: pairs used, sum w,
                  # sum r^2 of those pairs, frame pixels taking part, pixels matched to the model (within reach)
 PARAMS_BYTES = 352
+FORCE_CPU = "--force-cpu"  # the command-line flag (viewer, cloud.py, fusion.py): everything on the CPU
+
+
+def choice():
+    """TRIBUUTSCAN_GPU: "auto" (the GPU when there is one, else the CPU), "0" (the CPU: Open3D and the CPU
+    tracker; what --force-cpu sets) or "cpu" (WebGPU on the CPU, llvmpipe)."""
+    value = os.environ.get("TRIBUUTSCAN_GPU", "auto").lower()
+    return "0" if value in ("0", "no", "off") else value
+
+
+def force_cpu(argv):
+    """With --force-cpu in `argv`, tracking, fusion and meshing run on the CPU, also in the processes started
+    from here (the live worker, meshing jobs: they inherit the environment). Returns whether it was given."""
+    if FORCE_CPU in argv:
+        os.environ["TRIBUUTSCAN_GPU"] = "0"
+    return FORCE_CPU in argv
 
 
 class Layout:
