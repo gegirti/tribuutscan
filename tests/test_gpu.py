@@ -366,6 +366,25 @@ def test_a_full_brick_pool_is_counted_not_fatal():
     assert len(t) > 0 and np.abs(v[:, 2] - 250).max() < 0.05
 
 
+def test_a_mesh_too_big_for_one_pass_comes_in_parts_the_same():
+    """Marching cubes whose triangles do not fit the output buffer run over the bricks in parts (a 1613-frame
+    platform scan made more than 2.2 million); the parts join into exactly the one-pass mesh."""
+    if not kinds():
+        return
+    gpu_wgpu = wgpu_engine_or_none(kinds()[0])
+    w, h = 160, 100
+    K = np.array([[150.0, 0, 80], [0, 150, 50], [0, 0, 1]])
+    e = gpu_wgpu.Engine(gpu.Layout([-150, -100, 200], [150, 100, 300]), K, (w, h), kinds()[0], 1000)
+    y, x = np.mgrid[0:h, 0:w]
+    e.fuse((250 + 10 * np.sin(x / 9.0) + 0.05 * y).astype(np.float32), np.zeros((h, w, 3), np.uint8), np.eye(4))
+    v, t, c = e.mesh(1)
+    parts, tp, cp = e.mesh(1, max_tris=len(t) // 5)
+    rows = lambda tri: tri[np.lexsort(tri.T[::-1])]
+    assert len(t) > 1000 and np.array_equal(v, parts) and np.array_equal(c, cp)
+    assert np.array_equal(rows(t), rows(tp))
+    e.close()
+
+
 def test_close_gives_the_gpu_memory_back():
     """wgpu-py frees a device only through Python's cycle collector; close() must not wait for it."""
     if "gpu" not in kinds():

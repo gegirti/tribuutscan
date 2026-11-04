@@ -576,7 +576,7 @@ fn corner(vi: vec3<i32>) -> Corner {
 fn rgb(c: u32) -> vec3<f32> { return vec3<f32>(f32(c & 255u), f32((c >> 8u) & 255u), f32((c >> 16u) & 255u)); }
 @compute @workgroup_size(64)
 fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t: u32) {
-  let s = wg.y * 256u + wg.x;
+  let s = P.rect.x + wg.y * 256u + wg.x;  // this pass's bricks: slots rect.x .. img.z (Engine.mesh)
   if (s >= P.img.z) { return; }
   let b = bricks[s];
   let bc = vec3<i32>(vec3<u32>(b % P.dims.x, (b / P.dims.x) % P.dims.y, b / (P.dims.x * P.dims.y)));
@@ -1181,22 +1181,32 @@ class Engine:
         words = np.frombuffer(self.device.queue.read_buffer(self.codes, 0, 4 * pw * oh), np.uint32)
         return words.view(np.uint8).reshape(oh, 4 * pw)[:, :ow].copy()
 
-    def mesh(self, min_weight=4):
+    def mesh(self, min_weight=4, max_tris=None):
         """(vertices world mm, triangles, colours) of the surface where all eight voxels of a cube were
-        seen in at least `min_weight` frames (fusion.Engine.mesh's rule), by marching cubes."""
+        seen in at least `min_weight` frames (fusion.Engine.mesh's rule), by marching cubes. The bricks go
+        in one pass, or in parts when their triangles do not fit the output buffer (MESH_BYTES, ~2.2
+        million; a 1613-frame platform scan needed more): each part is read back and gpu.assemble_mesh
+        joins them, edges by their voxel, into the same mesh. `max_tris`: a smaller room (tests)."""
         n = self.counts()[0]
         if not n:
             return np.empty((0, 3)), np.empty((0, 3), np.int64), np.empty((0, 3), np.uint8)
-        max_tris = MESH_BYTES // 60
-        self.device.queue.write_buffer(self.uniform["ray"], 0, gpu.params(  # img.z: bricks, img.w: triangle room
-            self.layout, self.K, self.size, far_mm=self.far_mm, min_weight=float(min_weight), frame=n, limit=max_tris))
-        self.device.queue.write_buffer(self.tri_count, 0, np.zeros(2, np.uint32))
-        self._run([("mesh", (256, (n + 255) // 256))])
-        tris, full = np.frombuffer(self.device.queue.read_buffer(self.tri_count), np.uint32)
-        if full:
-            raise RuntimeError(f"mesh of more than {max_tris} triangles: {full} cubes left out")
-        raw = np.frombuffer(self.device.queue.read_buffer(self.out, 0, int(tris) * 60), np.uint32) if tris else np.empty(0, np.uint32)
-        return gpu.assemble_mesh(raw, self.layout)
+        max_tris = min(max_tris or MESH_BYTES // 60, MESH_BYTES // 60)
+        raws, todo = [], [(0, n)]
+        while todo:
+            start, end = todo.pop()
+            self.device.queue.write_buffer(self.uniform["ray"], 0, gpu.params(  # img.z: last brick, img.w: room
+                self.layout, self.K, self.size, far_mm=self.far_mm, min_weight=float(min_weight), frame=end,
+                limit=max_tris, rect=(start, 0, 0, 0)))
+            self.device.queue.write_buffer(self.tri_count, 0, np.zeros(2, np.uint32))
+            self._run([("mesh", (256, (end - start + 255) // 256))])
+            tris, full = np.frombuffer(self.device.queue.read_buffer(self.tri_count), np.uint32)
+            if full and end - start > 1:  # did not fit: the two halves, the first one first
+                todo += [((start + end) // 2, end), (start, (start + end) // 2)]
+            elif full:
+                raise RuntimeError(f"one brick makes more than {max_tris} triangles")
+            elif tris:
+                raws.append(np.frombuffer(self.device.queue.read_buffer(self.out, 0, int(tris) * 60), np.uint32))
+        return gpu.assemble_mesh(np.concatenate(raws) if raws else np.empty(0, np.uint32), self.layout)
 
     def blocks(self):
         return self.counts()[0]
