@@ -32,7 +32,7 @@ from pathlib import Path
 import numpy as np
 
 from . import calib
-from .sysinfo import gpu_usage, parse_fdinfo  # (kept here by name: tests and older notes use bench's)
+from .sysinfo import gpu_usage, parse_fdinfo  # noqa: F401 (parse_fdinfo kept here by name: tests and older notes use bench's)
 from . import cloud as cl
 from . import frames as fr
 
@@ -46,7 +46,7 @@ def stages():
     return [
         (cl.Scanner, "feed", "frame (all of feed)"),
         (cl, "frame_points", "depth -> points"),
-        (cl.Scanner, "cleaned", "clean depth"),
+        (cl, "cleaned_frame", "clean depth (merging)"),
         (cl, "isolate_mask", "object piece"),
         (track, "levels", "frame levels"),
         (cl.Scanner, "frame_markers", "markers"),

@@ -76,13 +76,6 @@ def plane_to(plane, transform_mm):
     return n2, c - n2 @ t
 
 
-def mm_transform(pose):
-    """A pose (translation in metres) with its translation in mm."""
-    out = pose.copy()
-    out[:3, 3] = pose[:3, 3] * 1000
-    return out
-
-
 def stands_on(xyz, pix, shape, n, c, tracked=None):
     """Does the object at the image centre stand on plane (n, c)? Its centre piece above the plane must
     come within CONTACT_MM of it (a table under the object does, a wall behind it does not), and the

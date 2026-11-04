@@ -85,11 +85,6 @@ def y10_scale(raw14):
     return np.where(raw14 >= 16, (raw14.astype(np.float32) - 8) / 16, np.float32(0))
 
 
-def decode_y14(buf, width, height, bytesperline):
-    """Return a (height, width) float32 array of depth on the Y10 scale (0 = invalid)."""
-    return y10_scale(unpack_y14(buf, width, height, bytesperline))
-
-
 def garbled_rows(raw, every=GARBLE_COLUMNS):
     """Bool per row: rows the scanner filled with garbage (see GARBLE_STEP), except the first of each
     run. `raw` holds the raw integer values (Y10, or Y14 before y10_scale); judged on every

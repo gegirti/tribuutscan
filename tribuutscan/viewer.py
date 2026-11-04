@@ -163,7 +163,6 @@ INFO_EVERY_S = 0.5  # the Status box's refresh
 LABEL_W = 12  # its label column (characters)
 MESSAGES_KEPT = 300  # lines the Messages box keeps
 MARKER_HZ = 5  # marker search rate; one search takes ~0.1 s at half resolution
-MARKER_RADII = (3, 4, 5, 7)  # dot radius in half-resolution pixels (smaller ones were glints)
 found_markers = {"on": True, "list": [], "stamp": 0.0}  # list in full-resolution pixels
 # While scanning, the worker says what each frame was (livescan.view_mask: 0 other, 1 base, 2 object):
 # the depth preview dims all but the object (the base is tinted while it is kept), marks its centre (the

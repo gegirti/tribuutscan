@@ -84,18 +84,18 @@ def relative_pose(current, reference, rng, inliers_out=None):
     current, reference: (points mm, descriptors) from extract(). `inliers_out` (a list), if given,
     receives the current frame's inlier points (mm).
     """
-    (pa, da), (pb, db) = current, reference
+    pa, pb = current[0], reference[0]
     good = good_matches(current, reference)
     if len(good) < MIN_INLIERS:
         return None, len(good)
     a, b = pa[[m.queryIdx for m in good]], pb[[m.trainIdx for m in good]]
-    best, best_mask = None, None
+    best_mask = None
     for _ in range(RANSAC_ROUNDS):
         s = rng.choice(len(good), 3, replace=False)
         t = kabsch(a[s], b[s])
         inl = np.linalg.norm(a @ t[:3, :3].T + t[:3, 3] - b, axis=1) < INLIER_MM
         if best_mask is None or inl.sum() > best_mask.sum():
-            best, best_mask = t, inl
+            best_mask = inl
     if best_mask.sum() < MIN_INLIERS:
         return None, int(best_mask.sum())
     t = kabsch(a[best_mask], b[best_mask])  # refined on all inliers

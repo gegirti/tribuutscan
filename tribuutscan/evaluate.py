@@ -98,21 +98,10 @@ def cached_markers(name, directory):
 
 
 TRACKERS = {  # name: Scanner options (the scan mode comes from the dataset)
-    "current": {},
+    "current": {},  # the joint solve on the CPU (the fallback without a usable GPU, or with --force-cpu)
     "gpu": dict(track_with="gpu"),  # the joint solve against a ray cast of a GPU volume (gputrack.py, Phase 3)
-    "gpu-p3": dict(track_with="gpu", segment_stride=2, orb="frame"),  # as Phase 3 left it
-    "gpu-seg": dict(track_with="gpu", orb="frame"),  # coarse object search only
-    "gpu-allmerge": dict(track_with="gpu", merge_min_s=0.0),  # merges not capped in time (before MERGE_MIN_S)
     "gpu-proc": dict(track_with="gpu", merge_process=True),  # merged in a process of its own (the live worker's way)
-    "gpu-noverify": dict(track_with="gpu", verify_gap=False),  # no shape check of the first frame after a gap
-    "baseline": dict(clean_depth=False, gate_refind=False, motion_dt=False, track_with="icp", mode="free"),
-    "p2": dict(track_with="icp"),  # frame-to-frame ICP with P1/P2 (gate, cleanup, scan modes)
-    "frame": dict(target="frame"),  # joint solve against the previous frame
-    "nomarkers": dict(track_with="jointnm"),  # joint solve against the model, without markers
-    "nofeatures": dict(use_features=False),  # joint solve without the ORB starting pose (P4 part 1)
-    "markers": dict(track_with="markers"),  # markers alone (P3)
-    "inline": dict(threaded_merge=False),  # merging in the tracking thread
-}
+}  # (the earlier variants, baseline to gpu-noverify, went in Phase 6: docs/history.md has their numbers)
 
 
 def make_scanner(tracker, preset, mode):
@@ -122,7 +111,7 @@ def make_scanner(tracker, preset, mode):
     return cl.Scanner(preset, log=lambda m: None, **options)
 
 
-def run(name, tracker="baseline", preset="small", live_markers=False, optimise_after=False, mesh=False):
+def run(name, tracker="current", preset="small", live_markers=False, optimise_after=False, mesh=False):
     """live_markers: let the tracker detect markers itself (markers.detect_fast, as live) instead of
     being handed the cached reference detections. Synthetic sets run with the estimated camera they
     were rendered with."""

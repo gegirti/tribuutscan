@@ -413,7 +413,7 @@ def test_output_leaves_out_base_background_and_floating_bits():
     obj = np.c_[25 * np.cos(t.ravel()), 25 * np.sin(t.ravel()), zz.ravel()]  # a can on the base
     fx, fy = np.meshgrid(np.arange(-3, 4, 1.5), np.arange(-3, 4, 1.5))
     floater = np.c_[fx.ravel() + 45, fy.ravel(), np.full(fx.size, 80.0)]  # inside the region, not connected
-    table = np.c_[rng_ring := np.linspace(100, 200, 50), np.zeros(50), np.zeros(50)]  # base outside the region
+    table = np.c_[np.linspace(100, 200, 50), np.zeros(50), np.zeros(50)]  # base outside the region
     other = np.c_[np.full(30, 150.0), np.zeros(30), np.linspace(10, 40, 30)]  # another object, outside
     parts = {"base": base, "obj": obj, "floater": floater, "table": table, "other": other}
     s.cloud.add(np.concatenate(list(parts.values())), np.zeros((sum(map(len, parts.values())), 3), np.uint8))

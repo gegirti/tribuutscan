@@ -1,5 +1,5 @@
 """Open3D ICP helpers that tracking uses (cloud.Scanner, track.py): per-level clouds and
-coarse-to-fine point-to-plane ICP. Needs Open3D (.venv).
+coarse-to-fine point-to-plane ICP (relock, the CPU tracker's levels). Needs Open3D (.venv).
 
 This was the first meshing prototype (frame-to-frame ICP odometry + a TSDF of 1 mm depth steps). Meshes
 now come from fusion.py, which fuses each frame at the pose tracking gave it; only these helpers stay.
@@ -8,7 +8,6 @@ import numpy as np
 import open3d as o3d
 
 ICP_LEVELS = ((0.006, 0.03), (0.003, 0.012), (0.002, 0.006))  # coarse to fine: (voxel, max match distance), metres
-MIN_FITNESS = 0.3  # a frame whose ICP overlap is below this is not taken as tracked
 
 
 def levels(full):

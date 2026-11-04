@@ -41,12 +41,6 @@ def apply(pose, pts_mm):
     return pts_mm @ pose[:3, :3].T + pose[:3, 3] * 1000
 
 
-def triangle_height(a, b, c):
-    """Smallest height of the triangle abc (0 when collinear)."""
-    area2 = np.linalg.norm(np.cross(b - a, c - a))
-    return area2 / max(np.linalg.norm(b - a), np.linalg.norm(c - b), np.linalg.norm(a - c), 1e-9)
-
-
 def consistent(frame_pts, map_pts, tol=PAIR_MM):
     """Largest subset of matched pairs whose pairwise distances agree (greedy: drop the worst)."""
     keep = list(range(len(frame_pts)))
