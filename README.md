@@ -43,9 +43,9 @@ The limits, honestly:
   Both are the scanner's own modes; the viewer's *Range* menu switches them. Long-range distances
   follow the scanner's own numbers for that mode, but no board calibration has been done at long
   range yet (checked once by hand: 50 cm read as 49.3 cm).
-- **Live tracking runs at about 15 frames per second** with a GPU (about 4 on the CPU alone), so
-  move steadily. The GPU itself is mostly idle (about 7 ms of work per frame); the rest is Python on
-  the CPU, the next thing to speed up. Plain objects need shape to hold on to: a flat cardboard box
+- **Live tracking runs at about 15-20 frames per second** with a GPU (20 when our hand-held
+  recordings are replayed through the scan worker, 14.5 in our last live scan, made before the latest
+  speed-up), and about 4 on the CPU alone, so move steadily. Plain objects need shape to hold on to: a flat cardboard box
   at 27-31 cm tracked only 138 of 353 frames with the earlier CPU tracker (not retried since).
 - **Something touching the object** (the stand it rests on, a cable) stays in the scan. The table
   under it and everything around it are left out, and *Remove base* decides about the base.
@@ -57,6 +57,7 @@ Light the scene and uncover the lenses, or every stream is black.
 
 ```
 python3 -m tribuutscan.viewer        # live colour + IR + depth
+python3 -m tribuutscan.viewer --force-cpu   # the same, tracking and meshes on the CPU even with a GPU
 ```
 
 For 14-bit depth (16x finer steps than the 10-bit depth V4L2 offers), allow your desktop user to
@@ -67,14 +68,16 @@ sudo cp udev/70-tribuutscan.rules /etc/udev/rules.d/
 sudo udevadm control --reload && sudo udevadm trigger --subsystem-match=usb --attr-match=idVendor=2bc5
 ```
 
-Scanning, calibration and meshing need Open3D and OpenCV, kept in a separate environment (`.venv`)
-that the viewer finds by itself. `setup-venv.sh` builds it on any distro from the list in
-`pyproject.toml` (extra `scan`):
+Scanning, calibration and meshing need Open3D and OpenCV (and `wgpu` for the GPU), kept in a separate
+environment (`.venv`) that the viewer finds by itself. Build it with [uv](https://docs.astral.sh/uv/),
+from the exact versions in `uv.lock`, on the same system Python the viewer runs on:
 
 ```
-./setup-venv.sh                      # or: PYTHON=python3.13 ./setup-venv.sh
-uv sync --all-extras                 # or with uv (https://docs.astral.sh/uv/): exact versions from uv.lock
+uv sync --all-extras                 # (plain `uv sync` leaves the extras out)
 ```
+
+Without uv, `python3 -m venv .venv && .venv/bin/pip install -e ".[scan,gpu]"` works too (on
+Debian/Ubuntu `python3 -m venv` needs `python3-venv`).
 
 Tested with Python 3.12 (numpy 1.26, OpenCV 4.10 and 4.11) and Python 3.14 (numpy 2.5, OpenCV 5.0, Tk 9),
 both with Open3D 0.20: the same results on every test and evaluation.
@@ -418,6 +421,7 @@ The IR projector turns on by itself when the IR stream is opened.
 - `examples/hand-gpu-scan/` renders of the mesh from a live scan on the GPU
 - `examples/testblock/` a render of the test block (`testblock.py` makes its STL)
 - `tests/` plain test functions: run with pytest, or call them directly
+- `docs/history.md` the working log: every measurement, what was tried and dropped
 
 ## TODO / roadmap
 
@@ -440,18 +444,12 @@ Next up:
       flat where the object stood; `solid.ply`, the same solid with colour, for Blender; a crop box in
       the 3D view for what touches the object (a stand, a cable). A coarser voxel for long range
       (0.75 mm) was measured and not taken: half the triangles, no closer between two scans.
-- [ ] **Speed** (measured on the marker scan: 247 ms per frame, about 4 fps):
-  - [x] the per-frame object search during merging (object separation: 361 -> 234 ms per frame
-        in evaluate.py on the marker scan); tracking still runs its own
-  - [ ] lens-model lookups instead of per-point maths (about 20 ms)
-  - [ ] fewer Open3D fit checks per frame (about 12 calls, 17 ms)
-  - [ ] ORB features on every second frame (about 8 ms)
-  - [ ] independent steps in parallel (11 of 12 CPU threads idle)
+- [x] **Clean-up** (Phase 6): `.venv` built with uv; the earlier tracker variants kept for comparisons
+      removed (their numbers stay in `docs/history.md`); `--force-cpu` to run on the CPU on purpose.
 - [ ] **Accuracy**:
   - [x] a test block to print, with known dimensions and small details (`testblock.py`)
   - [ ] the test block scanned and measured, close and long range
   - [ ] a long-range board calibration
-  - [ ] the up-to-3 mm rim error against Creality's scan of the same part
 - [ ] **IMU in tracking**: read the scanner's IMU calibration, check its clock against the depth
       frames, use the gyro as the rotation guess.
 
@@ -507,11 +505,12 @@ Want to help? Plug your scanner in and send the output of `lsusb` and
 the graphics driver your system already has: Vulkan on Linux (Mesa's drivers for Intel, AMD and NVIDIA
 via nouveau come with a stock Ubuntu desktop; NVIDIA's own driver has Vulkan too), DirectX 12 / Vulkan
 on Windows, Metal on macOS. No CUDA, ROCm or driver upgrade is needed. Without a usable GPU it falls
-back to the CPU (Mesa's llvmpipe, or Open3D and the CPU tracker). Tested only on an Intel Arc A750
+back to the CPU (Mesa's llvmpipe, or Open3D and the CPU tracker); `--force-cpu` (viewer, `cloud.py`,
+`fusion.py`) takes the CPU path on purpose. Tested only on an Intel Arc A750
 (Mesa 25.2) and on llvmpipe. **Have an AMD or NVIDIA card, or another Intel one?** No scanner needed:
 
 ```
-./setup-venv.sh && .venv/bin/python -m tribuutscan.gpucheck --out gpucheck.json
+uv sync --all-extras && .venv/bin/python -m tribuutscan.gpucheck --out gpucheck.json
 ```
 
 It fuses a synthetic sphere on your GPU and on the CPU fallback, checks the mesh against the true
@@ -524,9 +523,9 @@ Creality ships no Linux scanning software, and the Orbbec SDK we tried (`pyorbbe
 not recognise the scanner. Others are working on it too (found November 2026):
 [ubuntu-ferret-scanner](https://github.com/ssjrocks/ubuntu-ferret-scanner), a Linux app (GPL-3.0),
 and [OrbbecSDK_v2_WIN](https://github.com/rafik24/OrbbecSDK_v2_WIN), a Windows fork of Orbbec's SDK
-that needs a patched Orbbec library. If you know of more, please open an issue. This project now scans to calibrated point clouds and rough
-meshes, but it is early: for finished scans, Creality's Android app or CrealityScan under
-Wine/Bottles is still the practical choice.
+that needs a patched Orbbec library. If you know of more, please open an issue. This project now scans to calibrated point clouds,
+meshes and printable solids, but it is early and tested on one scanner: for finished scans, Creality's
+Android app or CrealityScan under Wine/Bottles is still the safer choice.
 
 ## License
 
