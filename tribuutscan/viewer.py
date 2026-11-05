@@ -48,6 +48,7 @@ from .image import depth_to_rgb, ppm, yuyv_pixels
 
 SIDE_W, DEPTH_W = 400, 800  # preview widths: colour and IR on the left, depth in the middle
 PREVIEW_FPS = 15  # previews redraw at most this often; every frame is still captured and paired
+SCAN_SIDE_FPS = 5  # the colour and IR previews while scanning (the depth preview, the live model, stays at 15)
 
 # (label, node, control id): what the Scanner panel's sliders drive.
 SLIDERS = [
@@ -109,6 +110,8 @@ class Stream(threading.Thread):
         self.stamp = 0.0
         self.recent = collections.deque(maxlen=12)  # (stamp, raw): ~0.4 s, so pairing works under load
         self.fps = 0.0
+        self.fresh = threading.Event()  # set on every new frame (the scan feeder waits on the depth stream's)
+        self.preview_fps = PREVIEW_FPS  # (lowered for colour and IR while scanning: SCAN_SIDE_FPS)
 
     def run(self):
         while True:
@@ -128,10 +131,11 @@ class Stream(threading.Thread):
                 continue
             self.raw, self.stamp = buf, self.cap.last_time
             self.recent.append((self.stamp, buf))
+            self.fresh.set()
             n += 1  # the fps shown is the camera's rate, not the preview's
             if time.time() - t0 >= 1:
                 self.fps, n, t0 = n / (time.time() - t0), 0, time.time()
-            if self.cap.ready() or time.time() - rendered < 1 / PREVIEW_FPS:
+            if self.cap.ready() or time.time() - rendered < 1 / self.preview_fps:
                 continue  # behind, or a preview is fresh enough: every frame still goes to `recent`
             rendered = time.time()
             self.latest, self.stats = self.render(self.cap, buf)
@@ -166,7 +170,8 @@ INFO_EVERY_S = 0.5  # the Status box's refresh
 LABEL_W = 12  # its label column (characters)
 MESSAGES_KEPT = 300  # lines the Messages box keeps
 MARKER_HZ = 5  # marker search rate; one search takes ~0.1 s at half resolution
-found_markers = {"on": True, "list": [], "stamp": 0.0}  # list in full-resolution pixels
+SCAN_MARKER_HZ = 1  # ...while scanning: the worker finds markers in its own frames, this ring is display only
+found_markers = {"on": True, "list": [], "stamp": 0.0, "hz": MARKER_HZ}  # list in full-resolution pixels
 # While scanning, the worker says what each frame was (livescan.view_mask: 0 other, 1 base, 2 object):
 # the depth preview dims all but the object (the base is tinted while it is kept), marks its centre (the
 # first frame's object is what the centre hits) and has a red frame while tracking is lost. With the GPU
@@ -214,7 +219,7 @@ def find_markers_loop(color):
             found_markers["list"] = markers.detect_fast(luma.reshape(color.cap.height, color.cap.width))
         elif not found_markers["on"]:
             found_markers["list"] = []
-        time.sleep(max(0.0, 1 / MARKER_HZ - (time.time() - t)))
+        time.sleep(max(0.0, 1 / found_markers["hz"] - (time.time() - t)))
 
 
 def render_color(cap, buf, width=SIDE_W):
@@ -561,7 +566,7 @@ class App:
         self.record_rate = tk.StringVar(value=next(iter(RECORD_RATES)))
         self.job = {"process": None, "dir": None}
         self.live = {"proc": None, "commands": None, "replies": None, "url": None, "open": False,
-                     "inflight": 0, "sent": 0.0, "raw": {},  # raw: depth buffers in work, by capture time
+                     "feeder": None,  # (Feeder: frames out, replies in, off the Tk loop)
                      "done": collections.deque(maxlen=60), "last": None, "name": "", "gpu": "", "merging": ""}
         # (done: when frames came back; last: (merged, frames, points, tracking); gpu / merging: from its log)
         self.scan_state = "idle"  # idle | counting (down to Start) | scanning | saving | optimising | meshing
@@ -578,6 +583,7 @@ class App:
         self.hold_depth = tk.BooleanVar(value=hold_view["on"])  # the View panel's "Hold depth"
         self.ir_auto_var = tk.BooleanVar(value=self.ir_auto)  # the Scanner panel's "Auto IR"
         self.countdown, self.count = tk.BooleanVar(value=True), None  # the Scan panel's "Countdown"; its end
+        self.ticks, self.tick_at = collections.deque(maxlen=20000), None  # Tk tick intervals while scanning
         self.panels, self.images, self.shown = [], {}, {}
 
     # --- window ---------------------------------------------------------------------------------
@@ -732,6 +738,10 @@ class App:
         if time.monotonic() - self.info_at >= INFO_EVERY_S:
             self.info_at = time.monotonic()
             self.refresh_info()
+        now = time.monotonic()
+        if self.scan_state == "scanning" and self.tick_at is not None:
+            self.ticks.append(now - self.tick_at)  # (how often the window got to run: logged at Stop)
+        self.tick_at = now
         self.root.after(33, self.tick)
 
     # --- the Status and Messages boxes ---------------------------------------------------------------
@@ -1256,6 +1266,8 @@ class App:
         live["commands"], live["replies"] = ctx.Queue(), ctx.Queue()
         live["proc"] = ctx.Process(target=livescan.run, args=(live["commands"], live["replies"]), daemon=True)
         live["proc"].start()
+        live["feeder"] = Feeder(self)
+        live["feeder"].start()
 
     def toggle_scan(self, continue_from=None):
         """Start (after the countdown, when it is on), cancel the countdown, or stop and save."""
@@ -1304,13 +1316,15 @@ class App:
         aim = None if continue_from else self.aim_for_start()
         capture = {"ir": self.ir_settings(), **({"aim": aim} if aim else {})}
         out = fr.CAPTURES / (time.strftime("%Y%m%d-%H%M%S") + "-scan")
-        self.scan_state, live["inflight"] = "scanning", 0
         live["name"], live["last"], live["merging"] = out.name, None, ""
         live["done"].clear()
         scan_view.update(keep_base=not self.remove_base.get(), lost=False, model=None)
-        self.live["raw"] = {}
+        live["feeder"].new_scan()
+        self.ticks.clear()
         live["commands"].put(("start", self.preset.get(), out, self.keep_raw.get(), continue_from, calib.CAMERA.mode,
                               self.remove_base.get(), {"capture": capture}))
+        self.scan_state = "scanning"  # (after "start": the feeder sends frames from now on)
+        self.lighter(True)
         self.log(f"scan started: {out.name} ({self.preset.get()}, point distance {cloud.PRESETS_MM[self.preset.get()]} mm)"
                  + (f", continuing {continue_from.name}" if continue_from else "")
                  + (f", on the picked object (depth pixel {aim[0]:.0f}, {aim[1]:.0f})" if aim else ""))
@@ -1363,21 +1377,20 @@ class App:
         live["open"] = True  # opens when the worker reports ready
         self.log("starting the 3D view ...")
 
+    def lighter(self, scanning):
+        """While scanning, the colour and IR previews and the marker ring update less often (the GIL is the
+        viewer's limit: idle, its threads already used 76 / 42 / 21 / 13% of a core on 2026-11-05)."""
+        for s in (self.color, self.ir):
+            s.preview_fps = SCAN_SIDE_FPS if scanning else PREVIEW_FPS
+        found_markers["hz"] = SCAN_MARKER_HZ if scanning else MARKER_HZ
+
     def check_scan(self):
-        """Hand the worker a new frame when it is free; handle its replies."""
-        live, color, depth = self.live, self.color, self.depth
-        if self.scan_state == "scanning" and live["inflight"] < 2 and color.raw and depth.raw \
-                and depth.stamp != live["sent"]:  # one frame in work, one waiting: the worker never idles
-            d_raw, d_t = depth.raw, depth.stamp
-            live["sent"] = d_t
-            live["inflight"] += 1
-            live["raw"] = {t: r for t, r in live["raw"].items() if t > d_t - 2.0}  # (for the live model view)
-            live["raw"][d_t] = d_raw
-            c_raw, c_t = color.nearest(d_t)  # no IR: the worker's raw copy leaves it out (frames.SCAN_STREAMS)
-            live["commands"].put(("frame", c_raw, None, d_raw, depth.cap.bytesperline, (c_t, 0.0, d_t)))
-        while live["replies"] is not None:
+        """Handle the worker's replies (the feeder took them; it also sends the frames)."""
+        live = self.live
+        feeder = live["feeder"]
+        while feeder is not None:
             try:
-                kind, *rest = live["replies"].get_nowait()
+                kind, rest, raw = feeder.out.get_nowait()
             except queue.Empty:
                 break
             if kind == "ready":
@@ -1393,9 +1406,7 @@ class App:
                 elif rest[0].startswith("merging on a thread"):
                     live["merging"] = "thread"
             elif kind == "frame_done":
-                live["inflight"] = max(0, live["inflight"] - 1)
                 merged, frames, points, tracking, cue, view, model, model_t = (list(rest) + [None] * 8)[:8]
-                raw = live["raw"].pop(model_t, None)
                 if self.scan_state == "scanning" and cue is not None:
                     live["done"].append(time.monotonic())  # (the Status box: frames back a second)
                     live["last"] = (merged, frames, points, tracking)
@@ -1417,12 +1428,80 @@ class App:
                 path, points = rest
                 self.log(f"scan saved: {points:,} points -> {Path(path).parent.name}/cloud.ply; optimising ...")
                 self.scan_state = "optimising"
+                self.lighter(False)
+                fed = feeder.report()
+                if fed:
+                    ticks = 1000 * np.array(self.ticks) if self.ticks else np.array([np.nan])
+                    self.log(f"viewer: {fed}; its window ticked every {np.median(ticks):.0f} ms "
+                             f"(95% within {np.percentile(ticks, 95):.0f} ms)")
             elif kind == "optimised":
                 self.log(rest[0] + ("; making the mesh ..." if len(rest) > 1 and rest[1] else ""))
                 self.scan_state = "meshing" if len(rest) > 1 and rest[1] else "idle"
             elif kind == "meshed":
                 self.log(rest[0])
                 self.scan_state = "idle"
+
+
+class Feeder(threading.Thread):
+    """The scan worker's frames and replies, off the Tk loop, for the worker's whole life. While scanning it hands
+    over each new depth frame with its colour pair as soon as fewer than 2 are in flight, and passes every reply
+    on to the Tk thread at once (`out`: (kind, rest, raw depth of a frame_done or None)). From the Tk tick the
+    send waited for a tick that the busy loop could not keep (2026-11-05, the platform scan: 9.2 fps live, the
+    worker waiting 32 ms a frame; bench --live, which feeds the worker like this, 15 fps on the same desktop)."""
+
+    def __init__(self, app):
+        super().__init__(daemon=True)
+        self.app, self.out, self.lock = app, queue.Queue(), threading.Lock()
+        self.inflight, self.sent_stamp, self.raw = 0, 0.0, {}  # raw: depth buffers in work, by capture time
+        self.stats = {"sent": 0, "t0": None, "t1": None, "lag": collections.deque(maxlen=4000)}  # lag: capture -> sent
+
+    def new_scan(self):
+        with self.lock:
+            self.inflight, self.raw = 0, {}
+            self.stats = {"sent": 0, "t0": None, "t1": None, "lag": collections.deque(maxlen=4000)}
+
+    def run(self):
+        live, depth, color = self.app.live, self.app.depth, self.app.color
+        while live["proc"] is not None and live["proc"].is_alive():
+            try:
+                kind, *rest = live["replies"].get(timeout=0.004)
+            except (queue.Empty, EOFError, OSError):
+                kind = None
+            if kind is not None:
+                raw = None
+                if kind == "frame_done":
+                    with self.lock:
+                        self.inflight = max(0, self.inflight - 1)
+                        raw = self.raw.pop(rest[7] if len(rest) > 7 else None, None)
+                self.out.put((kind, rest, raw))
+                continue  # (replies first: they free a place)
+            if self.app.scan_state == "scanning" and self.inflight < 2 and color.raw and depth.raw \
+                    and depth.stamp != self.sent_stamp:
+                self.send(live, depth, color)
+            else:
+                depth.fresh.wait(0.004)
+                depth.fresh.clear()
+
+    def send(self, live, depth, color):
+        d_raw, d_t = depth.raw, depth.stamp
+        c_raw, c_t = color.nearest(d_t)  # no IR: the worker's raw copy leaves it out (frames.SCAN_STREAMS)
+        with self.lock:
+            self.sent_stamp, self.inflight = d_t, self.inflight + 1
+            self.raw = {t: r for t, r in self.raw.items() if t > d_t - 2.0}  # (for the live model view)
+            self.raw[d_t] = d_raw
+        live["commands"].put(("frame", c_raw, None, d_raw, depth.cap.bytesperline, (c_t, 0.0, d_t)))
+        now, st = time.monotonic(), self.stats
+        st["sent"] += 1
+        st["t0"], st["t1"] = st["t0"] or now, now
+        st["lag"].append(now - d_t)
+
+    def report(self):
+        """One line on how the scan was fed: frames sent per second, capture to send (median)."""
+        st = self.stats
+        if not st["sent"] or st["t1"] is None or st["t1"] <= st["t0"]:
+            return None
+        lag = 1000 * float(np.median(list(st["lag"]))) if st["lag"] else float("nan")
+        return f"{st['sent']} frames sent, {st['sent'] / (st['t1'] - st['t0']):.1f} a second, {lag:.0f} ms after capture"
 
 
 def refuse(text):

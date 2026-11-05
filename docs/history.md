@@ -1272,3 +1272,17 @@ cubes on the GPU; the CPU keeps the 6x6 solve, markers, base votes, pose graph, 
     10 fps (15 s, 6.5 MB); model.gif, mesh.ply turning (60 frames, Open3D offscreen on Filament/Vulkan, 5 MB).
     Every frame looked at before publishing: the room, the shelf and boxes, the other hands; no people,
     screens or papers.
+
+- FIXES AFTER THE FIRST SCAN (2026-11-05 evening, plan approved: ~/.claude/plans/virtual-watching-kettle.md).
+  - Live speed. The user's platform scan ran 9.2 fps live (worker: tracking 75 ms, waiting for frames 32 ms);
+    bench --live, which feeds the worker straight, ~15 on the same desktop. The viewer sent frames from its Tk
+    tick, and the loop, sharing the GIL with the previews, the marker search and the streams, could not keep
+    up. Now a Feeder thread sends and receives; colour / IR previews at 5 fps and the marker ring at 1 Hz while
+    scanning. Live A/B on the scanner (the real viewer, 60 s, scanner still on the dark hand, long range,
+    HEAD from a worktree, alternating): HEAD 13.1 / 13.4 fps (waiting 23 / 22 ms); feeder alone 16.0 (6 ms);
+    feeder + lighter previews 19.3 / 17.6 (1 ms). The window ticked every 39 ms (95% within 55-57 ms).
+  - Found on the way: every lost frame of those still scans, HEAD's too, used one marker and fitted the shape
+    at 0.99 / 0.11 mm (degeneracy 0.037): a spurious marker on the board's pattern failing the marker check;
+    2-3% of marker frames with HEAD, 6-16% at the higher rate.
+  - The harness's first runs hung at "saving": it had no __main__ guard, so the spawned worker ran the harness
+    again (the known pitfall). And closing the user's viewer by signal reset the scanner into close range.

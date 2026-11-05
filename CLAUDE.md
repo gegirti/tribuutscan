@@ -345,6 +345,11 @@ Processes:
     starting meanwhile.
   - A range switch logs how long each step took; one still busy after SWITCH_STUCK_S 40 s is given up
     for a reconnect (one hung on 2026-11-05 after an IMU-off timeout, with no clue where).
+  - While scanning, a `Feeder` thread (not the Tk tick) sends each new depth frame with its colour pair as
+    soon as fewer than 2 are in flight and passes the worker's replies on; colour and IR previews drop to
+    SCAN_SIDE_FPS 5 and the marker ring to 1 Hz. Live, scanner still (2026-11-05, back to back): HEAD
+    13.1-13.4 fps with the worker waiting 22-23 ms a frame; the feeder alone 16.0 (6 ms); with the lighter
+    previews 17.6-19.3 (1 ms). At Stop the viewer logs frames sent per second and its tick intervals.
   - Records colour + zlib depth + imu.csv. The IMU runs at 200 Hz while the viewer runs, through the USB
     depth capture's own handle.
   - The Status and Messages boxes are plain text (`sysinfo.py` reads /proc and DRM fdinfo).

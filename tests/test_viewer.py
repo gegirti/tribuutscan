@@ -307,3 +307,55 @@ def test_auto_ir_follows_the_scanner_through_a_rounding_slider():
         assert scale.get() == 600 and app.synced["IR exposure"] == viewer.held(scale) == 600
     finally:
         viewer.get_control = real
+
+
+def test_the_feeder_keeps_the_worker_fed_off_the_tk_loop():
+    """The feeder sends each new depth frame (with its colour pair) as soon as fewer than 2 are in flight and
+    hands every reply on with the frame's raw depth, without the Tk loop: a fake worker taking 30 ms a frame
+    gets one after another."""
+    import queue
+    import threading
+    import time
+    import types
+    commands, replies, alive = queue.Queue(), queue.Queue(), threading.Event()
+    alive.set()
+    proc = types.SimpleNamespace(is_alive=alive.is_set)
+    cap = types.SimpleNamespace(bytesperline=2240)
+    depth = types.SimpleNamespace(raw=None, stamp=0.0, fresh=threading.Event(), cap=cap)
+    color = types.SimpleNamespace(raw=b"c", nearest=lambda t: (b"colour", t - 0.006))
+    app = types.SimpleNamespace(live={"proc": proc, "commands": commands, "replies": replies}, depth=depth, color=color,
+                                scan_state="scanning")
+    feeder = viewer.Feeder(app)
+    most, done = [0], []
+
+    def worker():
+        while alive.is_set():
+            try:
+                cmd = commands.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            most[0] = max(most[0], feeder.inflight)
+            time.sleep(0.03)
+            replies.put(("frame_done", 1, 1, 10, True, {}, None, None, cmd[5][2]))
+
+    threading.Thread(target=worker, daemon=True).start()
+    feeder.start()
+    try:
+        for k in range(1, 31):  # a 100 fps camera: the worker can't take every frame
+            depth.raw, depth.stamp = b"d%d" % k, time.monotonic()
+            depth.fresh.set()
+            time.sleep(0.01)
+        end = time.time() + 2
+        while time.time() < end and feeder.inflight:
+            time.sleep(0.01)
+        while True:
+            try:
+                done.append(feeder.out.get_nowait())
+            except queue.Empty:
+                break
+    finally:
+        alive.clear()
+    assert most[0] <= 2 and len(done) >= 8 and feeder.inflight == 0
+    assert all(kind == "frame_done" and raw is not None and raw.startswith(b"d") for kind, _, raw in done)
+    assert feeder.stats["sent"] == len(done) and "a second" in feeder.report()
+    assert float(np.median(feeder.stats["lag"])) < 0.02  # sent within ~a camera frame of arriving
