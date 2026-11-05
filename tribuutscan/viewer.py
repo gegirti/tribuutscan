@@ -472,6 +472,11 @@ def distance_hint(stats):
 IR_AUTO, IR_MANUAL = 0, 2
 
 
+def held(scale):
+    """The value a Scale holds, as its callback reports it (rounded to its resolution, within its range)."""
+    return int(round(float(scale.get())))
+
+
 def ir_exposure_mode(nodes, auto, log):
     try:
         v4l2.set_control(nodes["ir"], v4l2.CID_EXPOSURE_AUTO, IR_AUTO if auto else IR_MANUAL)
@@ -873,8 +878,8 @@ class App:
 
         scale = tk.Scale(parent, label=label, orient="horizontal", from_=info["min"], to=info["max"],
                          resolution=info["step"] or 1, command=set_value)
-        self.synced[label] = int(info["value"])  # (Tk calls set_value later, from idle: it must not count as a move)
         scale.set(info["value"])
+        self.synced[label] = held(scale)  # (Tk calls set_value later, when drawn: it must not count as a move)
         scale.pack(fill="x")
         self.controls[label] = (node, cid, info, scale)
         return scale
@@ -921,9 +926,11 @@ class App:
                 value = int(get_control(self.targets[node], cid))
             except (OSError, AttributeError):
                 return
-            if value != int(scale.get()):
-                self.synced[label] = value
+            if value != held(scale):
                 scale.set(value)
+                self.synced[label] = held(scale)  # what the scale holds: it rounds to its step and clamps to its
+                # range, and its callback reports that (2026-11-05: Auto IR switched itself off a second after
+                # every switch on, the scanner's value rounded by the slider counting as a move by hand)
 
     def ir_settings(self):
         """What a scan or recording notes about the IR exposure."""

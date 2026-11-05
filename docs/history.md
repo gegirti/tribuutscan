@@ -1261,3 +1261,14 @@ cubes on the GPU; the CPU keeps the 6x6 solve, markers, base votes, pose graph, 
   - Viewer smoke test on the scanner (dark-hand scene): automatic aim on the shelf (67 cm), a click on the hand
     "Picked: object ~32 cm", the countdown and Esc, Auto IR following the scanner (5000 / 1000), "valid 41% now,
     43% held". Tests: 151 pass.
+  - The user's first scan with all of it (20261105-190442, the dark hand turning on the platform, long range,
+    picked with a click): 1372 frames, lost 1, found again 6 (4 by shape), Optimise 357 loops, largest
+    correction 0.49 mm at the object, mesh 1,154,974 triangles from 250 frames. Its log showed Auto IR turning
+    itself off a second after every switch on (and at start): the IR sliders round to their step, and the
+    rounded value their callback reports counted as a move by hand. Fixed: the viewer remembers what the
+    slider holds (`held`), test with a rounding slider. That scan ran with the IR by hand (5000 / 2100).
+  - README GIFs from that scan (examples/readme/, `tribuutscan.showcase`): scan.gif, the raw copy replayed
+    through the live path (1370 of 1372 tracked) and drawn with the viewer's own previews, every 9th frame at
+    10 fps (15 s, 6.5 MB); model.gif, mesh.ply turning (60 frames, Open3D offscreen on Filament/Vulkan, 5 MB).
+    Every frame looked at before publishing: the room, the shelf and boxes, the other hands; no people,
+    screens or papers.

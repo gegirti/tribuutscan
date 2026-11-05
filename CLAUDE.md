@@ -315,6 +315,9 @@ python3 -m tribuutscan.view3d captures/<stamp>-scan    # browser 3D view at http
 .venv/bin/python -m tribuutscan.bakeoff slice captures/<stamp>-scan [--seconds S] [--capacity N]
                                             # GPU slice timing / stability on a saved scan
 .venv/bin/python -m tribuutscan.cloud captures/<stamp>-rec --optimise --mesh   # what the viewer's `m` runs
+.venv/bin/python -m tribuutscan.showcase captures/<stamp>-scan [out]   # README GIFs: scan.gif (the raw copy
+                                            # replayed, drawn with the viewer's previews) + model.gif (mesh.ply
+                                            # turning, Open3D offscreen); needs ffmpeg. Check every frame first
 .venv/bin/python -m tribuutscan.compare captures/<stamp>-scan [ref.ply] [--seeds 12] [--transform c.json]
                                             # score a cloud or mesh against a reference mesh (default
                                             # captures/reference/part/mesh.ply) -> compare[-<name>].json/.ply

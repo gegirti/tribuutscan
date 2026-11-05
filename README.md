@@ -1,5 +1,19 @@
 # triBUUTSCAN
 
+<p align="center">
+  <img src="examples/readme/scan.gif" width="720"
+       alt="A live scan: the colour camera on the left, the live model on the right, a mannequin hand turning on a platform">
+</p>
+<p align="center">
+  <img src="examples/readme/model.gif" width="400" alt="The mesh that scan gave after Stop, turning">
+</p>
+<p align="center"><sub>
+  A live scan of a mannequin hand turning on a platform (2026-11-05, long range, about 10x speed): colour on
+  the left, the live model on the right (grey: seen enough, yellow: needs more views, orange: not scanned
+  yet). Below it, the mesh it gave after Stop: 1.15 million triangles with colour, from 1372 frames (357 loop
+  closures, largest correction 0.49 mm).
+</sub></p>
+
 *3BUUTscan* — open-source Linux software for the **Creality CR-Scan Ferret 3D scanner** (tested on
 the Ferret Pro): live 3D scanning over USB into point clouds and meshes, with no CrealityScan,
 Windows or Wine. Python, tested on Ubuntu.

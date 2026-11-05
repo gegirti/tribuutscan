@@ -275,3 +275,35 @@ def test_the_countdown_starts_the_scan_at_zero_with_the_picked_aim():
     finally:
         viewer.aim_view.clear()
         viewer.aim_view.update(saved)
+
+
+def test_auto_ir_follows_the_scanner_through_a_rounding_slider():
+    """The IR sliders show the scanner's own exposure while Auto IR is on; a slider rounds what it is given
+    (its step) and reports the rounded value to its callback: that must not read as a move by hand."""
+    class Scale:  # a Tk Scale's rounding: step 100, range 100-6800
+        def __init__(self):
+            self.v = 3000
+
+        def set(self, v):
+            self.v = min(max(round(float(v) / 100) * 100, 100), 6800)
+
+        def get(self):
+            return self.v
+
+    app = viewer.App.__new__(viewer.App)
+    scale = Scale()
+    app.controls = {"IR exposure": ("depth", 1, {}, scale)}
+    app.targets = {"depth": None}
+    app.synced = {}
+    values = iter([5486, 5486, 581])
+    real = viewer.get_control
+    viewer.get_control = lambda target, cid: next(values)
+    try:
+        app.follow_ir()
+        assert scale.get() == 5500 and app.synced["IR exposure"] == 5500  # what its callback will say
+        app.follow_ir()  # the same value again: nothing to do
+        assert app.synced["IR exposure"] == 5500
+        app.follow_ir()
+        assert scale.get() == 600 and app.synced["IR exposure"] == viewer.held(scale) == 600
+    finally:
+        viewer.get_control = real
