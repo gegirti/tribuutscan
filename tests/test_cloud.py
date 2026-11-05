@@ -294,6 +294,34 @@ def test_the_tracking_source_follows_the_region_when_the_centre_misses():
     assert cl.isolate_mask(xyz, pix, shape, np.random.default_rng(0), seeds & False)[0].sum() <= 5  # no seeds
 
 
+def test_the_aim_takes_the_piece_where_the_viewer_had_the_object():
+    """The viewer's aim (a click, or the piece it followed) gives the depth pixel the first frame's piece is
+    taken at: the box off to the side, where the middle of the view hits a crumb (the dark-hand scene,
+    2026-11-05: the centre took the shelf behind the hand)."""
+    xyz, pix, shape, scene, box = _off_centre_scene()
+    rng = np.random.default_rng(0)
+    assert cl.isolate_mask(xyz, pix, shape, rng)[0].sum() <= 5  # the centre: the crumb
+    at = tuple(np.median(pix[box], axis=0))  # a pixel on the box
+    keep, _ = cl.isolate_mask(xyz, pix, shape, np.random.default_rng(0), at=at)
+    assert keep[box].mean() > 0.99 and keep.sum() <= box.stop - box.start + 2
+    assert (cl.centre_piece(xyz, pix, shape, at=at) == cl.centre_piece(xyz, pix, shape, at=at)).all()
+    s = cl.Scanner("small", log=lambda m: None, aim=at)
+    assert s.aim == at and s.scene.prefer_piece and s.stats["aim"] == list(at)
+    assert not cl.Scanner("small", log=lambda m: None).scene.prefer_piece
+
+
+def test_a_replay_takes_the_aim_its_live_scan_had():
+    import json
+    import tempfile
+    from pathlib import Path
+    with tempfile.TemporaryDirectory() as tmp:
+        assert cl.recording_aim(tmp) is None  # no info.json
+        (Path(tmp) / "info.json").write_text(json.dumps({"note": "frames a live scan processed"}))
+        assert cl.recording_aim(tmp) is None
+        (Path(tmp) / "info.json").write_text(json.dumps({"aim": [412.0, 380.0], "ir": {"auto": True}}))
+        assert cl.recording_aim(tmp) == (412.0, 380.0)
+
+
 def test_without_a_base_the_source_follows_the_ball_when_the_centre_misses():
     """No base known (the platform scans: a white top without depth): the object's ball seeds the tracking
     source, where the middle of the view hits only a crumb."""

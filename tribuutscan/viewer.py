@@ -6,7 +6,8 @@ Panels (panels.py, each folds):
   disparity offsets);
   the streams pause about 10 s while it switches (vendor.py). IR exposure and gain are controls on the
   depth function: they change the IR sensor that depth is computed from (14-bit USB depth, usbdepth.py,
-  then owns them). Auto IR steps them until the IR image has little clipping (clipping costs depth).
+  then owns them). Auto IR (on by default) is the scanner's own auto exposure; moving an IR slider takes
+  them over by hand.
 - Capture: `s` saves the current frame set to captures/<timestamp>/; `r` records colour + depth sets
   at 30 or 10 fps (and IMU samples, imu.csv) to captures/<timestamp>-rec/, stopping when the disk has
   under 5 GB free (frames.Recorder); `m` tracks, optimises and fuses the latest recording into
@@ -23,6 +24,7 @@ connection (it does so on its own now and then), the viewer reconnects by itself
 import collections
 import fcntl
 import itertools
+import math
 import multiprocessing
 import os
 import queue
@@ -41,7 +43,7 @@ import numpy as np
 
 from . import frames as fr
 from . import calib, cloud, gpu, imu, livescan, markers, panels, pointcloud, sysinfo, usbdepth, v4l2, vendor
-from .depth import decode_depth, garbled
+from .depth import decode_depth, decode_strided, garbled
 from .image import depth_to_rgb, ppm, yuyv_pixels
 
 SIDE_W, DEPTH_W = 400, 800  # preview widths: colour and IR on the left, depth in the middle
@@ -55,11 +57,10 @@ SLIDERS = [
 ]
 PANELS = [panels.ScannerPanel, panels.CapturePanel, panels.ScanPanel, panels.ImuPanel, panels.ViewPanel]
 
-# Auto IR: keep clipped pixels between CLIP_LO and CLIP_HI percent; brighten only if the mean is low.
-CLIP_LO, CLIP_HI, MEAN_LO = 0.3, 2.0, 35
-GAIN_CAP = 2000  # auto never raises gain past this (gain clipped badly in the 25 cm test)
-AUTO_STEP_MS, AUTO_MAX_STEPS = 600, 16
+IR_LABELS = ("IR exposure", "IR gain")  # the sliders the scanner's own auto exposure drives while Auto IR is on
+IR_FOLLOW_S = 1.0  # ...and they show its values, read back this often
 
+COUNTDOWN_S = 3  # Start counts down this long (Scan panel: Countdown), the aim still updating
 RECORD_RATES = {"30 fps": 30, "10 fps": 10}  # colour + compressed depth: about 75 / 25 MB/s (frames.Recorder)
 
 GOOD, EDGE, BAD = "#2e7d32", "#ef6c00", "#c62828"
@@ -172,6 +173,30 @@ found_markers = {"on": True, "list": [], "stamp": 0.0}  # list in full-resolutio
 # tracker it also sends the live model view of that frame (gpu.preview_codes), painted over the object
 # (paint_model); the preview then shows the frame the worker tracked, so model and depth agree.
 scan_view = {"mask": None, "t": 0.0, "keep_base": False, "lost": False, "model": None}  # model: (codes, depth raw)
+# Outside a scan the depth preview holds each pixel's last depth for a moment (display only: scans take the
+# real frames). On some surfaces the scanner drops whole regions from one frame to the next (2026-11-05, the
+# test block on the white platform, scanner still: 2-6% of the centre per frame, 10% over 30 frames, none of
+# it in 90% of them, at every IR exposure), and the raw preview flickers. Held pixels are drawn dimmer; the
+# hold is longer while the IMU says the scanner is still, short while it moves (old depth would smear).
+HOLD_S = {"still": 0.5, "moving": 0.15, "no imu": 0.3}
+HELD_SHADE = 0.6
+hold_view = {"on": True, "s": HOLD_S["no imu"], "depth": None, "t": None, "mode": None}
+# The aim, before Start: a few times a second the idle viewer finds the piece a scan would start on, the way the
+# scan's first frame does (cloud.isolate_mask on every 4th depth pixel), outlines it on the depth and colour
+# previews and dims the rest. A click on either preview picks another piece; the aim then follows that piece (the
+# point nearest its last centre) until Start hands the scan the pixel it is at (Scanner(aim=...)). Right-click or
+# Esc: back to the image centre, which is what a scan without an aim takes (2026-11-05, the dark-hand scene: the
+# centre fell just beside the hand and took the shelf behind it).
+AIM_HZ = 5
+AIM_FRESH_S = 1.0  # an aim older than this is neither drawn nor handed to a scan (streams paused, no depth)
+AIM_FOLLOW_MM = 40.0  # a picked piece is followed to the point nearest its last centre when one is this close
+AIM_KEEP = 5  # the depth-on-the-object share shown is the mean of this many aims (about a second)
+AIM_RGB = np.array([0, 229, 255], np.uint8)
+AIM_DIM = 2  # the rest of the depth preview is divided by this while aiming
+aim_view = {"on": True, "idle": False, "pick": None, "follow": None, "piece": None, "all": None, "t": 0.0}
+# piece: {"pix" (N, 2) depth pixels of its points, "colour" (N, 2) colour pixels, "z" median mm, "at" (u, v) the
+# pixel handed to a scan (None: the image centre), "plane" a support plane was cut, "coverage" depth share of its
+# box (mean of AIM_KEEP)}; all: (xyz, pix) of the frame, for a click on the colour preview
 BASE_TINT = np.array([0, 40, 110], np.uint8)
 LOST_RGB, LOST_PX = np.array([198, 40, 40], np.uint8), 8
 MODEL_DONE, MODEL_THIN = np.array([215, 222, 235]), np.array([240, 196, 60])  # seen often enough / too few times
@@ -199,6 +224,9 @@ def render_color(cap, buf, width=SIDE_W):
     hits, s = found_markers["list"], width / cap.width
     if hits:
         rgb = markers.draw(rgb, [(x * s, y * s, r * s, c) for x, y, r, c in hits])
+    piece = fresh_aim()
+    if piece is not None:  # the aimed piece's outline, where the colour camera sees it
+        paint_outline(rgb, piece_mask(piece["colour"], rgb.shape[:2], (cap.height, cap.width), grow_px=2))
     return ppm(rgb), {"text": f"markers {len(hits)}" if found_markers["on"] else ""}
 
 
@@ -216,15 +244,21 @@ def render_depth(cap, buf, width=DEPTH_W):
     if model is not None:
         model, buf = model  # the frame the scan worker tracked: its model view and its depth agree
     d = decode_depth(buf, cap.width, cap.height, cap.bytesperline)
-    h, w = d.shape
-    centre = d[h * 3 // 8:h * 5 // 8, w * 3 // 8:w * 5 // 8]
+    shown, held = fit(d, width), None  # (colour-map only the shown pixels)
+    if hold_view["on"] and not scanning:
+        shown, held = hold_depth(shown, time.monotonic())
+    h, w = shown.shape
+    centre = shown[h * 3 // 8:h * 5 // 8, w * 3 // 8:w * 5 // 8]
     valid = centre[centre > 0]
     stats = {
-        "text": f"valid {100 * (d > 0).mean():.0f}%",
+        "text": f"valid {100 * (d > 0).mean():.0f}%" + ("" if held is None else
+                                                         f" now, {100 * (shown > 0).mean():.0f}% held"),
         "centre_valid": valid.size / centre.size,
         "centre_cm": float(pointcloud.depth_to_mm(np.median(valid))) / 10 if valid.size else None,
     }
-    rgb = depth_to_rgb(fit(d, width))  # colour-map only the shown pixels
+    rgb = depth_to_rgb(shown)
+    if held is not None:
+        rgb[held] = (rgb[held] * HELD_SHADE).astype(np.uint8)
     view = scan_view["mask"]
     if view is not None and scanning:
         lab = view[np.ix_(preview_index(view.shape[0], rgb.shape[0]), preview_index(view.shape[1], rgb.shape[1]))]
@@ -234,12 +268,161 @@ def render_depth(cap, buf, width=DEPTH_W):
     if model is not None:
         paint_model(rgb, model)
         stats["text"] += MODEL_LEGEND
+    piece = None if scanning else fresh_aim()
+    if piece is not None:  # the aim: the piece a scan would start on, outlined; the rest dimmed
+        mask = piece_mask(piece["pix"], rgb.shape[:2], (cap.height, cap.width), grow_px=2)
+        rgb[~mask] //= AIM_DIM
+        paint_outline(rgb, mask)
+        at = piece["at"]
+        if at is None:
+            mark_centre(rgb)
+        else:
+            mark_centre(rgb, at=(at[0] * rgb.shape[1] / cap.width, at[1] * rgb.shape[0] / cap.height))
     if scanning:
         mark_centre(rgb)
         if scan_view["lost"]:
             b = LOST_PX
             rgb[:b], rgb[-b:], rgb[:, :b], rgb[:, -b:] = LOST_RGB, LOST_RGB, LOST_RGB, LOST_RGB
     return ppm(rgb), stats
+
+
+def fresh_aim():
+    """The aimed piece (aim_view["piece"]) if it is recent and the viewer is idle, else None."""
+    piece = aim_view["piece"]
+    if piece is None or not aim_view["idle"] or time.monotonic() - aim_view["t"] > AIM_FRESH_S:
+        return None
+    return piece
+
+
+def grow(mask, px):
+    """`mask` grown by `px` pixels (4-neighbour steps)."""
+    out = mask.copy()
+    for _ in range(px):
+        g = out.copy()
+        g[1:] |= out[:-1]
+        g[:-1] |= out[1:]
+        g[:, 1:] |= out[:, :-1]
+        g[:, :-1] |= out[:, 1:]
+        out = g
+    return out
+
+
+def piece_mask(points, shape, source_shape, grow_px=2):
+    """A preview-sized mask (shape) of the pixels (N, 2: x, y in a source_shape image) of a piece's points,
+    grown by grow_px to close the gaps between them (the aim takes every 4th pixel)."""
+    h, w = shape
+    mask = np.zeros(shape, bool)
+    if len(points):
+        x = (np.asarray(points[:, 0]) * w / source_shape[1]).astype(int)
+        y = (np.asarray(points[:, 1]) * h / source_shape[0]).astype(int)
+        ok = (x >= 0) & (x < w) & (y >= 0) & (y < h)
+        mask[y[ok], x[ok]] = True
+    return grow(mask, grow_px)
+
+
+def paint_outline(rgb, mask, width=2):
+    """Paint the edge of `mask` (its outermost `width` pixels) in AIM_RGB."""
+    edge = mask & grow(~mask, width)
+    rgb[edge] = AIM_RGB
+
+
+def aim_once(cap, buf, history, rng_seed=0):
+    """One aim (see aim_view): the piece a scan starting now would take, as isolate_mask finds it at the
+    image centre, or at the user's pick (followed by its 3D centre)."""
+    depth4, _ = decode_strided(buf, cap.width, cap.height, cap.bytesperline)
+    shape = (cap.height, cap.width)
+    xyz, _, pix = cloud.frame_points({"depth4": depth4, "shape": shape}, 4, colour=False)
+    if len(xyz) < 50:
+        aim_view.update(piece=None, all=None, t=time.monotonic())
+        return None
+    at, follow = aim_view["pick"], aim_view["follow"]
+    if at is not None and follow is not None:  # follow the picked piece: the point nearest its last centre
+        dist = np.linalg.norm(xyz - follow, axis=1)
+        i = int(np.argmin(dist))
+        if dist[i] <= AIM_FOLLOW_MM:
+            at = (float(pix[i, 0]), float(pix[i, 1]))
+    keep, plane = cloud.isolate_mask(xyz, pix, shape, np.random.default_rng(rng_seed), at=at)
+    if not keep.any():
+        aim_view.update(piece=None, all=(xyz, pix), t=time.monotonic())
+        return None
+    p, z = pix[keep], xyz[keep, 2]
+    cells = ((p[:, 0].max() - p[:, 0].min()) // 4 + 1) * ((p[:, 1].max() - p[:, 1].min()) // 4 + 1)
+    history.append(len(p) / cells)
+    if at is not None:  # hand the scan a pixel on the piece (its middle point), and follow it from here
+        mid = xyz[keep].mean(0)
+        aim_view["follow"] = mid
+        j = int(np.argmin(np.linalg.norm(xyz[keep] - mid, axis=1)))
+        at = (float(p[j, 0]), float(p[j, 1]))
+    colour = np.stack(calib.CAMERA.colour_px(p[:, 0], p[:, 1], z), -1)
+    piece = {"pix": p, "colour": colour, "z": float(np.median(z)), "at": at, "plane": plane is not None,
+             "coverage": float(np.mean(history)), "points": int(len(p))}
+    aim_view.update(piece=piece, all=(xyz, pix), t=time.monotonic())
+    return piece
+
+
+def aim_loop(depth):
+    """Background thread: aim_once on the newest depth frame AIM_HZ times a second while the viewer is idle."""
+    history = collections.deque(maxlen=AIM_KEEP)
+    while True:
+        t = time.time()
+        if aim_view["on"] and aim_view["idle"] and depth.raw is not None and depth.fps > 0:
+            try:
+                aim_once(depth.cap, depth.raw, history)
+            except Exception:  # noqa: BLE001 - a stream switching under it; the next round tries again
+                aim_view["piece"] = None
+        else:
+            history.clear()
+        time.sleep(max(0.0, 1 / AIM_HZ - (time.time() - t)))
+
+
+def aim_hint(piece, ir_stats, imu_state, markers_on):
+    """(text, colour) for the bar under the depth preview while aiming: distance in this range's window, depth on
+    the object, IR clipping, base and tilt, markers; the colour is the worst of them."""
+    near, far = pointcloud.window_cm()
+    if piece is None:
+        return f"No object in view: aim at it from {near + 3:.0f}-{far - 4:.0f} cm", BAD
+    z, long_range = piece["z"] / 10, calib.CAMERA.mode.startswith("Long")
+    parts, worst = [], GOOD
+    rank = {GOOD: 0, EDGE: 1, BAD: 2}
+
+    def add(text, colour=GOOD):
+        nonlocal worst
+        parts.append(text)
+        worst = colour if rank[colour] > rank[worst] else worst
+
+    est = " (estimate)" if calib.CAMERA.law_estimate else ""
+    if z < near + 2:
+        add(f"object ~{z:.0f} cm{est}: near the close edge, move back", EDGE)
+    elif z > far - 3:
+        add(f"object ~{z:.0f} cm{est}: near the far edge, move closer" + ("" if long_range else " or use Long range"), EDGE)
+    else:
+        add(f"object ~{z:.0f} cm{est}")
+    c = piece["coverage"]
+    add(f"depth {c:.0%}" + (": little, try another angle" if c < 0.15 else ""),
+        BAD if c < 0.15 else EDGE if c < 0.4 else GOOD)
+    clipped = (ir_stats or {}).get("clipped")
+    if clipped is not None and clipped > 5:
+        add(f"IR clipping {clipped:.0f}%", EDGE)
+    if not piece["plane"]:
+        tilt = imu_state["pitch"] if imu_state else None
+        add("no base" + (f", {abs(tilt):.0f}° down" if tilt is not None and tilt < -3 else "") + " (ok on a platform)")
+    if markers_on and found_markers["list"]:
+        add(f"markers {len(found_markers['list'])}")
+    return ("Picked: " if piece["at"] is not None else "") + " | ".join(parts), worst
+
+
+def hold_depth(depth, now):
+    """(depth to show, held mask) for one preview-sized depth image: each pixel keeps its last depth for
+    hold_view["s"] seconds after it had one (held: shown from an earlier frame, not this one). A change of
+    size or depth mode starts afresh (the raw values mean other distances)."""
+    hv = hold_view
+    if hv["depth"] is None or hv["depth"].shape != depth.shape or hv["mode"] != calib.CAMERA.mode:
+        hv.update(depth=np.zeros_like(depth), t=np.full(depth.shape, -np.inf), mode=calib.CAMERA.mode)
+    valid = depth > 0
+    hv["depth"][valid] = depth[valid]
+    hv["t"][valid] = now
+    held = ~valid & (now - hv["t"] < hv["s"])
+    return np.where(valid, depth, np.where(held, hv["depth"], 0)), held
 
 
 def paint_model(rgb, codes):
@@ -255,10 +438,11 @@ def paint_model(rgb, codes):
     rgb[missing] = (rgb[missing] * 0.3 + MODEL_MISSING * 0.7).astype(np.uint8)
 
 
-def mark_centre(rgb, arm=10, gap=4):
-    """A white cross (2 px lines, open in the middle) at the centre of a preview."""
+def mark_centre(rgb, arm=10, gap=4, at=None):
+    """A white cross (2 px lines, open in the middle) at the centre of a preview, or at preview pixel `at`."""
     h, w = rgb.shape[:2]
-    cy, cx = h // 2, w // 2
+    cy, cx = (h // 2, w // 2) if at is None else (int(np.clip(at[1], arm + gap, h - arm - gap - 1)),
+                                                   int(np.clip(at[0], arm + gap, w - arm - gap - 1)))
     for a, b in ((cx - gap - arm, cx - gap), (cx + gap, cx + gap + arm)):
         rgb[cy - 1:cy + 1, a:b] = 255
     for a, b in ((cy - gap - arm, cy - gap), (cy + gap, cy + gap + arm)):
@@ -279,20 +463,28 @@ def distance_hint(stats):
     return text + " - good", GOOD
 
 
-IR_EXPOSURE_MODE = 2  # IR node's auto exposure menu: 2 lets the depth function's IR exposure and gain act;
-# in 0 (auto, seen after a power-up on 2026-10-31) the sliders and Auto IR changed nothing
+# The IR node's auto exposure menu (v4l2.CID_EXPOSURE_AUTO). 0: the scanner's own auto exposure (what it powers
+# up and resets to); the depth function's IR exposure and gain then change nothing. 2: they act (by hand).
+# Measured 2026-11-05 (depth on the object per frame / in 90% of 40 frames): the scanner's AE chose 5000 / 1000 on
+# the dark hand (long range) and gave 51.6 / 49.2%, the defaults 3000 / 1000 51.1 / 48.4, the old one-shot
+# Auto IR's 1190 / 2700 51.2 / 47.8, 800 / 1000 48.3 / 43.2; on the test block (close range) it chose 581 and
+# matched every manual setting. So Auto IR is the scanner's own, on by default.
+IR_AUTO, IR_MANUAL = 0, 2
 
 
-def ir_exposure_by_hand(nodes, log):
+def ir_exposure_mode(nodes, auto, log):
     try:
-        v4l2.set_control(nodes["ir"], v4l2.CID_EXPOSURE_AUTO, IR_EXPOSURE_MODE)
+        v4l2.set_control(nodes["ir"], v4l2.CID_EXPOSURE_AUTO, IR_AUTO if auto else IR_MANUAL)
     except OSError as e:
-        log(f"IR exposure mode not set ({e.strerror}): the IR sliders may do nothing")
+        log(f"IR exposure mode not set ({e.strerror}): " + ("Auto IR may be off" if auto else "the IR sliders may do nothing"))
 
 
 RANGES = {"Close range 15-33 cm": calib.CLOSE, "Long range 20-72 cm": calib.LONG}
 SOURCES = {"board": "board calibration", "factory": "factory calibration", "estimate": "estimates"}
 SWITCH_SETTLE_S = 6.0  # the scanner may reset its USB connection a few seconds after its streams stop
+SWITCH_STUCK_S = 40.0  # a range switch takes 6-7 s; one still busy after this long is given up for a reconnect
+# (2026-11-05 10:34: one hung after "IMU not switched off ([Errno 110] Connection timed out)" until the viewer was
+# killed, with nothing logged about where; the switch now logs how long each step took)
 
 
 def depth_title(cap):
@@ -339,7 +531,8 @@ class App:
         self.message_count, self.messages_shown = itertools.count(1), 0
         self.rates, self.info_at = sysinfo.Rates(), 0.0  # the Status box: CPU / GPU rates, when it was refreshed
         self.nodes = v4l2.discover()
-        ir_exposure_by_hand(self.nodes, self.log)
+        self.ir_auto = True  # Auto IR: the scanner's own auto exposure (ir_exposure_mode)
+        ir_exposure_mode(self.nodes, self.ir_auto, self.log)
         opened = []  # closed again if a later one fails, so a retry finds the scanner free
         try:
             for open_one in (lambda: fr.open_depth(self.nodes, self.log),
@@ -356,7 +549,7 @@ class App:
                         "Depth": Stream(cap, render_depth)}
         self.color, self.ir, self.depth = self.streams.values()
         self.controls = {}  # label -> (node name, control id, info, scale); targets[node] is looked up at use
-        self.auto = {"steps": 0, "running": False}
+        self.synced, self.ir_read_at = {}, 0.0  # slider values set from the scanner's (not to be sent back); when
         self.switching = {"busy": False, "done": None}  # a range switch in progress / finished (its thread)
         self.rec = {"recorder": None, "thread": None, "missed": 0}
         self.record_rates = RECORD_RATES  # for the Capture panel
@@ -366,7 +559,7 @@ class App:
                      "inflight": 0, "sent": 0.0, "raw": {},  # raw: depth buffers in work, by capture time
                      "done": collections.deque(maxlen=60), "last": None, "name": "", "gpu": "", "merging": ""}
         # (done: when frames came back; last: (merged, frames, points, tracking); gpu / merging: from its log)
-        self.scan_state = "idle"  # idle | scanning | saving | optimising | meshing
+        self.scan_state = "idle"  # idle | counting (down to Start) | scanning | saving | optimising | meshing
         self.imu, self.imu_note, self.imu_want = None, "", usbdepth.available()
         self.retry_at = 0.0  # time.monotonic() before which a lost scanner is not reconnected again
         self.lost = False  # a stream lost its device and the scanner is not back yet
@@ -377,6 +570,9 @@ class App:
         self.remove_base = tk.BooleanVar(value=True)
         self.mesh_after = tk.BooleanVar(value=True)  # the mesh made after Stop (and Optimise)
         self.imu_wanted, self.find_markers = tk.BooleanVar(value=self.imu_want), tk.BooleanVar(value=True)
+        self.hold_depth = tk.BooleanVar(value=hold_view["on"])  # the View panel's "Hold depth"
+        self.ir_auto_var = tk.BooleanVar(value=self.ir_auto)  # the Scanner panel's "Auto IR"
+        self.countdown, self.count = tk.BooleanVar(value=True), None  # the Scan panel's "Countdown"; its end
         self.panels, self.images, self.shown = [], {}, {}
 
     # --- window ---------------------------------------------------------------------------------
@@ -415,10 +611,13 @@ class App:
             self.images[name] = blank
             image = tk.Label(parent, image=blank, bg="black", bd=0)
             image.pack()
+            if name in ("Depth", "Colour"):  # the aim: a click picks the object there, a right-click lets go
+                image.bind("<Button-1>", lambda e, name=name: self.aim_click(name, e.x, e.y))
+                image.bind("<Button-3>", lambda _e: self.aim_clear())
             if name == "Depth":
                 bar = tk.Frame(parent)
                 bar.pack(fill="x", pady=(4, 0))
-                self.guide = tk.Label(bar, anchor="center", font=("TkDefaultFont", 14, "bold"))
+                self.guide = tk.Label(bar, anchor="center", font=("TkDefaultFont", 12, "bold"))
                 self.guide.pack(side="left", fill="x", expand=True)
                 self.retry = tk.Button(bar, text="Retry now", font=panels.BOLD, command=self.retry_now)  # shown while lost
             stats = tk.Label(parent, anchor="w", font=("TkFixedFont", 9))
@@ -432,10 +631,12 @@ class App:
             self.panels.append(panel)
         for key, action in (("s", self.save), ("r", self.toggle_record), ("m", self.mesh), ("c", self.toggle_scan)):
             root.bind(key, lambda _event, action=action: action())
+        root.bind("<Escape>", lambda _event: self.escape())
         root.protocol("WM_DELETE_WINDOW", self.close)
 
     def start(self):
         threading.Thread(target=find_markers_loop, args=(self.color,), daemon=True).start()
+        threading.Thread(target=aim_loop, args=(self.depth,), daemon=True).start()
         for s in self.streams.values():
             s.start()
         on_usb = isinstance(self.depth.cap, usbdepth.DepthCapture)
@@ -469,16 +670,25 @@ class App:
             self.switching["busy"], self.lost = True, True
             self.log("lost the scanner (unplugged, or it reset its USB connection): reconnecting ...")
             threading.Thread(target=self.reconnect, daemon=True).start()
+        self.check_switch()
+        aim_view["idle"] = self.scan_state in ("idle", "counting") and not self.switching["busy"] and not self.lost
         if self.switching["done"]:  # back in the Tk thread after a range switch or a reconnect
-            self.switching.update(done=None, busy=False)
+            self.switching.update(done=None, busy=False, since=None, step=None)
             self.views["Depth"][0].configure(text=depth_title(self.depth.cap))
             self.range_var.set(self.range_name())
             self.imu_wanted.set(self.imu is not None or (self.imu_want and not self.imu_note))
             for label, (node, cid, _, scale) in self.controls.items():  # the scanner may have reset them
+                if label in IR_LABELS and self.ir_auto:
+                    continue  # (its own auto exposure sets these)
                 try:
                     set_control(self.targets[node], cid, int(scale.get()))
                 except (OSError, AttributeError) as e:
                     self.log(f"{label}: {getattr(e, 'strerror', None) or e}")
+        if self.ir_auto and not self.switching["busy"] and time.monotonic() - self.ir_read_at >= IR_FOLLOW_S:
+            self.ir_read_at = time.monotonic()
+            self.follow_ir()
+        st = self.imu.state() if self.imu is not None else None  # the depth preview's hold follows the IMU
+        hold_view["s"] = HOLD_S["no imu"] if st is None else HOLD_S["still" if st["still"] else "moving"]
         for name, s in self.streams.items():
             _, image, stats = self.views[name]
             if s.latest is not None and self.shown.get(name) != s.version:  # redraw only a changed preview
@@ -490,9 +700,15 @@ class App:
             wait = self.retry_at - time.monotonic()
             self.guide.configure(fg=BAD, text="Reconnecting to the scanner ..." if self.switching["busy"] or wait <= 0 else
                                  f"Scanner disconnected: plug it in or replug it. Next try in {wait:.0f} s")
-        elif self.depth.stats:
-            text, colour = distance_hint(self.depth.stats)
-            self.guide.configure(text=text, fg=colour)
+        else:
+            hint = self.check_countdown() if self.scan_state == "counting" else None
+            if hint is None and aim_view["idle"] and time.monotonic() - aim_view["t"] <= AIM_FRESH_S:
+                hint = aim_hint(aim_view["piece"], self.ir.stats, self.imu.state() if self.imu else None,
+                                found_markers["on"])
+            if hint is None and self.depth.stats:
+                hint = distance_hint(self.depth.stats)
+            if hint is not None:
+                self.guide.configure(text=hint[0], fg=hint[1])
         retry_shown = self.retry.winfo_ismapped()
         if self.lost and not self.switching["busy"] and not retry_shown:
             self.retry.pack(side="right", padx=(6, 0))
@@ -559,8 +775,8 @@ class App:
                        f"{self.rec['missed']} missed")
         if self.job["process"] is not None:
             now.append(f"meshing {self.job['dir'].name}")
-        if self.auto["running"]:
-            now.append("finding the IR exposure (Auto IR)")
+        if self.scan_state == "counting":
+            now.append("counting down to the start of a scan")
         return "; ".join(now) or "idle: showing the scanner's images"
 
     def status_lines(self):
@@ -569,7 +785,8 @@ class App:
         on_usb = isinstance(self.depth.cap, usbdepth.DepthCapture)
         mode = calib.CAMERA.mode
         rows = [("Now", self.doing()),
-                ("Scanner", f"depth {'14-bit over USB' if on_usb else '10-bit (V4L2)'}, {self.range_names.get(mode, mode)}"),
+                ("Scanner", f"depth {'14-bit over USB' if on_usb else '10-bit (V4L2)'}, {self.range_names.get(mode, mode)}, "
+                            f"IR {'auto (the scanner' + chr(39) + 's own)' if self.ir_auto else 'by hand'}"),
                 ("Camera", SOURCES.get(calib.CAMERA.source, calib.CAMERA.source)
                  + (", distances are estimates" if calib.CAMERA.law_estimate else ""))]
         streams = ", ".join(f"{name.split()[0].lower()} {s.fps:.0f}" for name, s in self.streams.items())
@@ -643,79 +860,113 @@ class App:
             return None
 
         def set_value(value):
+            value = int(float(value))
+            if self.synced.get(label) == value:  # (the scale showing the scanner's own value: nothing to send)
+                return
+            self.synced.pop(label, None)
+            if label in IR_LABELS and self.ir_auto:
+                self.set_ir_auto(False)  # moving an IR slider takes the IR exposure over by hand
             try:
-                set_control(self.targets[node], cid, int(float(value)))
+                set_control(self.targets[node], cid, value)
             except (OSError, AttributeError) as e:
                 self.log(f"{label}: {getattr(e, 'strerror', None) or e}")
 
         scale = tk.Scale(parent, label=label, orient="horizontal", from_=info["min"], to=info["max"],
                          resolution=info["step"] or 1, command=set_value)
+        self.synced[label] = int(info["value"])  # (Tk calls set_value later, from idle: it must not count as a move)
         scale.set(info["value"])
         scale.pack(fill="x")
         self.controls[label] = (node, cid, info, scale)
         return scale
 
     def reset_controls(self):
-        for _, _, info, scale in self.controls.values():
-            scale.set(info["default"])  # triggers set_value
+        for label, (_, _, info, scale) in self.controls.items():
+            if label not in IR_LABELS:
+                scale.set(info["default"])  # triggers set_value
+        self.set_ir_auto(True)  # (the scanner's own auto exposure is the default for IR)
 
     def control_values(self):
-        return {label: get_control(self.targets[node], cid) for label, (node, cid, _, _) in self.controls.items()}
+        values = {label: get_control(self.targets[node], cid) for label, (node, cid, _, _) in self.controls.items()}
+        return {**values, "IR auto": self.ir_auto}
 
-    def start_auto(self):
-        if self.auto["running"]:  # a second click would start a second chain of steps beside the first
-            return
-        if "IR exposure" in self.controls and "IR gain" in self.controls and not self.switching["busy"]:
-            self.auto["steps"], self.auto["running"] = 0, True
-            self.auto_step()
+    def toggle_ir_auto(self):
+        self.set_ir_auto(bool(self.ir_auto_var.get()))
 
-    def auto_step(self):
-        """One Auto IR step: darken while clipping, brighten while dim, else stop."""
-        exposure, gain = self.controls["IR exposure"], self.controls["IR gain"]
-        e, g = exposure[3].get(), gain[3].get()
-        clipped, mean = self.ir.stats.get("clipped"), self.ir.stats.get("mean")
-        self.auto["steps"] += 1
-        if clipped is None or self.auto["steps"] > AUTO_MAX_STEPS:
-            self.log("Auto IR: gave up")
-            self.auto["running"] = False
+    def set_ir_auto(self, on):
+        """Auto IR on (the scanner's own auto exposure) or off (the IR sliders' values, from where it was)."""
+        if on == self.ir_auto:
             return
-        if clipped > CLIP_HI and g > gain[2]["min"]:
-            gain[3].set(max(gain[2]["min"], g * 0.7))
-        elif clipped > CLIP_HI and e > exposure[2]["min"]:
-            exposure[3].set(max(exposure[2]["min"], e * 0.7))
-        elif clipped < CLIP_LO and mean < MEAN_LO and e < exposure[2]["max"]:
-            exposure[3].set(min(exposure[2]["max"], e * 1.4))
-        elif clipped < CLIP_LO and mean < MEAN_LO and g < GAIN_CAP:
-            gain[3].set(min(GAIN_CAP, g * 1.3))
+        self.ir_auto = on
+        self.ir_auto_var.set(on)
+        ir_exposure_mode(self.nodes, on, self.log)
+        if on:
+            self.ir_read_at = 0.0  # the sliders follow it from the next tick
         else:
-            self.log(f"Auto IR: done (exposure {e}, gain {g})")
-            self.auto["running"] = False
-            return
-        self.message = f"Auto IR: step {self.auto['steps']}"
-        self.root.after(AUTO_STEP_MS, self.auto_step)
+            for label in IR_LABELS:
+                if label in self.controls:
+                    node, cid, _, scale = self.controls[label]
+                    try:
+                        set_control(self.targets[node], cid, int(scale.get()))
+                    except (OSError, AttributeError) as e:
+                        self.log(f"{label}: {getattr(e, 'strerror', None) or e}")
+        self.log("Auto IR on: the scanner sets its IR exposure" if on else "IR exposure by hand")
+
+    def follow_ir(self):
+        """While Auto IR is on: show the scanner's own exposure and gain on the IR sliders."""
+        for label in IR_LABELS:
+            if label not in self.controls:
+                continue
+            node, cid, _, scale = self.controls[label]
+            try:
+                value = int(get_control(self.targets[node], cid))
+            except (OSError, AttributeError):
+                return
+            if value != int(scale.get()):
+                self.synced[label] = value
+                scale.set(value)
+
+    def ir_settings(self):
+        """What a scan or recording notes about the IR exposure."""
+        values = {label: int(self.controls[label][3].get()) for label in IR_LABELS if label in self.controls}
+        return {"auto": self.ir_auto, "exposure": values.get("IR exposure"), "gain": values.get("IR gain")}
 
     def range_name(self):
         return self.range_names.get(calib.CAMERA.mode, calib.CAMERA.mode)
 
     def choose_range(self, label):
         mode = RANGES[label]
-        busy = self.rec["recorder"] or self.scan_state != "idle" or self.auto["running"] or self.switching["busy"]
+        busy = self.rec["recorder"] or self.scan_state != "idle" or self.switching["busy"]
         if mode == calib.CAMERA.mode or busy:
             if busy:
-                self.log("stop recording, scanning and Auto IR before switching the range")
+                self.log("stop recording and scanning before switching the range")
             self.range_var.set(self.range_name())
             return
-        self.switching["busy"] = True
+        gen = self.switching.get("gen", 0) + 1
+        self.switching.update(busy=True, since=time.monotonic(), step="starting", gen=gen)
         self.log(f"switching to {label}: the streams pause for about 10 s")
-        threading.Thread(target=self.switch_range, args=(mode,), daemon=True).start()
+        threading.Thread(target=self.switch_range, args=(mode, gen), daemon=True).start()
 
-    def switch_range(self, mode):
-        """Background thread: pause the streams, switch the scanner's depth mode, start them again."""
+    def switch_range(self, mode, gen=None):
+        """Background thread: pause the streams, switch the scanner's depth mode, start them again. If the
+        watchdog in `check_switch` gave up on it meanwhile (a newer `gen`), it leaves the streams alone."""
+        took, t = [], [time.monotonic()]
+
+        def step(name):  # the step about to run, for the watchdog's message; the time the last one took
+            now = time.monotonic()
+            if self.switching.get("step") not in (None, "starting"):
+                took.append(f"{self.switching['step']} {now - t[0]:.1f} s")
+            t[0] = now
+            self.switching["step"] = name
+
         try:
+            step("switching the IMU off")
             self.imu_off()  # its commands go through the depth capture, which is about to close
+            step("pausing the streams")
             for s in self.streams.values():
                 s.pause()
+            step("waiting for the scanner to settle")
             time.sleep(SWITCH_SETTLE_S)
+            step("switching the depth mode")
             for attempt in range(2):
                 try:
                     found = wait_for_scanner()
@@ -733,12 +984,31 @@ class App:
                     time.sleep(3)
             self.log(f"depth range switched to {mode}")
         except Exception as e:  # noqa: BLE001 - shown to the user
-            self.log(f"range switch failed: {e}")
+            self.log(f"range switch failed at {self.switching.get('step')}: {e}")
         finally:
+            if gen is not None and self.switching.get("gen") != gen:
+                self.log(f"the range switch given up came back after {time.monotonic() - t[0]:.0f} s "
+                         f"in {self.switching.get('step') or 'a step'}: left alone")
+                return
+            step("opening the streams again")
             self.reopen()
             if self.imu_want:
+                step("switching the IMU on")
                 self.imu_on()
+            step(None)
+            self.log("range switch took: " + ", ".join(took))
             self.switching["done"] = True
+
+    def check_switch(self):
+        """The watchdog (Tk thread): a range switch busy for SWITCH_STUCK_S is given up and the scanner
+        reconnected as after a USB reset (a stuck thread that comes back later then leaves things alone)."""
+        sw = self.switching
+        if not sw["busy"] or sw.get("since") is None or time.monotonic() - sw["since"] < SWITCH_STUCK_S:
+            return
+        self.log(f"range switch stuck {SWITCH_STUCK_S:.0f} s while {sw.get('step')}: reconnecting the scanner")
+        sw.update(gen=sw.get("gen", 0) + 1, since=None)
+        self.lost = True
+        threading.Thread(target=self.reconnect, daemon=True).start()
 
     def reconnect(self):
         """Background thread, after a stream lost its device (the scanner reset itself): stop what
@@ -774,7 +1044,7 @@ class App:
         Returns False (and says so) if they could not be opened."""
         try:
             self.nodes.update(wait_for_scanner())
-            ir_exposure_by_hand(self.nodes, self.log)  # a USB reset puts it back to auto
+            ir_exposure_mode(self.nodes, self.ir_auto, self.log)  # (a USB reset puts it back to auto)
             self.color.resume(v4l2.Capture(self.nodes["color"], "YUYV", fr.W, fr.H))
             self.ir.resume(v4l2.Capture(self.nodes["ir"], "GREY", fr.W, fr.H))
             cap = fr.open_depth(self.nodes, self.log)
@@ -838,6 +1108,9 @@ class App:
             self.imu_off()
             self.imu_note = ""
             self.log("IMU off")
+
+    def toggle_hold(self):
+        hold_view["on"] = bool(self.hold_depth.get())
 
     def toggle_markers(self):
         found_markers.update(on=self.find_markers.get())
@@ -978,16 +1251,51 @@ class App:
         live["proc"].start()
 
     def toggle_scan(self, continue_from=None):
+        """Start (after the countdown, when it is on), cancel the countdown, or stop and save."""
         live = self.live
         if self.scan_state == "scanning":
             self.scan_state = "saving"
             live["commands"].put(("stop", bool(self.mesh_after.get())))
             self.log("scan stopped, saving ...")
             return
+        if self.scan_state == "counting":
+            self.cancel_countdown()
+            return
         if self.scan_state != "idle" or self.switching["busy"]:
             return
         if live["proc"] is None:
+            self.start_worker()  # (during the countdown it has the time to start)
+        if self.countdown.get():
+            self.scan_state, self.count = "counting", {"until": time.monotonic() + COUNTDOWN_S, "from": continue_from}
+            return
+        self.begin_scan(continue_from)
+
+    def cancel_countdown(self):
+        if self.scan_state == "counting":
+            self.scan_state, self.count = "idle", None
+            self.log("start cancelled")
+
+    def check_countdown(self):
+        """While counting: the time left in the bar under the depth preview; the scan starts at 0."""
+        left = self.count["until"] - time.monotonic()
+        if left <= 0:
+            continue_from = self.count["from"]
+            self.scan_state, self.count = "idle", None
+            self.begin_scan(continue_from)
+            return None
+        return f"Starting in {math.ceil(left)} ...  (Esc cancels)", GOOD
+
+    def aim_for_start(self):
+        """The depth pixel a scan starting now takes its first piece at: the picked piece's (fresh), else None."""
+        piece = fresh_aim()
+        return None if piece is None or piece["at"] is None else [round(piece["at"][0], 1), round(piece["at"][1], 1)]
+
+    def begin_scan(self, continue_from=None):
+        live = self.live
+        if live["proc"] is None:
             self.start_worker()
+        aim = None if continue_from else self.aim_for_start()
+        capture = {"ir": self.ir_settings(), **({"aim": aim} if aim else {})}
         out = fr.CAPTURES / (time.strftime("%Y%m%d-%H%M%S") + "-scan")
         self.scan_state, live["inflight"] = "scanning", 0
         live["name"], live["last"], live["merging"] = out.name, None, ""
@@ -995,9 +1303,38 @@ class App:
         scan_view.update(keep_base=not self.remove_base.get(), lost=False, model=None)
         self.live["raw"] = {}
         live["commands"].put(("start", self.preset.get(), out, self.keep_raw.get(), continue_from, calib.CAMERA.mode,
-                              self.remove_base.get()))
+                              self.remove_base.get(), {"capture": capture}))
         self.log(f"scan started: {out.name} ({self.preset.get()}, point distance {cloud.PRESETS_MM[self.preset.get()]} mm)"
-                 + (f", continuing {continue_from.name}" if continue_from else ""))
+                 + (f", continuing {continue_from.name}" if continue_from else "")
+                 + (f", on the picked object (depth pixel {aim[0]:.0f}, {aim[1]:.0f})" if aim else ""))
+
+    def aim_click(self, name, x, y):
+        """A click on the depth or colour preview picks the piece there for the aim (idle or counting only)."""
+        if self.scan_state not in ("idle", "counting"):
+            return
+        if name == "Depth":
+            pick = (x * fr.W / DEPTH_W, y * fr.H / (DEPTH_W * fr.H // fr.W))
+        else:  # colour: the frame's point that the colour camera sees nearest the click
+            frame = aim_view["all"]
+            if frame is None:
+                return
+            xyz, pix = frame
+            cx, cy = calib.CAMERA.colour_px(pix[:, 0], pix[:, 1], xyz[:, 2])
+            i = int(np.argmin(np.hypot(cx - x * fr.W / SIDE_W, cy - y * fr.H / (SIDE_W * fr.H // fr.W))))
+            pick = (float(pix[i, 0]), float(pix[i, 1]))
+        aim_view.update(pick=pick, follow=None)
+        self.message = "aim: picked the object there (right-click or Esc: back to the centre)"
+
+    def aim_clear(self):
+        if aim_view["pick"] is not None:
+            aim_view.update(pick=None, follow=None)
+            self.message = "aim: the object at the centre of the view"
+
+    def escape(self):
+        if self.scan_state == "counting":
+            self.cancel_countdown()
+        else:
+            self.aim_clear()
 
     def continue_scan(self):
         """Go on with the newest saved scan (saved by this version: it has merged.npz)."""
@@ -1066,6 +1403,8 @@ class App:
                             "   FLAT AREA: aim at an edge, a corner or markers" if cue.get("flat") else "")
                     base = ("object turning, scanner standing | " if turning else "") + \
                         ("base found" if cue.get("base") else "looking for the base")
+                    if cue.get("piece", 1) > 1:  # (cloud.Scanner.start_piece: lost too long, the scan went on)
+                        base = f"piece {cue['piece']}: keep scanning, it joins the others after Stop | " + base
                     self.message = f"SCAN {merged} of {frames} frames merged, {points:,} points | held by {held} | {base}{hint}"
             elif kind == "saved":
                 path, points = rest

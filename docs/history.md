@@ -1218,3 +1218,46 @@ cubes on the GPU; the CPU keeps the 6x6 solve, markers, base votes, pose graph, 
   - Tests: 139 pass in .venv and in a fresh `uv sync --all-extras` environment; 138 under /usr/bin/python3
     (no Open3D: the GPU tests pass by).
   - CLAUDE.md shortened to the working notes; this file got the log.
+- SCAN UX (2026-11-05, plan approved: ~/.claude/plans/virtual-watching-kettle.md). The user: aim like CrealityScan
+  (a live view before Start, a countdown), keep scanning when lost and join the pieces after Stop, learn the
+  object by its colours; a public app, so nothing may assume a colour, a platform or a scene.
+  - Measured first (scratch replays): each lost stretch of >= 15 frames replayed as a fresh start. The 11-02
+    17:07 hand scan's 35 lost frames: 34 tracked. The 20:31 platform scan's 61: 0, because the fresh start took
+    one finger (216 cells, against 1590 for the hand). The 11-04 test-block attempts: 0-3% valid depth, nothing
+    to track. (Replays of the 20:31 scan with today's code track all 730 frames: its loss was live only.)
+  - The test-block flicker (the user's answer3.webm, scanner still, close range): IR exposure 300-4500 and the
+    scanner's own AE (581) all gave 2-6% of the centre per frame, 10% over 30 frames, nothing valid in 90% of
+    them; per frame the scanner sends one of three states (the wall ~2%, a blob 0.2-0.5%, nothing). Not
+    exposure, not our decode. The white platform gives no depth at any exposure although its dots are crisp in
+    IR; the dark hand on the board in long range gives 25% of the frame valid in 90% of frames.
+  - U1: held depth in the idle preview; Auto IR = the scanner's own AE (numbers in CLAUDE.md); the range
+    switch's step timings and a 40 s watchdog; coarse 14-bit pixels out of the garbled-row test.
+  - U2: the aim (outline, click to pick, follow, checklist bar, 3 s countdown), `Scanner(aim=...)`, kept in
+    the raw copy and session.json. On the dark-hand scene the centre took the shelf (67 cm); a click on the
+    hand gave the hand (32 cm, 64% depth). 18 ms per aim at 5 Hz.
+  - U3: colour.py (the object's U/V histogram against the rest of the view, learned at keyframes, ~1 ms each;
+    while lost it seeds the source piece). U4: scan pieces (start_piece after PIECE_AFTER_S 1 s lost with depth;
+    the GPU volume emptied in place, Engine.reset) and optimise.join_pieces after Stop.
+  - evaluate, all 13 datasets (CPU: u-before 114327 / u12-after 120601 / u34-cpu 122856 + u34b-cpu 130327 for
+    the two with pieces; GPU from a HEAD worktree: u-before-gpu 122203 / u34-gpu 123705 + u34b-gpu 130551):
+    - U1+U2: tracking identical on every dataset; points +-1-11 and marker scatter in the 12th decimal, the
+      run-to-run noise Phase 6 recorded.
+    - U3+U4, GPU: 12 datasets identical; the colour model seeded lost frames (platform 7, handgap 2) without
+      changing a result. synthplate started a second piece at the edge-on turn and left it out: the plate's
+      two faces never overlap and its markers are on one face each, so no join passed the check (73 tracked
+      either way: the known weakness, markers seen from both sides are still the way).
+    - U3+U4, CPU: handgap (100 frames skipped; HEAD never found its place again: 211 of 381 tracked) went on
+      in a second piece and joined it by ORB (fitness 0.72, 0.83 mm): 366 tracked (96% of the frames with
+      depth), jumps 1 -> 0, 105 merged, 147k points (HEAD 104k; the recording without the gap 159k), loops
+      118 -> 217, doubled 0.0009 -> 0.0042 (without the gap 0.0069), largest correction at the object 0.29 ->
+      0.72 mm (without the gap 1.26). Every other dataset identical.
+    - Two fixes found on handgap: the second piece's scene took the view centre's piece for its first region
+      (25 mm wide: its 56 merged frames gave 7,510 cloud points), so a new piece's scene now prefers
+      tracking's piece; and the biggest piece as the scan's world cut the joined cloud with that region, so
+      the first piece is the anchor (the biggest only when the first is too small).
+  - bench --live hand2, alternating with HEAD while CrealityPrint ran (load 6-14): HEAD 16.1 / 15.6 / 15.0 /
+    16.1 fps, new 15.4 / 14.6 / 15.3 / 14.9, all 440 tracked. Perhaps ~4% (the ranges nearly overlap); to be
+    checked at idle.
+  - Viewer smoke test on the scanner (dark-hand scene): automatic aim on the shelf (67 cm), a click on the hand
+    "Picked: object ~32 cm", the countdown and Esc, Auto IR following the scanner (5000 / 1000), "valid 41% now,
+    43% held". Tests: 151 pass.

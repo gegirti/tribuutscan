@@ -76,20 +76,21 @@ def plane_to(plane, transform_mm):
     return n2, c - n2 @ t
 
 
-def stands_on(xyz, pix, shape, n, c, tracked=None):
+def stands_on(xyz, pix, shape, n, c, tracked=None, prefer=False):
     """Does the object at the image centre stand on plane (n, c)? Its centre piece above the plane must
     come within CONTACT_MM of it (a table under the object does, a wall behind it does not), and the
     plane's points must lie AROUND the object's outline seen along the normal, not inside it: under the
     object a table is hidden, while one of the object's own flat sides lies within its outline. When the
     centre piece does not touch the plane, tracking's piece (`tracked`, a mask of the points) may: looking
-    down on a platform the middle of the view can miss the object."""
+    down on a platform the middle of the view can miss the object. With `prefer` (the viewer's aim chose the
+    object), tracking's piece is asked first."""
     h = xyz @ n + c
     idx = np.nonzero(h > OBJECT_ABOVE_MM)[0]
     if len(idx) < 50:
         return False
-    piece = cl.centre_piece(xyz[idx], pix[idx], shape)
+    piece = tracked[idx] if prefer and tracked is not None else cl.centre_piece(xyz[idx], pix[idx], shape)
     if (not piece.any() or h[idx][piece].min() >= CONTACT_MM) and tracked is not None:
-        piece = tracked[idx]
+        piece = tracked[idx] if not prefer else cl.centre_piece(xyz[idx], pix[idx], shape)
     if not piece.any() or h[idx][piece].min() >= CONTACT_MM:
         return False
     a = np.cross(n, [1.0, 0, 0] if abs(n[0]) < 0.9 else [0, 1.0, 0])
@@ -111,6 +112,7 @@ class Scene:
         self.plane = None  # (n, c): n points up out of the table, in the region frame
         self.votes, self.seen_frames = [], 0
         self.axis, self.radius, self.top = None, None, None  # object cylinder, region frame (mm)
+        self.prefer_piece = False  # the viewer's aim chose the object: tracking's piece before the view centre's
         self.ball = None  # (centre, radius, start radius) while no base is known, region frame (mm)
         self.late_plane = False  # the plane was settled after objects had been merged
         self.off_centre = 0  # frames whose view centre missed the object (masks fell back to the core)
@@ -125,7 +127,8 @@ class Scene:
         if self.seen_frames > VOTE_LIMIT and self.seen_frames % VOTE_LATE_EVERY:
             return
         found = cl.support_plane(xyz_cam, self.rng, pix, shape, tries=BASE_TRIES, min_share=BASE_MIN_SHARE,
-                                 min_cm2=BASE_MIN_CM2, accept=lambda n, c: stands_on(xyz_cam, pix, shape, n, c, tracked))
+                                 min_cm2=BASE_MIN_CM2, accept=lambda n, c: stands_on(xyz_cam, pix, shape, n, c, tracked,
+                                                                         self.prefer_piece))
         if found is None:
             return
         self.votes.append(plane_to(found, cam_to_region))
@@ -266,7 +269,7 @@ class Scene:
         pts = xyz_cam[idx]
         if self.axis is None:  # first view: the object is the piece above the table at the image centre, or for a
             # base found late, tracking's piece (from above the middle of the view missed the hand: the room, a crumb)
-            late = self.late_plane and piece is not None and piece[idx].any()
+            late = (self.late_plane or self.prefer_piece) and piece is not None and piece[idx].any()
             first = piece[idx] if late else cl.centre_piece(pts, pix[idx], shape)
             self._fit_region(pts[first] @ cam_to_region[:3, :3].T + cam_to_region[:3, 3],
                              self.plane[0])
@@ -330,6 +333,26 @@ class Scene:
             self.axis, self.radius, self.top = np.array(state["axis"]), state["radius"], state["top"]
         if state.get("ball") is not None:
             self.ball = (np.array(state["ball"][0]), state["ball"][1], state["ball"][2])
+
+    def cover(self, pts):
+        """Grow the region (or the ball) to take in object points (region frame, mm) that other parts of the scan
+        saw: the pieces joined into this scene's world (optimise.join_pieces), whose sides it may never have
+        seen. The 99th percentile, so a stray point does not inflate it."""
+        if not len(pts):
+            return
+        if self.axis is not None and self.plane is not None:
+            n = self.plane[0]
+            h = pts @ n + self.plane[1]
+            up = pts[h > OBJECT_ABOVE_MM]
+            if len(up):
+                flat = up - np.outer((up - self.axis) @ n, n)
+                reach = float(np.percentile(np.linalg.norm(flat - self.axis, axis=1), 99)) + REGION_MARGIN_MM
+                self.radius = max(self.radius, reach)
+                self.top = max(self.top, float(np.percentile(up @ n + self.plane[1], 99)) + REGION_MARGIN_MM)
+        elif self.ball is not None:
+            centre, radius, start = self.ball
+            reach = float(np.percentile(np.linalg.norm(pts - centre, axis=1), 99)) + REGION_MARGIN_MM
+            self.ball = (centre, max(radius, reach), start)
 
     def height(self, xyz_region):
         n, c = self.plane

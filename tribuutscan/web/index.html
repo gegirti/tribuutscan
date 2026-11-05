@@ -389,6 +389,8 @@ async function poll() {
         ? '<span class="bad">lost: move back slowly</span>'
         : cue.flat ? '<span class="bad">flat area: aim at an edge or markers</span>'
         : `ok, held by ${held}${s.relocked ? ` (re-found ${s.relocked}×)` : ""}`;
+      if (s.pieces > 1 && info.phase === "scanning")  // (cloud.Scanner.start_piece: the cloud shown is this piece's)
+        $("tracking").innerHTML += ` · piece ${s.pieces}: joins the others after Stop`;
       $("empty").classList.toggle("show", info.points === 0);
     }
     if (Date.now() - messageAt > 8000)  // a Process result stays readable for a while

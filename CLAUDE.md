@@ -8,7 +8,7 @@ free of anything private.
 ## What this is
 
 triBUUTSCAN (also written 3BUUTscan): a Linux toolkit for the Creality CR-Scan Ferret Pro, used
-directly over USB through the stock `uvcvideo` driver. Made in 3BUUT, MIT licensed. Status (2026-11-04):
+directly over USB through the stock `uvcvideo` driver. Made in 3BUUT, MIT licensed. Status (2026-11-05):
 live scanning works end to end on one scanner. Tracking runs on the GPU (WebGPU, any vendor, CPU
 fallback), objects can be scanned hand-held or turned on a platform, and Stop gives a cloud, a mesh,
 a closed STL for printing and a coloured solid for Blender. Not done: accuracy against a printed test
@@ -81,11 +81,17 @@ block, a long-range board calibration, 30 fps.
   700 with a CPU-heavy job beside it. The scanner does it when the host is slow to take its data:
   under the same load (60 s, two runs each) 8 URBs gave 169-170 garbled and 693-949 broken frames
   (16-19 fps), 64 URBs 0-1 and 67-73 (29.5 fps); 128 / 256 no better. So `usbdepth.NURBS` = 64, and
-  `depth.decode_depth` drops a garbled frame whole (all 0; `garbled_rows`: >= 15% of a row's
-  row-to-row steps are nonzero multiples of 64, real rows 0-3%; the ramp kind is not caught, hence
-  the whole frame). No hits on 614 synthetic frames; every real hit looked at was garbage. uvcvideo
-  keeps only 5 URBs for bulk, so 10-bit V4L2 depth stays more exposed. The viewer logs dropped
+  `depth.decode_depth` clears a garbled row and GARBLE_MARGIN 8 rows around it (`garbled_rows`: >= 15%
+  of a row's row-to-row steps are nonzero multiples of 64, real rows 0-3%; the ramp kind is not caught,
+  hence the margin; dropping the whole frame was measured worse). No hits on 614 synthetic frames.
+  uvcvideo keeps only 5 URBs for bulk, so 10-bit V4L2 depth stays more exposed. The viewer logs cleared
   previews at close.
+  COARSE 14-BIT DEPTH (2026-11-05): sparse, low-confidence 14-bit pixels come in whole 10-bit steps
+  (values multiples of 64), often near the image's bottom edge, and rows of them looked garbled: 8041
+  previews in a 20-minute viewer session on the dark-hand scene, 24 frames of the 11-04 test-block
+  recording. Their flagged rows hold 26-88% such values, real 14-bit garbage 5-9% (chance). Steps
+  between coarse pixels no longer count: every real hit in all recordings is still found (Y10 marker
+  recording 44 of 44 frames, the four Y14 ones 5 of 5), the test-block false hits went 24 -> 1.
 - Only one program can stream from the scanner at a time. Close the viewer before running
   `python3 -m tribuutscan.pointcloud` (live grab) or `tribuutscan.measure`.
 - The scanner resets its USB connection 3-4 s after a program stops streaming: the kernel logs
@@ -103,7 +109,13 @@ block, a long-range board calibration, 30 fps.
   node's auto exposure is 2: on 2026-10-31 it was 0, the exposure read back drifted (968-985) and
   setting it changed nothing, on both paths. With 2: exposure 500/1500/3000/6000 gave IR mean
   9.5/28.8/54.6/95.7, identical over USB and V4L2.
-  The viewer now sets the IR node's auto exposure to 2 at start and after a range switch (verified 0 -> 2).
+  AUTO IR (2026-11-05): 0 is the scanner's own auto exposure (what it powers up and resets to). Depth on
+  the object (per frame / valid in 90% of 40 frames), dark hand at long range: scanner AE (it chose
+  5000 / 1000) 51.6 / 49.2%, defaults 3000 / 1000 51.1 / 48.4, the old one-shot Auto IR's 1190 / 2700
+  51.2 / 47.8, 800 / 1000 48.3 / 43.2. Test block at close range: it chose 581 and matched every manual
+  setting (300-4500 all gave 2-6% per frame there: that scene's flicker is not exposure). So the
+  viewer's Auto IR checkbox (on by default) leaves the IR node at 0 and the sliders show its values;
+  moving an IR slider sets 2 (by hand). Applied again after a range switch or reconnect.
 - One test with light boxes at about 25 cm in a dark room: depth stayed at about 72% valid from exposure
   800 to 3000. Clipping cost depth: gain 8000 gave 33% clipped pixels and only 47% valid. The
   projector lights the scene on its own. So the rule is to avoid IR clipping, not to make the image
@@ -250,13 +262,20 @@ tribuutscan-viewer                          # launcher in ~/.local/bin, copy of 
 python3 -m tribuutscan.viewer [--force-cpu] # depth (middle), colour + IR (left), panels (right, fold):
                                             # (--force-cpu: tracking and meshes on the CPU, GPU or not)
                                             # Scanner: Range close 15-33 / long ~20-72 cm (estimate),
-                                            #   IR exposure/gain, colour brightness, Auto IR
+                                            #   IR exposure/gain, colour brightness, Auto IR (the
+                                            #   scanner's own, on by default; a slider: by hand)
+                                            # Aim (idle): the object a scan would take is outlined
+                                            #   (cyan); click depth or colour preview to pick another,
+                                            #   right-click / Esc: the centre again; bar: distance,
+                                            #   depth on it, IR clipping, base, markers
                                             # Capture: `s` saves captures/<stamp>/, `r` records colour +
                                             #   zlib depth + imu.csv to captures/<stamp>-rec/ at 30 or 10 fps
                                             #   (~75 / 25 MB/s, stops under 5 GB free), `m` meshes
                                             #   the latest recording (cloud.py --optimise --mesh)
-                                            # Scan: `c` live scan (worker process), Open 3D view
-                                            # IMU: tilt horizon, turn rate; View: Find markers
+                                            # Scan: `c` live scan after a 3-2-1 countdown (Esc
+                                            #   cancels; Countdown box), Open 3D view
+                                            # IMU: tilt horizon, turn rate; View: Find markers,
+                                            #   Hold depth (calmer preview, held parts dimmer)
                                             # events: message line, console, captures/viewer.log
                                             # Status / Messages boxes under the previews (sysinfo.py)
 python3 -m tribuutscan.vendor [modes|factory|scan|switch "<mode>"]   # depth modes, factory calibration
@@ -314,6 +333,15 @@ Processes:
   - Streams: colour and IR over V4L2, depth over usbfs (14-bit) when the udev rule allows, else 10-bit
     V4L2. The streams are paired by kernel capture time.
   - Previews at most 15 a second, the newest frame only, index-resampled (SIDE_W 400 / DEPTH_W 800).
+    Outside a scan the depth preview holds each pixel's last depth 0.5 s while the IMU says still, 0.15 s
+    while moving (`hold_depth`; display only): some surfaces lose whole regions from frame to frame.
+  - The aim (`aim_loop`, 5 Hz while idle, ~18 ms each): `cloud.isolate_mask` on every 4th pixel, as the
+    first scan frame does, outlined on depth and colour; a click picks a piece, followed by its 3D centre
+    until Start hands its pixel to the scan (`Scanner(aim=...)`, noted as "aim" in the raw copy's
+    info.json and session.json so replays take it). Start counts down 3 s (COUNTDOWN_S), the worker
+    starting meanwhile.
+  - A range switch logs how long each step took; one still busy after SWITCH_STUCK_S 40 s is given up
+    for a reconnect (one hung on 2026-11-05 after an IMU-off timeout, with no clue where).
   - Records colour + zlib depth + imu.csv. The IMU runs at 200 Hz while the viewer runs, through the USB
     depth capture's own handle.
   - The Status and Messages boxes are plain text (`sysinfo.py` reads /proc and DRM fdinfo).
@@ -344,7 +372,9 @@ One frame (`cloud.Scanner.feed`, GPU tracker):
    frame at the pose guess (`scene.axial`). The kept base is re-fitted once (`table_in_camera`). The
    source is the piece connected to the region's core where the guess puts it (`Scene.core`: the
    cylinder over the base, or the ball's start radius when no base is known), after the plane cut. The
-   view-centre piece is used only before a region exists, or with fewer than MIN_SEEDS seeds.
+   view-centre piece is used only before a region exists, or with fewer than MIN_SEEDS seeds; the first
+   frame takes it at the viewer's aim when one was picked (then the scene prefers tracking's piece to
+   the view centre's for the base vote and the first region).
 2. **Guess.** The last motion, scaled by the time since the last frame, for at most GUESS_MAX_S 0.3 s.
 3. **Solve.** The GPU runs point-to-plane ICP against a ray cast of its own tracking volume (gputrack:
    3 mm truncation; levels reach 30/12/6 mm with strides 4/2/1 and at most 3/3/8 passes). The CPU adds
@@ -367,7 +397,15 @@ One frame (`cloud.Scanner.feed`, GPU tracker):
      views.
 
    After a pose found anywhere, REFIND_HOLD frames must track before merging resumes. While lost, the
-   viewer shows the model from the last pose (the "ghost").
+   viewer shows the model from the last pose (the "ghost"). While lost, the source piece is seeded by the
+   object's colours instead of the region's core when the colour model can tell them (`colour.py`:
+   U/V histograms of object vs the rest of the view, learned at keyframes; silent when they overlap,
+   Bhattacharyya > 0.6, so depth alone decides as before).
+   **Pieces.** Lost for PIECE_AFTER_S 1 s of frames with depth, with every recovery failing, the scan
+   goes on in a new piece (`start_piece`): pose chain, scene, marker map, live cloud and tracking volume
+   start afresh (the volume emptied in place, `Engine.reset`: no second ~560 MB engine), at the last good
+   pose; its first frame takes the object by colour, else at the point nearest the last source. Re-finds
+   look only within the current piece. `pieces` holds each one's first index, like `sources`.
 6. **Scene** (`scene.py`, mode "still"):
    - The base is found by votes: 3 must agree in world coordinates. `stands_on` requires contact within
      10 mm, and at most half the plane may lie inside the object's outline. After VOTE_LIMIT, while no
@@ -385,6 +423,14 @@ One frame (`cloud.Scanner.feed`, GPU tracker):
    MERGE_MIN_S 0.25 s. Capping the volume's fusion too made synth's ATE 0.35 -> 2.6 mm.
 
 After Stop:
+- **Join** (`optimise.join_pieces`, before the save, when there are pieces): the first piece's world is
+  the scan's (where it was aimed and found its base; the biggest piece's if the first is too small); each other piece is placed by shared markers, ORB between keyframes, or shape (FPFH), each
+  candidate refined by `track.solve` and taken as Optimise takes a loop (fitness >= 0.3, rmse <= 2 mm,
+  markers or a pinned shape). A joined piece moves with all its frames; one that joins nothing, or has
+  fewer than PIECE_MIN_KEYFRAMES 5 keyframes, is left out (saved as piece-N.ply; its frames "left out").
+  Optimise then adds no odometry edge across a piece boundary, a certain edge per join (the keyframe pair
+  nearest each other once placed), and finds loops across pieces as within one; remerge blends nothing
+  across a boundary. session.json keeps "piece_list" and "piece_joins".
 - **Save**: cloud.ply, session.json, keyframes.npz, merged.npz, frame_poses.txt, labels.npz, track.csv,
   markers.json, cloud_state.npz.
 - **Optimise** (`optimise.py`): loops from shared markers, ORB matches or nearby poses. Loops the shape
@@ -436,7 +482,8 @@ Invariants:
 
   Synthetic sets regenerate byte for byte when missing. The trackers are "current" (the CPU), "gpu",
   and "gpu-proc" (the live worker's merge process; must equal "gpu"). The columns are:
-  - tracked, jumps (> 30 mm / 15 degrees);
+  - tracked, used (tracked of the frames that had depth), pieces and joined (scan pieces, U4),
+    jumps (> 30 mm / 15 degrees, within a piece);
   - doubled: a same-facing sheet 2.5-8 mm along the normal;
   - marker scatter, keyframe scatter;
   - ATE / truth mm (synthetic), region mm;
@@ -448,7 +495,9 @@ Invariants:
   as the scanner sends them).
 - **`compare.py`** scores a cloud or mesh against Creality's mesh of the marker part. Use 12 seeds, and
   reuse a transform for clouds that share tracking.
-- **Reference runs** (2026-11-04, Phase 6, all 13 datasets): captures/eval/20261104-101245-p6-after-gpu
+- **Reference runs** (2026-11-05, scan UX, all 13 datasets): captures/eval/20261105-123705-u34-gpu and
+  -122856-u34-cpu, with -130551-u34b-gpu / -130327-u34b-cpu for handgap and synthplate after the last fixes.
+  Before them (2026-11-04, Phase 6): captures/eval/20261104-101245-p6-after-gpu
   (`--optimise`) and -101700-p6-after-cpu. The marker part's mesh lies 0.08-0.09 mm (median) / 0.33-0.35 mm
   (p90) from Creality's. Hand-held live: 20 fps through `bench --live` on hand2.
 - **Datasets** live in captures/ (not in git). The hand and platform recordings are the user's;
@@ -510,12 +559,20 @@ point sets: use `compare.SEEDS = 12`, and the same transform for clouds that sha
 - Hand-held distance readings (about +-1-2 cm) cannot tell `a/z+b` from `a/z^2+b`. A fixed rig is
   needed for the real depth law.
 
-## Open (2026-11-04)
+## Open (2026-11-05)
 
 The GPU plan (approved 2026-11-01) is done through Phase 6 (clean-up), except for what needs the user or
-was left to them.
+was left to them. The scan UX plan (approved 2026-11-05, ~/.claude/plans/virtual-watching-kettle.md): U1-U4
+coded and measured on the datasets (docs/history.md); U0 and the live checks need the user.
 
 Needs the user and the scanner:
+- **Scan UX, U0 and live:** the dev scene (the dark hand on the board on the white platform, long range,
+  two more hands at the left, the shelf behind) recorded with keep raw frames: D1 platform turn, D2 the
+  same ~45 degrees down, D3 hand-held circle, D4 look away ~2 s twice and come back from another side,
+  D5 60 s still. D1-D4 become evaluate datasets. Live: the aim picks the hand, a click moves it, the
+  countdown, the calm preview, Auto IR on a light and a dark object, 10 range switches without a hang,
+  D4 giving joined pieces. The user offered a CrealityScan screen capture of its Auto IR; and the app on
+  the white-platform scene would tell whether its depth there is any better.
 - **The live check of Phase 5:**
   - a platform scan with one level pass and one about 45 degrees down, at 30-35 cm;
   - solid.ply opened in Blender;

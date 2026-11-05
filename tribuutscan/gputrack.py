@@ -190,6 +190,16 @@ class Tracker:
         return {**{k: round(1000 * v / n, 2) for k, v in self.timing.items()}, "passes": round(self.passes / n, 1),
                 "device": self.engine.device_name}
 
+    def reset(self, centre_mm):
+        """An empty volume centred on `centre_mm` (world) in place of this one (a scan's new piece)."""
+        old = self.engine.layout
+        centre = np.asarray(centre_mm, float)
+        layout = gpu.Layout(centre - HALF_MM, centre + HALF_MM, old.voxel_mm, round(old.trunc_mm / old.voxel_mm),
+                            old.capacity)
+        layout.dims = old.dims.copy()  # (the lattice can round one brick either way: the buffers keep their size)
+        self.engine.reset(layout)
+        self.ref, self.rect = None, None
+
     def close(self):
         self.engine.close()
 

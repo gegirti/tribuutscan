@@ -63,6 +63,8 @@ def run(jobs, replies, point_mm, stride, clean, spec, mode):
                          None if orb is None else orb[0], feat))
         elif kind == "points":
             replies.put(("points", cloud.points(msg[1])))
+        elif kind == "reset":  # a new scan piece: its own cloud (the merged frames' points stay for the join)
+            cloud = cl.VoxelCloud(point_mm)
         elif kind == "state":
             replies.put(("state", {**{k: getattr(cloud, k) for k in CLOUD_ARRAYS}, "frames": cloud.frames,
                                    "raw_points": cloud.raw_points}, merged))
@@ -129,6 +131,11 @@ class MergeProcess:
                     return reply[1]
             elif reply[0] == "state" and wait_for == "state":
                 return reply[1], reply[2]
+
+    def reset(self):
+        """The cloud starts empty from the next job on (cloud.Scanner.start_piece); merged frames stay."""
+        self.jobs.put(("reset",))
+        self.points_cache = None
 
     def sync(self):
         """Wait until every job sent is merged."""

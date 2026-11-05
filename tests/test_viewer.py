@@ -55,6 +55,29 @@ def test_depth_preview_dims_all_but_the_object():
     assert (shaded[249:251, 386:396] == 255).all() and (shaded[250, 398:402] != 255).any()  # centre mark, open
 
 
+def test_depth_preview_holds_depth_for_a_moment():
+    hv = viewer.hold_view
+    saved = dict(hv)
+    try:
+        hv.update(on=True, s=0.5, depth=None)
+        a = np.zeros((4, 6), np.float32)
+        a[1, 2] = 300.0
+        shown, held = viewer.hold_depth(a, 10.0)
+        assert shown[1, 2] == 300 and not held.any()
+        b = np.zeros_like(a)
+        b[3, 3] = 200.0
+        shown, held = viewer.hold_depth(b, 10.3)  # within 0.5 s: the old pixel held, the new one live
+        assert shown[1, 2] == 300 and held[1, 2] and shown[3, 3] == 200 and not held[3, 3]
+        shown, held = viewer.hold_depth(b, 10.6)  # 0.6 s after it was last seen: gone
+        assert shown[1, 2] == 0 and not held[1, 2] and shown[3, 3] == 200
+        hv["mode"] = "another mode"  # a range switch: nothing is held over
+        shown, held = viewer.hold_depth(np.zeros_like(a), 10.7)
+        assert not shown.any() and not held.any()
+    finally:
+        hv.clear()
+        hv.update(saved)
+
+
 def test_depth_preview_has_a_red_frame_while_tracking_is_lost():
     import time
     from tribuutscan.depth import encode_y10
@@ -136,7 +159,7 @@ def test_status_box_says_what_runs_and_what_it_uses():
                    (("Colour", 30.0), ("IR (flipped)", 29.6), ("Depth", 30.2))}
     app.imu, app.imu_note = None, "IMU needs udev/70-tribuutscan.rules (see README)"
     app.job, app.scan_state, app.lost = {"process": None, "dir": None}, "idle", False
-    app.switching, app.auto, app.rec = {"busy": False}, {"running": False}, {"recorder": None, "missed": 0}
+    app.switching, app.ir_auto, app.rec = {"busy": False}, True, {"recorder": None, "missed": 0}
     app.range_names = {mode: label for label, mode in viewer.RANGES.items()}
     lines = app.status_lines()
     assert [line[:viewer.LABEL_W].strip() for line in lines] == \
@@ -144,6 +167,7 @@ def test_status_box_says_what_runs_and_what_it_uses():
     assert all(line[viewer.LABEL_W - 1] == " " for line in lines)  # the labels' column
     text = "\n".join(lines)
     assert "idle" in lines[0] and "10-bit (V4L2)" in text and "colour 30, ir 30, depth 30 fps" in text
+    assert "IR auto (the scanner's own)" in text
     assert "udev" in text and "not started" in text and "not in use" in text and "GB free for captures/" in text
 
     worker, job = Proc(), Proc()
@@ -169,3 +193,85 @@ def test_status_box_says_what_runs_and_what_it_uses():
         for p in (worker, job):
             p.child.kill()
             p.child.wait()
+
+
+def _aim_scene():
+    """A 14-bit depth frame: a flat table (raw 300) with two boxes on it (raw 420): one over the image centre,
+    one off to the left."""
+    from tribuutscan.depth import encode_y14
+
+    class Cap:
+        width, height, bytesperline = 1280, 800, 1280 * 14 // 8
+
+    raw = np.full((800, 1280), 300.0)
+    raw[300:500, 560:760] = 420.0  # under the centre
+    raw[300:500, 150:350] = 420.0  # off to the left
+    return Cap, encode_y14((raw * 16 + 8).astype(np.uint16))
+
+
+def test_the_aim_outlines_the_centre_piece_and_follows_a_pick():
+    import collections
+    Cap, buf = _aim_scene()
+    saved = dict(viewer.aim_view)
+    try:
+        viewer.aim_view.update(pick=None, follow=None, idle=True)
+        piece = viewer.aim_once(Cap, buf, collections.deque(maxlen=5))
+        assert piece is not None and piece["at"] is None  # automatic: the image centre, as a scan without an aim
+        u = piece["pix"][:, 0]
+        assert 560 <= u.min() and u.max() < 760 and piece["plane"]  # the centre box, the table cut
+        assert piece["coverage"] > 0.9 and piece["colour"].shape == piece["pix"].shape
+        viewer.aim_view.update(pick=(250.0, 400.0), follow=None)  # a click on the left box
+        piece = viewer.aim_once(Cap, buf, collections.deque(maxlen=5))
+        assert 150 <= piece["pix"][:, 0].min() and piece["pix"][:, 0].max() < 350
+        assert 150 <= piece["at"][0] < 350 and viewer.aim_view["follow"] is not None
+        again = viewer.aim_once(Cap, buf, collections.deque(maxlen=5))  # followed by its centre
+        assert np.array_equal(again["pix"], piece["pix"])
+        viewer.aim_view["t"] = viewer.time.monotonic()
+        assert viewer.fresh_aim() is again
+        viewer.aim_view["idle"] = False  # scanning: no aim drawn or handed over
+        assert viewer.fresh_aim() is None
+    finally:
+        viewer.aim_view.clear()
+        viewer.aim_view.update(saved)
+
+
+def test_the_aim_hint_names_what_needs_doing():
+    from tribuutscan import calib
+    near, far = viewer.pointcloud.window_cm()
+    piece = {"z": (near + far) / 2 * 10, "coverage": 0.6, "plane": True, "at": None}
+    text, colour = viewer.aim_hint(piece, {"clipped": 0.5}, None, False)
+    assert colour == viewer.GOOD and "depth 60%" in text and not text.startswith("Picked")
+    text, colour = viewer.aim_hint(dict(piece, coverage=0.1, plane=False, at=(1, 2)), {"clipped": 9.0},
+                                   {"pitch": -30.0}, False)
+    assert colour == viewer.BAD and text.startswith("Picked") and "try another angle" in text
+    assert "IR clipping 9%" in text and "no base, 30° down (ok on a platform)" in text
+    far_piece = dict(piece, z=(far - 1) * 10)
+    text, colour = viewer.aim_hint(far_piece, {}, None, False)
+    assert colour == viewer.EDGE and "far edge" in text
+    assert ("Long range" in text) == (not calib.CAMERA.mode.startswith("Long"))
+    assert viewer.aim_hint(None, {}, None, False)[1] == viewer.BAD
+
+
+def test_the_countdown_starts_the_scan_at_zero_with_the_picked_aim():
+    import time
+    app = viewer.App.__new__(viewer.App)  # the state only
+    started, logged = [], []
+    app.begin_scan = lambda continue_from=None: started.append(continue_from)
+    app.log = logged.append
+    app.scan_state, app.count = "counting", {"until": time.monotonic() + 2, "from": None}
+    text, colour = app.check_countdown()
+    assert text.startswith("Starting in 2") and not started
+    app.count["until"] = time.monotonic() - 0.01
+    assert app.check_countdown() is None and started == [None] and app.scan_state == "idle"
+    app.scan_state, app.count = "counting", {"until": time.monotonic() + 2, "from": None}
+    app.escape()
+    assert app.scan_state == "idle" and logged == ["start cancelled"]
+    saved = dict(viewer.aim_view)
+    try:
+        viewer.aim_view.update(idle=True, t=time.monotonic(), piece={"at": (412.34, 380.0)})
+        assert app.aim_for_start() == [412.3, 380.0]
+        viewer.aim_view["piece"] = {"at": None}  # automatic: the scan takes the centre itself
+        assert app.aim_for_start() is None
+    finally:
+        viewer.aim_view.clear()
+        viewer.aim_view.update(saved)

@@ -31,6 +31,9 @@ SHARED_MARKER_MM = 6.0  # markers within this distance (world, current poses) ar
 LOOP_FITNESS, LOOP_RMSE_MM, LOOP_MARKER_MM = 0.3, 1.5, 2.0
 PREFERENCE = 2.0
 ROT_SIGMA_DEG, POS_SIGMA_MM = 0.5, 1.0  # per edge, for the information matrices
+JOIN_KEYFRAMES = 12  # a scan piece's keyframes compared by ORB with each joined piece's (spread over both)
+JOIN_ORB_TRIES = 4  # ...the pairs with the most matches tried
+JOIN_GRID_MM = 2.0  # pieces' object points thinned to this grid for the join's checks
 
 
 def relative(a, b):
@@ -99,17 +102,25 @@ def find_loops(kfs, levels, rng, log=print):
     return loops
 
 
-def optimise_poses(kfs, rng, log=print):
-    """New camera -> world poses for the keyframes (list of dicts: pose, points mm, feat, markers)."""
+def optimise_poses(kfs, rng, log=print, breaks=(), joins=()):
+    """New camera -> world poses for the keyframes (list of dicts: pose, points mm, feat, markers). `breaks`:
+    positions whose keyframe starts a scan piece (no odometry edge from the one before: the scan was lost
+    between them); `joins`: (a, b) position pairs whose relative pose join_pieces verified (certain edges)."""
     if len(kfs) < MIN_GAP + 1:
         return [k["pose"] for k in kfs], {"keyframes": len(kfs), "loops_found": 0, "loops_kept": 0}
     levels = [track.levels(k["points"] / 1000) for k in kfs]
     graph = reg.PoseGraph()
     for k in kfs:
         graph.nodes.append(reg.PoseGraphNode(k["pose"]))
+    breaks = set(breaks)
     for i in range(len(kfs) - 1):
+        if i + 1 in breaks:
+            continue
         t = relative(kfs[i]["pose"], kfs[i + 1]["pose"])
         graph.edges.append(reg.PoseGraphEdge(i + 1, i, t, info_matrix(levels[i + 1][-1], levels[i][-1], t), uncertain=False))
+    for a, b in joins:
+        t = relative(kfs[b]["pose"], kfs[a]["pose"])
+        graph.edges.append(reg.PoseGraphEdge(a, b, t, info_matrix(levels[a][-1], levels[b][-1], t), uncertain=False))
     loops = find_loops(kfs, levels, rng, log)
     for i, j, t, info, _ in loops:
         graph.edges.append(reg.PoseGraphEdge(j, i, t, info, uncertain=True))
@@ -137,15 +148,144 @@ def object_features(feat, scene, pose):
     return feat[0][keep], feat[1][keep]
 
 
-def optimise(scanner, log=print):
-    """Optimise a Scanner's keyframes and merge its cloud again with the corrected poses."""
+def piece_points(kfs):
+    """A scan piece's object points (world mm) from its keyframes (index, pose, points, ...), thinned."""
+    from .gputrack import grid_points
+    pts = [k[2] @ k[1][:3, :3].T + k[1][:3, 3] * 1000 for k in kfs if len(k[2])]
+    return grid_points(np.concatenate(pts), JOIN_GRID_MM) if pts else np.zeros((0, 3))
+
+
+def spread(items, n):
+    return [items[i] for i in sorted(set(np.linspace(0, len(items) - 1, min(n, len(items))).round().astype(int)))] \
+        if items else []
+
+
+def join_candidates(scanner, groups, k, placed, maps):
+    """Transforms (metres) that may take scan piece k's world into the joined world, with how each was found:
+    shared markers, ORB between keyframes, shape. `placed`: joined piece -> its transform."""
+    from . import features, session
+    out = []
+    mk = maps[k]
+    for j, tj in placed.items():
+        if len(mk) >= 3 and len(maps[j]) >= 3:
+            found = maps[j].match_global(mk.pos[np.argsort(-mk.count)])
+            if found is not None:
+                out.append((tj @ found, "markers"))
+    turns = getattr(scanner, "object_turns", False)
+    feat_of = lambda kf: object_features(kf[3], scanner.scene_of(kf[0]), kf[1]) if turns else kf[3]
+    mine = [(kf, feat_of(kf)) for kf in spread([kf for kf in groups[k] if kf[3] is not None], JOIN_KEYFRAMES)]
+    theirs = [(kf, feat_of(kf), placed[j]) for j in placed
+              for kf in spread([kf for kf in groups[j] if kf[3] is not None], JOIN_KEYFRAMES)]
+    pairs = sorted(((len(features.good_matches(fa, fb)), ia, ib) for ia, (_, fa) in enumerate(mine)
+                    for ib, (_, fb, _) in enumerate(theirs) if fa is not None and fb is not None), reverse=True)
+    for count, ia, ib in pairs[:JOIN_ORB_TRIES]:
+        if count < features.MIN_INLIERS:
+            break
+        (ka, fa), (kb, fb, tb) = mine[ia], theirs[ib]
+        found, inliers = features.relative_pose(fa, fb, scanner.rng)
+        if found is not None:
+            out.append((tb @ kb[1] @ found @ np.linalg.inv(ka[1]), "features"))
+    src = piece_points(groups[k])
+    dst = np.concatenate([piece_points(groups[j]) @ placed[j][:3, :3].T + placed[j][:3, 3] * 1000 for j in placed])
+    found = session.shape_pose(src, dst)
+    if found is not None:
+        out.append((found, "shape"))
+    return out, src, dst
+
+
+def join_pieces(scanner, log=print):
+    """After Stop, before Optimise: put a scan's pieces (cloud.Scanner.start_piece) into one world, the first
+    piece's (the biggest one's when the first is too small to keep). Each later piece is placed by shared markers, ORB between keyframes or shape (join_candidates),
+    each candidate refined by the joint solve against the pieces placed so far and taken only as Optimise
+    takes a loop: session.accept, and markers or a shape that pins the pose (track.DEGENERATE). A piece that
+    joins moves with all its frames; one that joins nothing (or has fewer than PIECE_MIN_KEYFRAMES) is left
+    out of the scan: its points are kept apart (scanner.left_pieces, saved as piece-N.ply). Returns a report,
+    or None for a scan of one piece."""
+    from . import cloud as cl
+    from . import session
+    pieces = scanner.pieces
+    if len(pieces) < 2 or all("joined" in p for p in pieces):
+        return None
     scanner.flush()
+    groups = [[kf for kf in scanner.keyframes if scanner.piece_of(kf[0]) == k] for k in range(len(pieces))]
+    maps = scanner.piece_maps + [scanner.marker_map]
+    # The scan's world is its first piece's: the scan started there, aimed at the object, and found its base and
+    # region from that view. A later piece starts mid-motion after a loss: on handgap (CPU) the second piece's
+    # region came out 25 mm wide, and as the anchor it cut the joined cloud to 73k points (the first's: 135k).
+    # The biggest piece only when the first is too small to keep.
+    sizes = [len(g) for g in groups]
+    anchor = 0 if sizes[0] >= cl.PIECE_MIN_KEYFRAMES else int(np.argmax(sizes))
+    placed, joins, how = {anchor: np.eye(4)}, [], {}
+    waiting = [k for k in range(len(pieces)) if k != anchor and len(groups[k]) >= cl.PIECE_MIN_KEYFRAMES]
+    progress = True
+    while waiting and progress:  # (a piece may join through one placed after it)
+        progress = False
+        for k in list(waiting):
+            candidates, src, dst = join_candidates(scanner, groups, k, placed, maps)
+            best = None
+            if len(src) >= 200 and len(dst) >= 200:
+                ls, ld = track.levels(src / 1000), track.levels(dst / 1000)
+                for start, kind in candidates:
+                    t, info = track.solve(ls, ld, start)
+                    if session.accept(info) and (info["markers_used"] or (info["degeneracy"] or 0) >= track.DEGENERATE) \
+                            and (best is None or info["fitness"] > best[1]["fitness"]):
+                        best = (t, info, kind)
+            if best is None:
+                continue
+            placed[k], how[k] = best[0], {"by": best[2], "fitness": round(best[1]["fitness"], 3),
+                                          "rmse_mm": round(best[1]["rmse_mm"], 3)}
+            waiting.remove(k)
+            progress = True
+            mine = np.array([(best[0] @ kf[1])[:3, 3] for kf in groups[k]])  # the join's edge in the pose graph:
+            others = [(kf, placed[j]) for j in placed if j != k for kf in groups[j]]  # the keyframe pair whose
+            theirs = np.array([(tb @ kf[1])[:3, 3] for kf, tb in others])  # cameras are nearest once placed
+            d = np.linalg.norm(mine[:, None] - theirs[None], axis=2)
+            a, b = np.unravel_index(int(np.argmin(d)), d.shape)
+            joins.append((groups[k][a][0], others[b][0][0]))
+    left = [k for k in range(len(pieces)) if k not in placed]
+    scene = scanner.scene_of(pieces[anchor]["first_index"])
+    for k, t in placed.items():  # the scan's region takes in what the joined pieces saw of the object
+        if k != anchor:
+            scene.cover(piece_points(groups[k]) @ t[:3, :3].T + t[:3, 3] * 1000)
+    for k, t in placed.items():  # every joined piece's frames into the scan's world
+        if k == anchor:
+            continue
+        lo, hi = pieces[k]["first_index"], pieces[k + 1]["first_index"] if k + 1 < len(pieces) else np.inf
+        inside = lambda i: lo <= i < hi
+        scanner.keyframes = [(i, t @ p, *rest) if inside(i) else (i, p, *rest) for i, p, *rest in scanner.keyframes]
+        scanner.poses = [(i, t @ p if inside(i) else p) for i, p in scanner.poses]
+        scanner.track_log = [(i, st, t @ p if p is not None and inside(i) else p) for i, st, p in scanner.track_log]
+    scanner.left_pieces = scanner.take_pieces_out(left)
+    scanner.scene = scene
+    scanner.piece_joins = joins
+    for k, p in enumerate(pieces):
+        p["joined"] = k in placed
+    scanner.remerge({})
+    report = {"pieces": len(pieces), "anchor": anchor + 1, "joined": {k + 1: how[k] for k in how},
+              "left_out": [k + 1 for k in left]}
+    log(f"pieces: {len(placed)} of {len(pieces)} in one world" + (f", {len(left)} left out" if left else "")
+        + "".join(f"; piece {k + 1} by {h['by']} (fitness {h['fitness']}, {h['rmse_mm']} mm)" for k, h in how.items()))
+    return report
+
+
+def optimise(scanner, log=print):
+    """Optimise a Scanner's keyframes and merge its cloud again with the corrected poses (its pieces joined
+    first, join_pieces)."""
+    scanner.flush()
+    pieces_report = join_pieces(scanner, log) if len(getattr(scanner, "pieces", ())) > 1 else None
     kfs = [{"index": i, "pose": pose, "points": pts, "feat": feat, "markers": mk}
            for i, pose, pts, feat, mk in scanner.keyframes]
     if getattr(scanner, "object_turns", False):
         for k in kfs:
             k["feat"] = object_features(k["feat"], scanner.scene, k["pose"])
-    new_poses, report = optimise_poses(kfs, scanner.rng, log)
+    breaks, joins = (), ()
+    if len(getattr(scanner, "pieces", ())) > 1:
+        position = {k["index"]: n for n, k in enumerate(kfs)}
+        breaks = [n for n in range(1, len(kfs)) if scanner.piece_of(kfs[n]["index"]) != scanner.piece_of(kfs[n - 1]["index"])]
+        joins = [(position[a], position[b]) for a, b in getattr(scanner, "piece_joins", []) if a in position and b in position]
+    new_poses, report = optimise_poses(kfs, scanner.rng, log, breaks, joins)
+    if pieces_report is not None:
+        report["pieces"] = pieces_report
     moved = [np.linalg.norm((np.linalg.inv(a["pose"]) @ b)[:3, 3]) * 1000 for a, b in zip(kfs, new_poses)]
     report["largest_correction_mm"] = round(float(max(moved)), 2) if moved else 0.0  # (at the camera)
     at_object, turned = [], []
@@ -194,8 +334,11 @@ def process(scanner, directory, action, log=print, box=None):
         report = optimise(scanner, log)
         scanner.save(directory)
         (directory / "optimise.json").write_text(json.dumps(report, indent=2))
+        pieces = report.get("pieces") or {}
         return (f"optimised: {report['loops_kept']} loop closures, largest correction "
-                f"{report['largest_correction_at_object_mm']} mm at the object ({report['largest_correction_deg']} degrees)")
+                f"{report['largest_correction_at_object_mm']} mm at the object ({report['largest_correction_deg']} degrees)"
+                + (f"; pieces: {len(pieces['joined']) + 1} of {pieces['pieces']} joined" if pieces else "")
+                + (f", piece {', '.join(map(str, pieces['left_out']))} left out (piece-N.ply)" if pieces.get("left_out") else ""))
     if action in cl.PRESETS_MM:
         scanner.remerge({}, point_mm=cl.PRESETS_MM[action])
         scanner.preset = action

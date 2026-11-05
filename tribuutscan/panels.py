@@ -49,7 +49,7 @@ class Panel(tk.Frame):
 
 
 class ScannerPanel(Panel):
-    """Depth range, IR exposure and gain, colour brightness, Auto IR."""
+    """Depth range, IR exposure and gain (Auto IR: the scanner's own auto exposure), colour brightness."""
     title = "Scanner"
 
     def build(self, body):
@@ -61,7 +61,8 @@ class ScannerPanel(Panel):
             self.app.slider(body, label, node, cid)
         buttons = tk.Frame(body)
         buttons.pack(fill="x", pady=(4, 0))
-        tk.Button(buttons, text="Auto IR", command=self.app.start_auto).pack(side="left", expand=True, fill="x")
+        tk.Checkbutton(buttons, text="Auto IR", variable=self.app.ir_auto_var,
+                       command=self.app.toggle_ir_auto).pack(side="left", expand=True)
         tk.Button(buttons, text="Reset defaults", command=self.app.reset_controls).pack(side="left", expand=True, fill="x")
 
 
@@ -88,7 +89,8 @@ class CapturePanel(Panel):
 class ScanPanel(Panel):
     """Live scan into one merged cloud (worker process), continue, browser 3D view."""
     title = "Scan"
-    STATES = {"idle": ("Start scan (c)", "normal"), "scanning": ("Stop scan (c)", "normal"),
+    STATES = {"idle": ("Start scan (c)", "normal"), "counting": ("Cancel start (c / Esc)", "normal"),
+              "scanning": ("Stop scan (c)", "normal"),
               "saving": ("Saving...", "disabled"), "optimising": ("Optimising...", "disabled"),
               "meshing": ("Making the mesh...", "disabled")}
 
@@ -109,6 +111,7 @@ class ScanPanel(Panel):
         row = tk.Frame(body)
         row.pack(fill="x")
         tk.Checkbutton(row, text="Mesh after Stop", variable=self.app.mesh_after).pack(side="left")
+        tk.Checkbutton(row, text="Countdown", variable=self.app.countdown).pack(side="left")
 
     def refresh(self):
         text, state = self.STATES[self.app.scan_state]
@@ -166,3 +169,5 @@ class ViewPanel(Panel):
     def build(self, body):
         tk.Checkbutton(body, text="Find markers (ringed in colour)", variable=self.app.find_markers,
                        command=self.app.toggle_markers).pack(anchor="w")
+        tk.Checkbutton(body, text="Hold depth (calmer preview, held parts dimmer)", variable=self.app.hold_depth,
+                       command=self.app.toggle_hold).pack(anchor="w")

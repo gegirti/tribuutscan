@@ -104,11 +104,11 @@ TRACKERS = {  # name: Scanner options (the scan mode comes from the dataset)
 }  # (the earlier variants, baseline to gpu-noverify, went in Phase 6: docs/history.md has their numbers)
 
 
-def make_scanner(tracker, preset, mode):
+def make_scanner(tracker, preset, mode, aim=None):
     options = dict(mode=mode, **TRACKERS[tracker]) if tracker in TRACKERS else None
     if options is None:
         raise ValueError(f"unknown tracker {tracker}; one of {list(TRACKERS)}")
-    return cl.Scanner(preset, log=lambda m: None, **options)
+    return cl.Scanner(preset, log=lambda m: None, aim=aim, **options)
 
 
 def run(name, tracker="current", preset="small", live_markers=False, optimise_after=False, mesh=False):
@@ -185,7 +185,7 @@ def _run(name, tracker, preset, live_markers, optimise_after, mesh=False):
     directory = dataset_path(name)
     base, gap = GAPS.get(name, (name, range(0)))
     found = cached_markers(base, directory)
-    scanner = make_scanner(tracker, preset, DATASETS[name][2])
+    scanner = make_scanner(tracker, preset, DATASETS[name][2], cl.recording_aim(directory))
     sightings, elapsed, n = [], 0.0, 0
     for i, frame in enumerate(fr.read_recording(directory)):
         if i in gap:
@@ -203,6 +203,10 @@ def _run(name, tracker, preset, live_markers, optimise_after, mesh=False):
                     sightings.append(loc[0] @ pose[:3, :3].T + pose[:3, 3] * 1000)
     scanner.flush()
     scanner.close()
+    pieces = None
+    if len(scanner.pieces) > 1:  # as after Stop: the scan's pieces into one world (or left out)
+        from . import optimise as opt
+        pieces = opt.join_pieces(scanner, log=lambda m: None)
     opt_report = None
     if optimise_after:
         from . import optimise
@@ -210,6 +214,7 @@ def _run(name, tracker, preset, live_markers, optimise_after, mesh=False):
     scanner.trim_table()
     xyz, rgb, seen, normals = scanner.output_cloud().points(cl.MIN_SEEN, with_normals=True)  # as saved
     tracked = [(i, p) for i, s, p in scanner.track_log if p is not None]
+    with_depth = sum(1 for _, s, _ in scanner.track_log if s != "too few points")
     centre = xyz.mean(0) if len(xyz) else np.zeros(3)
     gap = metrics.loop_gap(tracked, centre)
     result = {
@@ -221,7 +226,11 @@ def _run(name, tracker, preset, live_markers, optimise_after, mesh=False):
         "gpu_ms": scanner.stats.get("gpu_ms"),
         "points": int(len(xyz)),
         "region_mm": None if scanner.scene.radius is None else round(float(scanner.scene.radius)),
-        "pose_jumps": metrics.pose_jumps(tracked, centre),
+        "pose_jumps": [j for k in range(len(scanner.pieces)) for j in  # (within each piece: between two, the
+                       metrics.pose_jumps([t for t in tracked if scanner.piece_of(t[0]) == k], centre)],  # scanner moved)
+        "used": round(len(tracked) / max(with_depth, 1), 3),  # tracked of the frames that had depth
+        "pieces": len(scanner.pieces), "pieces_joined": sum(1 for p in scanner.pieces if p.get("joined", True)),
+        "pieces_report": pieces, "colour_seeded": scanner.stats.get("colour_seeded", 0),
         "flat_frames": scanner.stats.get("flat", 0),
         "object_turns": scanner.object_turns, "room_votes": dict(scanner.room_votes),
         "shape_refinds": scanner.stats.get("shape_refinds", 0),
@@ -288,7 +297,8 @@ def show(results, against=None):
             v = len(v)
         return "-" if v is None else (f"{v:.3g}" if isinstance(v, float) else str(v))
 
-    cols = [("tracked", "tracked"), ("relocked", "re-found"), ("pose_jumps", "jumps"),
+    cols = [("tracked", "tracked"), ("used", "used"), ("pieces_joined", "joined"), ("pieces", "pieces"),
+            ("relocked", "re-found"), ("pose_jumps", "jumps"),
             ("double_surface_ratio", "double"), ("marker_scatter.scatter_mm", "mk mm"),
             ("keyframe_marker_scatter.scatter_mm", "kf mk mm"), ("loop_gap.mm", "gap mm"),
             ("ground_truth.ate_mm", "ATE mm"), ("keyframe_ground_truth.ate_mm", "kf ATE"), ("truth_mm.median", "truth mm"),

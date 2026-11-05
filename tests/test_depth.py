@@ -81,6 +81,26 @@ def test_garbled_rows_are_cleared():
     assert depth.garbled["frames"] == before + 2
 
 
+def test_coarse_14_bit_depth_is_not_garbage():
+    """Sparse, low-confidence 14-bit depth comes in whole 10-bit steps (values multiples of 64): rows of it
+    step by multiples of 64 too (the dark-hand scene's near edge, 2026-11-05), and are left alone; real
+    garbage in 14 bits (steps of 1024, any low bits) is still found."""
+    from tribuutscan import depth
+    rng = np.random.default_rng(3)
+    h, w = 60, 640
+    fine = np.full((h, w), 0, np.int64)
+    fine[:40] = 4000 + 7 * np.arange(40)[:, None] + rng.integers(0, 5, (40, w))  # a smooth surface
+    coarse = fine.copy()
+    coarse[44:52, ::3] = 64 * rng.integers(60, 70, (8, len(range(0, w, 3))))  # coarse values at the bottom
+    assert depth.garbled_rows(coarse).any()  # (judged as 10-bit values: false hits)
+    assert not depth.garbled_rows(coarse, y14=True).any()
+    garbage = fine.copy()
+    garbage[20:26] = 1024 * rng.integers(1, 15, (6, w)) + rng.integers(1, 64, w)
+    assert depth.garbled_rows(garbage, y14=True)[21:26].all()
+    got = depth.decode_depth(depth.encode_y14(coarse.astype(np.uint16)), w, h, w * 14 // 8)
+    assert got[44:52, ::3].all()  # nothing cleared
+
+
 def test_the_strided_decode_is_every_4th_pixel_of_the_full_one():
     from tribuutscan import depth
     clean, bad = garbled_frame()

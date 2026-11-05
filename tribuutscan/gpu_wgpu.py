@@ -1241,6 +1241,23 @@ class Engine:
     def sync(self):
         self.device.queue.read_buffer(self.counters)
 
+    def reset(self, layout=None):
+        """Empty the volume in place (a scan's new piece starts its own: cloud.Scanner.start_piece), optionally
+        moved to `layout` of the same size. The buffers and the device stay: an Engine holds ~560 MB."""
+        if layout is not None:
+            if tuple(layout.dims) != tuple(self.layout.dims) or layout.capacity != self.layout.capacity:
+                raise ValueError("a reset keeps the volume's size")
+            self.layout = layout
+        q = self.device.queue
+        empty = np.full(self.layout.bricks, gpu.EMPTY, np.uint32)
+        q.write_buffer(self.index, 0, empty)
+        q.write_buffer(self.mark, 0, empty)
+        enc = self.device.create_command_encoder()
+        for b in (self.tsdfw, self.colvox, self.counters):
+            enc.clear_buffer(b)
+        q.submit([enc.finish()])
+        self.frames = self.empty = 0
+
     def close(self):
         """Give the GPU memory back now (200-700 MB). wgpu-py's device and queue refer to each other, so a
         device is only freed by Python's cycle collector: waiting for it let a loop of replays hold 3.9

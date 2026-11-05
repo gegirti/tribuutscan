@@ -19,6 +19,11 @@ import numpy as np
 # runs the old V4L2 recording also had a few rows of another kind (a smooth ramp across the row,
 # wrapping at 1024) that this test misses, hence the wide margin. Dropping the whole frame instead
 # was measured worse: on the marker recording (3.3 fps) the 44 lost frames let tracking double the part.
+# 14-bit depth also has COARSE pixels, whose values are themselves multiples of 64 (a 10-bit step's worth of
+# precision): sparse, low-confidence depth, often near the image's bottom edge (the board's near edge in the
+# dark-hand scene, 2026-11-05: false hits in ~15% of frames; 26-88% coarse values in the flagged rows of the
+# test-block recording 20261104-210154, against 5-9% in the real garbage of four Y14 recordings, about chance).
+# Steps between coarse pixels do not count: they are rounding, not garbage.
 GARBLE_STEP = 64  # raw units, both formats
 GARBLE_SHARE, GARBLE_MIN = 0.15, 10  # a row is garbled when this share (and number) of its steps are such...
 GARBLE_COLUMNS = 4  # ...judged on every 4th column: the first pixel of each packed group of 4, the only one a
@@ -85,12 +90,14 @@ def y10_scale(raw14):
     return np.where(raw14 >= 16, (raw14.astype(np.float32) - 8) / 16, np.float32(0))
 
 
-def garbled_rows(raw, every=GARBLE_COLUMNS):
+def garbled_rows(raw, every=GARBLE_COLUMNS, y14=False):
     """Bool per row: rows the scanner filled with garbage (see GARBLE_STEP), except the first of each
-    run. `raw` holds the raw integer values (Y10, or Y14 before y10_scale); judged on every
-    GARBLE_COLUMNS-th column (`every` 1: `raw` holds only those), over the pixels with depth in both rows."""
+    run. `raw` holds the raw integer values (Y10, or Y14 before y10_scale: then `y14`, and coarse pixels
+    are left out); judged on every GARBLE_COLUMNS-th column (`every` 1: `raw` holds only those), over the
+    pixels with depth in both rows."""
     s = raw[:, ::every].astype(np.int32)
-    ok = (s[1:] > 0) & (s[:-1] > 0)
+    have = (s > 0) & (s % GARBLE_STEP != 0) if y14 else s > 0
+    ok = have[1:] & have[:-1]
     step = s[1:] - s[:-1]
     hits = (ok & (step != 0) & (step % GARBLE_STEP == 0)).sum(1)
     hit = np.zeros(len(raw), bool)
@@ -104,7 +111,7 @@ def decode_depth(buf, width, height, bytesperline, clean=True):
     y14 = bytesperline >= width * 14 // 8
     raw = unpack_y14(buf, width, height, bytesperline) if y14 else decode_y10(buf, width, height, bytesperline)
     if clean:
-        rows = cleared_rows(garbled_rows(raw))
+        rows = cleared_rows(garbled_rows(raw, y14=y14))
         if rows is not None:
             raw[rows] = 0
     return y10_scale(raw) if y14 else raw
@@ -131,7 +138,7 @@ def decode_strided(buf, width, height, bytesperline):
     g = rows[:, :n * (7 if y14 else 5)].reshape(height, n, 7 if y14 else 5)
     first = ((g[..., 0].astype(np.uint16) << 6) | (g[..., 1] >> 2)) if y14 else \
         ((g[..., 0].astype(np.uint16) << 2) | (g[..., 1] >> 6))
-    clear = cleared_rows(garbled_rows(first, every=1))
+    clear = cleared_rows(garbled_rows(first, every=1, y14=y14))
     if clear is not None:
         first = first.copy()
         first[clear] = 0

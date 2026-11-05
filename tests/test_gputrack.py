@@ -110,3 +110,36 @@ def test_the_ghost_shows_the_whole_model_at_the_last_good_pose():
         assert (full >= 2).sum() > 3 * (clipped >= 2).sum(), kind
         assert np.array_equal(ghost >= 2, full >= 2), kind  # the model where it was, the whole of it
         t.close()
+
+
+def test_a_reset_volume_is_empty_and_can_move():
+    """A scan's new piece empties the tracking volume in place (no second ~560 MB engine): nothing of the
+    old surface is left to ray cast, and it fills again where the new piece puts it."""
+    gputrack = tracker_or_none()
+    if gputrack is None:
+        return
+    from tribuutscan import calib
+    w, h = 320, 200
+    spec = {"size": [w, h], "depth": {"fx": 300.0, "fy": 300.0, "cx": 159.5, "cy": 99.5, "dist": [0, 0, 0, 0, 0]},
+            "law": {"a_mm": 289570.0, "b": 873.4}, "window_mm": [150.0, 330.0],
+            "colour_from_depth": {"ax": 1.0, "bx": 0.0, "ay": 1.0, "by": 0.0}}
+    cam = calib.Camera(spec)
+    K = cam.intrinsic_matrix()
+    first = np.eye(4)
+    depth = scene_depth(gpu.pose_mm(first), K, (w, h))
+    frame = {"depth": np.where(depth > 0, cam.raw_from_mm(np.maximum(depth, 1)), 0).astype(np.float32)}
+    try:
+        t = gputrack.Tracker(cam, (w, h), (0, 0, 260), "gpu")
+    except KeyError:
+        return
+    try:
+        dims = t.engine.layout.dims.copy()
+        t.fuse(frame, None, first)
+        assert t.engine.counts()[0] > 0 and (t.ghost(first, None, 1.0) >= 2).sum() > 1000
+        t.reset((7.0, -3.0, 251.0))  # another centre, off the brick lattice: the same size
+        assert np.array_equal(t.engine.layout.dims, dims) and t.engine.counts() == (0, 0, 0)
+        assert (t.ghost(first, None, 1.0) >= 2).sum() == 0  # nothing left of the old surface
+        t.fuse(frame, None, first)
+        assert (t.ghost(first, None, 1.0) >= 2).sum() > 1000
+    finally:
+        t.close()

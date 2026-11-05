@@ -69,6 +69,11 @@ SHAPE_EVERY_S = 0.25  # refind_shape: at most one try per this much frame time w
 MARKER_CHECK_MM, MARKER_CHECK_DEG, MARKER_CHECK_MIN = 5.0, 2.0, 3  # marker_check: a solve this far from the markers' own
     # placement is redone from it, and must then hold this many of them
 TURN_AXIS_MIN_DEG = 20.0  # turn_axis: poses turned at least this far from the first one count
+PIECE_AFTER_S = 1.0  # lost this long (frame time, frames with depth) with every recovery failing, the scan goes on
+# in a new piece: a pose chain, scene and tracking volume of its own, joined to the others after Stop
+# (join_pieces). Lost frames were thrown away before (2026-11-05: a lost stretch of the 11-02 17:07 hand scan,
+# replayed as a fresh start, tracked 34 of its 35 frames)
+PIECE_MIN_KEYFRAMES = 5  # a piece with fewer keyframes is dropped as noise
 GAP_S = 0.5  # the first frame tracked after this long without one (lost frames, or none came) is checked by shape:
     # its solve began at the last good pose, and a turn about a vertical axis hides in horizontal faces (the
     # synthetic block on a platform, 3 s left out: "tracked" 37 degrees off)
@@ -333,11 +338,13 @@ STEPS_26 = np.array([(dx << 42) + (dy << 21) + dz for dx in (-1, 0, 1) for dy in
                      if (dx, dy, dz) != (0, 0, 0)], np.int64)  # neighbour offsets in packed-key space
 
 
-def centre_piece(xyz, pix, shape):
-    """Mask of the points connected (through CLUSTER_CELL_MM cells) to the point nearest the image centre."""
+def centre_piece(xyz, pix, shape, at=None):
+    """Mask of the points connected (through CLUSTER_CELL_MM cells) to the point nearest the image centre,
+    or nearest depth pixel `at` (u, v): where the viewer's aim put the object (a click, or the piece it followed)."""
     h, w = shape
+    u, v = (w / 2, h / 2) if at is None else at
     seeds = np.zeros(len(xyz), bool)
-    seeds[np.argmin(np.hypot(pix[:, 0] - w / 2, pix[:, 1] - h / 2))] = True
+    seeds[np.argmin(np.hypot(pix[:, 0] - u, pix[:, 1] - v))] = True
     return connected_piece(xyz, seeds)
 
 
@@ -358,14 +365,15 @@ def connected_piece(xyz, seeds, cell_mm=CLUSTER_CELL_MM):
     return piece[inv]
 
 
-def isolate_mask(xyz, pix, shape, rng, seeds=None, known=None, plane=None):
+def isolate_mask(xyz, pix, shape, rng, seeds=None, known=None, plane=None, at=None):
     """Mask of the object's points (support plane dropped, piece at the centre kept), and that plane
     ((n, c), or None). With `seeds` (bool mask: where the object should be, scene.Scene.core), the piece
     connected to the seeds left after the plane cut is kept instead, when there are MIN_SEEDS of them.
     `known`: a function giving a plane to cut by when the frame shows none of its own (the kept base
     where the pose guess puts it: without a cut the piece took in the whole floor, and the hand scan's
     frames 46-49 matched the model at 10-28%). `plane`: the table, already found (scene.Scene.
-    table_in_camera): no search of the frame's own (support_plane, 7 ms a frame)."""
+    table_in_camera): no search of the frame's own (support_plane, 7 ms a frame). `at`: the depth pixel the
+    piece is taken at instead of the centre (centre_piece)."""
     keep = np.ones(len(xyz), bool)
     if plane is None:
         plane = support_plane(xyz, rng, pix, shape)
@@ -377,7 +385,7 @@ def isolate_mask(xyz, pix, shape, rng, seeds=None, known=None, plane=None):
         if seeds is not None and seeds[idx].sum() >= MIN_SEEDS:
             piece = connected_piece(xyz[idx], seeds[idx])
         else:
-            piece = centre_piece(xyz[idx], pix[idx], shape)
+            piece = centre_piece(xyz[idx], pix[idx], shape, at)
         keep[idx[~piece]] = False
     return keep, plane
 
@@ -641,7 +649,7 @@ class Scanner:
     """
 
     def __init__(self, preset="small", log=print, mode="still", track_with="joint", remove_base=True,
-                 merge_min_s=None, live_view=False, merge_process=False):
+                 merge_min_s=None, live_view=False, merge_process=False, aim=None):
         try:
             from . import fuse  # Open3D: frame-to-frame ICP
         except ImportError:
@@ -730,6 +738,25 @@ class Scanner:
         self.last_view = None  # (pixels, object mask, base mask, shape) of the last tracked frame, for the viewer
         self.labels = {}  # index -> view_mask of every tracked frame (what fusion takes as object / base)
         self.sources = []  # [{"rec": recording dir, "first_index": scanner index of its frame 0}]
+        # aim: the depth pixel (u, v) where the viewer's aim had the object at Start (None: the image centre).
+        # The first frame takes its piece there, and the scene then prefers tracking's piece to the centre's.
+        self.aim = None if aim is None else (float(aim[0]), float(aim[1]))
+        from .colour import ObjectColours
+        self.colours = ObjectColours()  # the object's colours against its surroundings, learned at keyframes: while
+        # lost they seed the object's piece (colour.py; silent when the two share their colours)
+        self.stats["colour_seeded"] = 0
+        # Scan pieces (start_piece): by first scanner index, like sources; "joined" is set by join_pieces.
+        self.pieces = [{"first_index": 0}]
+        self.piece_scenes, self.piece_maps = [], []  # the scene and marker map each finished piece had
+        self.lost_since = None  # frame time the current loss began (frames with depth only)
+        self.last_source = None  # the last tracked source's centre (camera mm): where a new piece looks first
+        self.reach_kept = None  # object_reach() when the last piece ended
+        self.gpu_reset_due = False  # the tracking volume is emptied at the new piece's first frame
+        self.stats["pieces"] = 1
+        self.left_pieces, self.piece_joins = [], []  # join_pieces: pieces left out (clouds), the joins' keyframe pairs
+        if self.aim is not None:
+            self.scene.prefer_piece = True
+            self.stats["aim"] = list(self.aim)
 
     def feed(self, frame, index=None):
         """Process one frame set ({'color', 'depth'}); returns True if it was merged into the cloud."""
@@ -756,9 +783,17 @@ class Scanner:
             keep = scene.object_mask(all_xyz, all_pix, shape, np.eye(4))
         else:  # the frame's piece where the guess puts the object (the middle of the view can miss a narrow one)
             seeds = known = None
+            at = self.aim if self.prev is None and not self.refind_needed else None  # (the first frame only)
+            if self.prev is None and len(self.pieces) > 1:  # a new piece's first frame: the object as last seen
+                seeds, at = self.piece_start_seeds(frame, all_xyz, all_pix)
             if self.prev is not None:
                 to_world = scene_transform(self.pose @ guess)
                 seeds = scene.core(all_xyz, to_world)
+                if self.lost_run and self.colours.ratio is not None:  # lost, the guess unsure: the object's colours
+                    by_colour = self.colours.seeds(frame, all_xyz, all_pix, self.object_reach())
+                    if by_colour is not None and by_colour.sum() >= MIN_SEEDS:
+                        seeds = by_colour
+                        self.stats["colour_seeded"] += 1
                 if scene.mode == "still" and scene.plane is not None:  # the table: the kept base re-fitted, once
                     table = scene.table_in_camera(all_xyz, to_world)
                     if table[3]:
@@ -766,9 +801,9 @@ class Scanner:
                     else:  # (the guess was off: the frame's own plane is searched, the kept one only if none)
                         known = lambda: table[:2]
             if table_plane is not None:
-                keep, _ = isolate_mask(all_xyz, all_pix, shape, self.rng, seeds, plane=table_plane)
+                keep, _ = isolate_mask(all_xyz, all_pix, shape, self.rng, seeds, plane=table_plane, at=at)
             else:
-                keep, plane = isolate_mask(all_xyz, all_pix, shape, self.rng, seeds, known)
+                keep, plane = isolate_mask(all_xyz, all_pix, shape, self.rng, seeds, known, at=at)
                 self.frame_table = table_normal(all_xyz, plane)
         xyz, pix = all_xyz[keep], all_pix[keep]
         if len(xyz) < 500 // seg ** 2:
@@ -784,7 +819,7 @@ class Scanner:
         if fuse is not None:
             if self.track_with == "gpu":
                 levels = None  # the GPU matches the frame's own maps (Open3D levels only to re-find)
-                self.gpu_source(frame, xyz, pix)
+                self.gpu_source(frame, xyz, pix, first=self.prev is None)
             else:
                 from . import track
                 levels = track.levels(xyz / 1000)
@@ -864,8 +899,10 @@ class Scanner:
                     self.lost_run += 1
                     self.track_log.append((index, "lost", None))
                     self.show_ghost()
+                    self.lost_long(t, index)
                     return False
-            self.last_t, self.lost_run = t, 0
+            self.last_t, self.lost_run, self.lost_since = t, 0, None
+            self.last_source = xyz.mean(0)
             self.prev = True if levels is None else levels
             stats["tracking"] = True
             if len(marker_pts):
@@ -894,6 +931,8 @@ class Scanner:
             if fuse is not None and move < KEY_MOVE_MM and turn < KEY_TURN_DEG and self.since_merge < KEY_EVERY:
                 return False
         self.since_merge, self.last_merged = 0, self.pose.copy()
+        if scene.mode == "still":  # a keyframe: its object and the rest of its view teach the colour model
+            self.colours.learn(frame, all_xyz, all_pix, obj, ~(obj | base))
         if scene.mode == "still" and fuse is not None and not self.object_turns and not self.room_settled() \
                 and (t is None or self.room_t is None or not 0 <= t - self.room_t < ROOM_EVERY_S):
             self.room_t = t
@@ -967,7 +1006,8 @@ class Scanner:
             return
         last = self.poses[-1][0]
         fix = new_poses.get(last, old[last]) @ np.linalg.inv(old[last])
-        self.pose, self.last_merged = fix @ self.pose, fix @ self.last_merged
+        self.pose = fix @ self.pose
+        self.last_merged = None if self.last_merged is None else fix @ self.last_merged  # (a new piece merged none)
         cloud = VoxelCloud(point_mm or self.cloud.point_mm)
         for index, _ in self.poses:
             pose = new_poses.get(index, old[index])
@@ -982,7 +1022,7 @@ class Scanner:
         # the mesh fused from every frame came out blurred: p90 0.55 mm against 0.34 from merged frames)
         fixes = {i: new_poses.get(i, old[i]) @ np.linalg.inv(old[i]) for i, _ in self.poses}
         keyed = sorted(fixes)
-        starts = sorted(src["first_index"] for src in self.sources)
+        starts = sorted({src["first_index"] for src in self.sources} | {p["first_index"] for p in self.pieces})
         part = lambda i: bisect.bisect_right(starts, i)
         log = []
         for i, status, p in self.track_log:
@@ -1036,6 +1076,10 @@ class Scanner:
         sc.object_turns = sc.stats["object_turns"] = bool(session.get("object_turns", False))
         sc.crop = session.get("crop")
         sc.sources = list(session.get("sources", []))
+        if session.get("piece_list"):  # a scan of joined pieces (their frames already in one world)
+            sc.pieces = [dict(p) for p in session["piece_list"]]
+            sc.piece_joins = [tuple(j) for j in session.get("piece_joins", [])]
+            sc.stats["pieces"] = len(sc.pieces)
         if (directory / "frame_poses.txt").exists():  # every tracked frame (scans saved before 2026-11-01: none)
             status = {}
             if (directory / "track.csv").exists():
@@ -1202,8 +1246,13 @@ class Scanner:
         self.cue["features"] = bool(plausible_step(step, xyz))
         return feat, (step if self.cue["features"] else None)
 
-    def gpu_source(self, frame, xyz, pix):
-        """Hand this frame's piece to the GPU tracker; the first frame makes it, its volume around this piece."""
+    def gpu_source(self, frame, xyz, pix, first=False):
+        """Hand this frame's piece to the GPU tracker; the first frame makes it, its volume around this piece
+        (a new scan piece's first frame empties it there: start_piece)."""
+        if self.gpu is not None and first and self.gpu_reset_due:
+            to_world = scene_transform(self.pose)
+            self.gpu.reset(xyz.mean(0) @ to_world[:3, :3].T + to_world[:3, 3])
+            self.gpu_reset_due = False
         if self.gpu is None:
             from . import gputrack
             to_world = scene_transform(self.pose)
@@ -1230,6 +1279,108 @@ class Scanner:
         to_ref = np.linalg.inv(scene_transform(ref))  # world (mm) -> target frame (mm)
         dst = self.marker_map.pos[[m for _, m in matched]] @ to_ref[:3, :3].T + to_ref[:3, 3]
         return marker_pts[[f for f, _ in matched]], dst
+
+    def lost_long(self, t, index):
+        """A lost frame with depth: after PIECE_AFTER_S of them (frame time; 0.1 s a frame without stamps)
+        the scan goes on in a new piece from the next frame (start_piece)."""
+        now = t if t is not None else 0.1 * self.stats["frames"]
+        if self.lost_since is None:
+            self.lost_since = now
+        elif now - self.lost_since >= PIECE_AFTER_S and self.stats["merged"]:
+            self.start_piece(index + 1)
+
+    def start_piece(self, first_index):
+        """Go on in a new piece from scanner index `first_index`: the pose chain starts again (at the last good
+        pose, so the new piece's world lies near the old one when the scanner barely moved), with a scene,
+        marker map and tracking volume of its own and an empty live cloud. The merged frames, keyframes and
+        labels stay (global), the finished piece's scene and marker map are kept for the join (join_pieces)."""
+        from .markermap import MarkerMap
+        from .scene import Scene
+        self.sync_merges()  # (the old piece's merges land in its cloud, before the reset)
+        self.piece_scenes.append(self.scene)
+        self.piece_maps.append(self.marker_map)
+        self.reach_kept = self.object_reach()
+        self.scene = Scene(self.scene.mode, self.rng)
+        self.scene.prefer_piece = True  # its object was chosen by colour or where the last piece had it, not by the
+        # view centre: its base vote and first region take tracking's piece (handgap, CPU: with the view centre's,
+        # the second piece's region came out 25 mm wide and its 56 merged frames gave 7,510 cloud points)
+        self.marker_map = MarkerMap(add_mm=self.marker_map.add_mm)
+        self.prev, self.motion, self.motion_s, self.last_t = None, np.eye(4), None, None
+        self.prev_feat = self.feat_pose = self.refind_feat = None
+        self.hold, self.cue = 0, {}
+        self.shape_model, self.shape_t = None, None
+        self.model, self.model_merged, self.model_levels, self.model_at = None, -1, None, -1
+        self.last_merged, self.merge_t, self.since_merge = None, None, 0
+        self.room_ref, self.room_t = None, None
+        self.lost_run, self.lost_since = 0, None
+        self.gpu_reset_due = self.gpu is not None
+        with self.cloud_lock:
+            self.cloud = VoxelCloud(self.cloud.point_mm)
+        if self.merge_proc is not None:
+            self.merge_proc.reset()
+        self.points_kept = 0
+        self.pieces.append({"first_index": int(first_index)})
+        self.stats["pieces"] = len(self.pieces)
+        self.log(f"tracking lost for {PIECE_AFTER_S:.0f} s: going on in piece {len(self.pieces)}; "
+                 "the pieces are joined after Stop")
+
+    def piece_start_seeds(self, frame, xyz, pix):
+        """(seeds, at) for a new piece's first frame: the object by its colours (colour.py) when they tell it
+        from the room, else the piece at the point nearest where the last tracked source was (camera)."""
+        reach = self.reach_kept or 150.0
+        if self.colours.ratio is not None:
+            by_colour = self.colours.seeds(frame, xyz, pix, reach)
+            if by_colour is not None and by_colour.sum() >= MIN_SEEDS:
+                return by_colour, None
+        if self.last_source is not None and len(xyz):
+            d = np.linalg.norm(xyz - self.last_source, axis=1)
+            i = int(np.argmin(d))
+            if d[i] <= reach:
+                return None, (float(pix[i, 0]), float(pix[i, 1]))
+        return None, None
+
+    def scene_of(self, index):
+        """The scene of the piece scanner index `index` belongs to (in that piece's own world until joined)."""
+        k = self.piece_of(index)
+        return self.piece_scenes[k] if k < len(self.piece_scenes) else self.scene
+
+    def take_pieces_out(self, numbers):
+        """Leave pieces (numbers from 0) out of the scan: their frames go from keyframes, merged frames, labels
+        and the tracked poses ("left out"). Returns their clouds as they were, for saving apart (piece-N.ply):
+        [{"piece": N (from 1), "xyz" world mm, "rgb"}]."""
+        out = []
+        for k in numbers:
+            lo = self.pieces[k]["first_index"]
+            hi = self.pieces[k + 1]["first_index"] if k + 1 < len(self.pieces) else np.inf
+            inside = lambda i: lo <= i < hi
+            cloud = VoxelCloud(self.cloud.point_mm)
+            for i, pose in self.poses:
+                if inside(i) and i in self.merged_data:
+                    pts, rgb, nrm = self.merged_data[i]
+                    cloud.add(pts.astype(np.float64) @ pose[:3, :3].T + pose[:3, 3] * 1000, rgb,
+                              nrm.astype(np.float64) @ pose[:3, :3].T)
+            xyz, rgb, _ = cloud.points(1) if len(cloud) else (np.zeros((0, 3)), np.zeros((0, 3), np.uint8), None)
+            out.append({"piece": k + 1, "xyz": xyz, "rgb": rgb})
+            self.keyframes = [kf for kf in self.keyframes if not inside(kf[0])]
+            self.poses = [(i, p) for i, p in self.poses if not inside(i)]
+            for i in [i for i in self.merged_data if inside(i)]:
+                del self.merged_data[i]
+            for i in [i for i in self.labels if inside(i)]:
+                del self.labels[i]
+            self.track_log = [(i, "left out", None) if inside(i) and p is not None else (i, st, p)
+                              for i, st, p in self.track_log]
+        return out
+
+    def piece_of(self, index):
+        """The piece number scanner index `index` belongs to."""
+        return bisect.bisect_right([p["first_index"] for p in self.pieces], index) - 1
+
+    def object_reach(self):
+        """How far (mm) the object reaches from its middle: the region's radius, the ball's start, else 150."""
+        scene = self.scene
+        if scene.radius is not None:
+            return float(scene.radius)
+        return float(scene.ball[2]) if scene.ball is not None else 150.0
 
     def judge(self, index, info, step, xyz):
         """Note a solve's info (flat-face hint, cues) and say whether its pose is taken."""
@@ -1322,7 +1473,8 @@ class Scanner:
         tracking solve (solve_ok, RELOCK_FITNESS, floor_agrees) and by the time lost (reachable). GPU tracker
         only. The ORB extracted here is kept in self.refind_feat."""
         self.refind_feat = feat
-        kfs = [k for k in self.keyframes if k[3] is not None and k[3][1] is not None]
+        first = self.pieces[-1]["first_index"]  # this piece's keyframes: the others' poses are in other worlds
+        kfs = [k for k in self.keyframes if k[3] is not None and k[3][1] is not None and k[0] >= first]
         if self.gpu is None or self.features is None or not kfs:
             return False
         if feat is None:
@@ -1568,8 +1720,14 @@ class Scanner:
         self.stats["remove_base"], self.stats["base_found"] = self.remove_base, self.scene.plane is not None
         self.stats["sources"] = self.sources
         self.stats["crop"], self.stats["crop_axes"] = self.crop, self.crop_axes().round(6).tolist()
+        self.stats["piece_list"] = [{k: (bool(v) if k == "joined" else int(v)) for k, v in p.items()} for p in self.pieces]
+        self.stats["piece_joins"] = [[int(a), int(b)] for a, b in self.piece_joins]
         out = save(directory, self.output_cloud(), self.poses, self.stats, self.preset, min_seen)
         self.save_state(directory)
+        for left in self.left_pieces:  # pieces that joined nothing, in their own world (manual joining: later)
+            if len(left["xyz"]):
+                pc.write_ply(Path(directory) / f"piece-{left['piece']}.ply",
+                             (left["xyz"] @ FLIP.T / 1000).astype(np.float32), left["rgb"])
         return out
 
     def save_state(self, directory):
@@ -1629,10 +1787,20 @@ class Scanner:
             self.cloud.keep(keep)
 
 
+def recording_aim(directory):
+    """The viewer's aim at Start (depth pixel (u, v)) as a live scan's raw copy notes it in info.json, or None:
+    a replay takes the first frame's piece where the live scan did."""
+    try:
+        aim = json.loads((Path(directory) / "info.json").read_text()).get("aim")
+    except (OSError, ValueError):
+        return None
+    return tuple(aim) if aim else None
+
+
 def scan(directory, preset="small", log=print, remove_base=True, track_with="gpu"):
     """Merge a recording; returns the Scanner (its cloud, poses and stats; save() writes the result).
     Tracks on the GPU (gputrack) when there is one, else on the CPU (track.solve)."""
-    scanner = Scanner(preset, log, remove_base=remove_base, track_with=track_with)
+    scanner = Scanner(preset, log, remove_base=remove_base, track_with=track_with, aim=recording_aim(directory))
     scanner.add_source(Path(directory).resolve(), 0)
     try:
         for i, frame in enumerate(fr.read_recording(directory)):
@@ -1642,6 +1810,9 @@ def scan(directory, preset="small", log=print, remove_base=True, track_with="gpu
     finally:
         scanner.close()  # the GPU's memory back before Optimise and the mesh
     scanner.flush()
+    if len(scanner.pieces) > 1 and scanner.fuse is not None:  # the scan's pieces into one world, as after Stop
+        from . import optimise
+        optimise.join_pieces(scanner, log)
     return scanner
 
 

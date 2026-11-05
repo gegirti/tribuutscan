@@ -4,7 +4,10 @@ The viewer starts it with the .venv Python when there is one (so ICP tracking wo
 to it over two queues. The worker also serves the browser 3D view of the growing cloud
 (view3d page), so cloud data never passes back through the viewer.
 
-Commands:  ("start", preset, out_dir, keep_raw, continue_from or None, depth mode name, remove_base[, tracker])
+Commands:  ("start", preset, out_dir, keep_raw, continue_from or None, depth mode name, remove_base[, options])
+           options: {"tracker": "gpu" | "joint", "capture": {...}} (a tracker name alone also works); "capture"
+           (the IR settings, the aim: depth pixel (u, v) of the object at Start) goes into the raw copy's
+           info.json and the scan's session.json
            (tracker: "gpu", the default, which falls back to the CPU solve without a GPU; or "joint")
            | ("frame", yuyv, grey or None, depth_buf, bytesperline, (t_colour, t_ir, t_depth))
            | ("stop"[, mesh]) | ("quit",)   (times: camera capture times, seconds; mesh: make the mesh after
@@ -114,7 +117,7 @@ class LiveSource:
             if s is None:
                 return "empty", self.cached[1], {"name": self.name, "points": 0, "session": {}, "phase": self.phase}
             key = (self.scan_id, s.stats["merged"], s.stats["tracking"], s.cue.get("flat"), self.phase,
-                   id(s.cloud), s.cloud.point_mm)
+                   id(s.cloud), s.cloud.point_mm, len(s.pieces))
             if key != self.built_key and time.time() - self.built_at >= PAYLOAD_EVERY_S:
                 xyz, rgb, seen = s.live_points(LIVE_MIN_SEEN)  # region, base as chosen
                 payload = view3d.pack_arrays(xyz @ cl.FLIP.T / 1000, rgb, seen)
@@ -122,6 +125,7 @@ class LiveSource:
                     "preset": s.preset, "point_distance_mm": s.cloud.point_mm,
                     "raw_points": s.cloud.raw_points,
                     **{k: s.stats[k] for k in ("frames", "merged", "lost", "relocked", "tracking")},
+                    "pieces": len(s.pieces),  # (while scanning, the cloud shown is the current piece's)
                     "cue": dict(s.cue), "crop": s.crop}}
                 if self.phase != "scanning":  # (turn_axis reads every tracked pose: only for a finished scan's Crop)
                     info["session"]["crop_axes"] = s.crop_axes().round(6).tolist()
@@ -178,7 +182,7 @@ def run(commands, replies, port=view3d.PORT):
         replies.put(("log", f"3D view not available: port {port}: {e.strerror}"))
         server = None
     replies.put(("ready", f"http://localhost:{port}/" if server else None))
-    out_dir, keep_raw, recorder = None, False, None
+    out_dir, keep_raw, recorder, capture = None, False, None, {}
     parent = multiprocessing.parent_process()
     timing = {"wait": 0.0, "raw": 0.0, "feed": 0.0, "frames": 0}  # per scan, logged at Stop
     reader = Reader(commands)
@@ -202,7 +206,10 @@ def run(commands, replies, port=view3d.PORT):
         timing["wait"] += time.perf_counter() - t_wait
         if kind == "start":
             timing, decoded_at_start = {k: 0 for k in timing}, reader.decode_s
-            _, preset, out_dir, keep_raw, continue_from, depth_mode, remove_base, *tracker = cmd
+            _, preset, out_dir, keep_raw, continue_from, depth_mode, remove_base, *options = cmd
+            options = options[0] if options else {}
+            options = {"tracker": options} if isinstance(options, str) else options
+            capture = options.get("capture", {})
             calib.use_mode(depth_mode)  # the law of the scanner's mode, before any frame is turned into points
             recorder = None
             log = lambda m: replies.put(("log", m))
@@ -213,8 +220,10 @@ def run(commands, replies, port=view3d.PORT):
                     log(f"continuing {Path(continue_from).name}: show the scanner a part it has seen")
                 else:
                     source.scanner = cl.Scanner(preset, log=log, remove_base=remove_base,
-                                                track_with=tracker[0] if tracker else "gpu", live_view=True,
-                                                merge_process=True)
+                                                track_with=options.get("tracker", "gpu"), live_view=True,
+                                                merge_process=True, aim=capture.get("aim"))
+                if capture:
+                    source.scanner.stats["capture"] = capture  # (session.json takes every stats key)
                 source.scan_id += 1
                 source.name = f"live: {out_dir.name}"
                 source.phase, source.out_dir = "scanning", out_dir
@@ -225,7 +234,7 @@ def run(commands, replies, port=view3d.PORT):
                 try:
                     if recorder is None:
                         recorder = RawCopy(fr.Recorder(bytesperline, root=out_dir,
-                                                       extra={"note": "frames a live scan processed"}))
+                                                       extra={"note": "frames a live scan processed", **capture}))
                         with source.lock:  # its frame 0 is the scanner's next index (continued scans count on)
                             source.scanner.add_source(recorder.recorder.dir.resolve(), source.scanner.stats["frames"])
                     if recorder.error is not None:
@@ -248,7 +257,7 @@ def run(commands, replies, port=view3d.PORT):
             timing["feed"] += time.perf_counter() - t2
             timing["frames"] += 1
             replies.put(("frame_done", s.stats["merged"], s.stats["frames"], points, s.stats["tracking"],
-                         dict(s.cue, base=s.scene.plane is not None, turning=s.object_turns), view_mask(s.last_view),
+                         dict(s.cue, base=s.scene.plane is not None, turning=s.object_turns, piece=len(s.pieces)), view_mask(s.last_view),
                          s.view_codes, t_d))
         elif kind == "frame":
             replies.put(("frame_done", 0, 0, 0))
@@ -258,6 +267,12 @@ def run(commands, replies, port=view3d.PORT):
                 recorder = None
             with source.lock:
                 source.scanner.close()  # the GPU tracker's memory back (Optimise and the mesh come next)
+                if len(source.scanner.pieces) > 1:  # its pieces into one world first (what joins nothing: piece-N.ply)
+                    try:
+                        from . import optimise
+                        optimise.join_pieces(source.scanner, log=lambda m: replies.put(("log", m)))
+                    except ImportError:
+                        pass
                 path, kept = source.scanner.save(out_dir)
                 source.name = out_dir.name
                 source.phase = "optimising"
