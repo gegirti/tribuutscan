@@ -448,6 +448,7 @@ After Stop:
   thin compared with that object (<= 1/3 of its height). The dev scene: the platform was voted, the board
   24.9 mm above it became the base; mesh 1.15M -> 483k triangles, the hand and its stand, flat bottom.
   `lifted_mm` keeps how far: with Keep base everything above the voted base still shows.
+  Optimise (also "Optimise again" in the 3D view) settles it too, so scans saved before get it.
 - **Save**: cloud.ply, session.json, keyframes.npz, merged.npz, frame_poses.txt, labels.npz, track.csv,
   markers.json, cloud_state.npz.
 - **Optimise** (`optimise.py`): loops from shared markers, ORB matches or nearby poses. Loops the shape

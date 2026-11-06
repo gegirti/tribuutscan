@@ -278,6 +278,8 @@ def optimise(scanner, log=print):
     first, join_pieces)."""
     scanner.flush()
     pieces_report = join_pieces(scanner, log) if len(getattr(scanner, "pieces", ())) > 1 else None
+    if hasattr(scanner, "settle_base"):  # (a scan saved before the base was lifted at Stop gets it here: no-op after)
+        scanner.settle_base()
     kfs = [{"index": i, "pose": pose, "points": pts, "feat": feat, "markers": mk}
            for i, pose, pts, feat, mk in scanner.keyframes]
     if getattr(scanner, "object_turns", False):
