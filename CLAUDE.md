@@ -342,7 +342,7 @@ Processes:
     first scan frame does, outlined on depth and colour; a click picks a piece, followed by its 3D centre
     until Start hands its pixel to the scan (`Scanner(aim=...)`, noted as "aim" in the raw copy's
     info.json and session.json so replays take it). Start counts down 3 s (COUNTDOWN_S), the worker
-    starting meanwhile.
+    starting meanwhile. A click while scanning goes to the worker as a pick (step 5 below).
   - A range switch logs how long each step took; one still busy after SWITCH_STUCK_S 40 s is given up
     for a reconnect (one hung on 2026-11-05 after an IMU-off timeout, with no clue where).
   - While scanning, a `Feeder` thread (not the Tk tick) sends each new depth frame with its colour pair as
@@ -400,8 +400,18 @@ One frame (`cloud.Scanner.feed`, GPU tracker):
    - a solve failed only by one or two markers, on a shape that pins the pose (degeneracy >= 4 x
      track.DEGENERATE), is solved again without them (`odd_markers`; a spurious marker on a printed
      pattern, 2026-11-05).
-5. **Lost.** It tries, in this order:
+5. **Lost.** First the frame's piece is judged against the object's look (`likeness`; `look`: size r90,
+   points scaled by distance^2 and distance of the look piece's last LOOK_FRAMES 30 tracked sources, the
+   look piece being the first, or the latest one a click started): "object" (r90 x0.5-2, points >= 0.35,
+   distance within max(30%, 100 mm)), "other" (points < 0.1, r90 outside x1/3-3, or the distance off by
+   twice that) or "unsure". An "other" frame (looking away: the shelf, a wall, crumbs) tries nothing and
+   the viewer says the object is out of view. Otherwise it tries, in this order:
    - `relock`: Open3D ICP from the last pose against the object cloud, gated, then the GPU solve's checks;
+     not once this loss has shown something else (`relock_due`, `away_frames`: the scanner may come back
+     anywhere, and on the CPU tracker a relock 4 s after a look-away took a wrong pose nearby; a 1 s time
+     limit instead cost the CPU tracker half of markersgap, whose frames are only missing). After
+     AWAY_FRAMES 5 such frames (it looked away) the CPU tracker's own step from the last pose is not tried
+     either (`step_due`: it accepts at fitness 0.3 / 2 mm and took a frame 14 degrees off): a new piece;
    - `refind_anywhere`: ORB against keyframes, with inliers away from the object and the pose reachable
      in the time lost;
    - `refind_shape`: FPFH + RANSAC against the object so far, at most every 0.25 s, refusing edge-on
@@ -412,15 +422,26 @@ One frame (`cloud.Scanner.feed`, GPU tracker):
    object's colours instead of the region's core when the colour model can tell them (`colour.py`:
    U/V histograms of object vs the rest of the view, learned at keyframes; silent when they overlap,
    Bhattacharyya > 0.6, so depth alone decides as before).
-   **Pieces.** Lost for PIECE_AFTER_S 1 s of frames with depth, with every recovery failing, the scan
-   goes on in a new piece (`start_piece`): pose chain, scene, marker map, live cloud and tracking volume
-   start afresh (the volume emptied in place, `Engine.reset`: no second ~560 MB engine), at the last good
-   pose; its first frame takes the object by colour, else at the point nearest the last source. Re-finds
-   look only within the current piece. `pieces` holds each one's first index, like `sources`.
+   **Pieces.** After PIECE_AFTER_S 1 s of lost frames whose piece may be the object ("object" or "unsure"; an
+   "other" frame, or one with too little depth, starts the clock again), with every recovery failing, the scan
+   goes on in a new piece (`start_piece`): pose chain, scene, marker map, live cloud and tracking volume start
+   afresh (the volume emptied in place, `Engine.reset`: no second ~560 MB engine), at the last good pose; its
+   first frame takes the object by colour, else at the point nearest where the lost frames saw it
+   (`like_source`), else nearest the last source. Before 2026-11-06 any frame with depth counted: looking
+   away started pieces on the shelf and the wall, each taken where the last had its object, until one took
+   the boxes behind the hand. ("unsure" must count: seen from above, devplatform's hand showed a third of
+   its points, and with only "object" counting the CPU tracker never began a piece.) Re-finds look only within the current piece. `pieces` holds each one's first index, like `sources`.
+   **A click** on the depth or colour preview while scanning (`Scanner.pick`, sent as ("pick", kind, (u, v));
+   the raw copy notes it in picks.csv, `recording_picks` gives replays the same): on the object being
+   tracked (the last frame's labels) nothing changes; on something else a new piece starts there at once;
+   while lost, that frame's piece is taken at the click and found again in the scan if it can be, else a
+   new piece starts there (no 1 s wait). A piece a click started becomes the look piece.
 6. **Scene** (`scene.py`, mode "still"):
    - The base is found by votes: 3 must agree in world coordinates. `stands_on` requires contact within
      10 mm, and at most half the plane may lie inside the object's outline. After VOTE_LIMIT, while no
-     base is known, a vote is taken on every 10th frame.
+     base is known, a vote is taken on every 10th frame, except for VOTE_WINDOW 100 frames after the view
+     turns VOTE_NEW_VIEW_DEG 25 degrees from every view such a window began at (a scan level for minutes,
+     then a pass from 45 degrees: the dev scan of 2026-11-06 got 4-6 votes in 1000 frames before this).
    - The region grows only toward points GROW_ABOVE_MM 10 above the base, seen in the middle half of the
      view.
    - The kept plane is re-fitted only to points outside the object's footprint, and a re-fit that turns
@@ -435,18 +456,27 @@ One frame (`cloud.Scanner.feed`, GPU tracker):
 
 After Stop:
 - **Join** (`optimise.join_pieces`, before the save, when there are pieces): the first piece's world is
-  the scan's (where it was aimed and found its base; the biggest piece's if the first is too small); each other piece is placed by shared markers, ORB between keyframes, or shape (FPFH), each
-  candidate refined by `track.solve` and taken only at fitness >= 0.6 and rmse <= 1.0 mm (JOIN_*; a
-  weak shape join at 0.43 / 1.44 mm doubled the dev scene's hand) with markers or a pinned shape. A joined piece moves with all its frames; one that joins nothing, or has
+  the scan's (where it was aimed and found its base; the biggest piece's if the first is too small); each
+  other piece is placed by shared markers, ORB between keyframes, or shape (FPFH, JOIN_SHAPE_SEEDS 2 RANSAC
+  seeds), each candidate refined by `track.solve` (`join_solve`) and taken only at fitness >= 0.6 and rmse
+  <= 1.0 mm (JOIN_*; a weak shape join at 0.43 / 1.44 mm doubled the dev scene's hand) with markers or a
+  pinned shape, one way or the other: a piece that saw much more than the others fails onto them (the
+  2026-11-06 45 degree pass: 0.306 / 1.06 mm) while they lie on it (0.981 / 0.77 mm). Passing candidates
+  more than JOIN_AGREE 10 mm / 5 degrees apart leave the piece out (`join_pick`: a view that fits in two
+  places). A joined piece moves with all its frames; one that joins nothing, or has
   fewer than PIECE_MIN_KEYFRAMES 5 keyframes, is left out (saved as piece-N.ply; its frames "left out").
+  When the first piece never found a base and a joined one did, the scan takes that piece's base and
+  region (`Scene.adopt_base`; level at long range the board gives no depth, from 45 degrees it does).
   Optimise then adds no odometry edge across a piece boundary, a certain edge per join (the keyframe pair
   nearest each other once placed), and finds loops across pieces as within one; remerge blends nothing
   across a boundary. session.json keeps "piece_list" and "piece_joins".
 - **Base onto a support** (`Scanner.settle_base` -> `Scene.lift_base`, after the join): the base moves up
   onto a flat layer parallel to it that the object stands on, when the layer is wide (>= 100 cm2, >= 10% of
   the object's points), what stands on it covers at most a quarter of it (cells of 3+ points), and it is
-  thin compared with that object (<= 1/3 of its height). The dev scene: the platform was voted, the board
-  24.9 mm above it became the base; mesh 1.15M -> 483k triangles, the hand and its stand, flat bottom.
+  thin compared with that object (<= 1/3 of its height). The layer's own plane is fitted (`_layer_plane`,
+  within 5 degrees of the base): a board need not lie parallel to the platform, and a base voted 1.6 degrees
+  off spread the board over 19-27 mm. The dev scene: the platform was voted, the board 24.9 mm above it
+  became the base; mesh 1.15M -> 483k triangles, the hand and its stand, flat bottom.
   `lifted_mm` keeps how far: with Keep base everything above the voted base still shows.
   Optimise (also "Optimise again" in the 3D view) settles it too, so scans saved before get it.
 - **Save**: cloud.ply, session.json, keyframes.npz, merged.npz, frame_poses.txt, labels.npz, track.csv,
@@ -494,7 +524,8 @@ Invariants:
 ## Measuring
 
 - **`evaluate.py`** runs a tracker over these datasets:
-  - real: markers, hand, platform, platform2, devplatform (the dev scene, 2026-11-05);
+  - real: markers, hand, platform, platform2, devplatform (the dev scene, 2026-11-05), devaway (the dev
+    scene, 2026-11-06: still 88 s, two look-aways, a 45 degree pass);
   - synthetic: synth, synth7, synthhard, synthfp, synthplate, synthturn;
   - gap variants: markersgap, handgap, synthturngap.
 
@@ -513,9 +544,12 @@ Invariants:
   as the scanner sends them).
 - **`compare.py`** scores a cloud or mesh against Creality's mesh of the marker part. Use 12 seeds, and
   reuse a transform for clouds that share tracking.
-- **Reference runs** (2026-11-05/06, all 14 datasets): captures/eval/20261105-203248-f-gpu and
-  -203250-f-cpu, with 20261106-083850-joingate-cpu for devplatform and handgap after the join gate.
-  Before them (scan UX): 20261105-123705-u34-gpu, -122856-u34-cpu, -130551-u34b-gpu, -130327-u34b-cpu.
+- **Reference runs** (2026-11-06, all 15 datasets, `--optimise`): captures/eval/20261106-153054-g-final3-gpu
+  and -153054-g-final3-cpu (the look-away plan). The code before it: 20261106-110005-g-before-gpu and
+  -110839-g-before-cpu (HEAD ab893a8 with relock's no-normals guard, which HEAD's CPU tracker needed on devaway).
+  Before them: captures/eval/20261105-203248-f-gpu and -203250-f-cpu, with 20261106-083850-joingate-cpu for
+  devplatform and handgap after the join gate; (scan UX) 20261105-123705-u34-gpu, -122856-u34-cpu,
+  -130551-u34b-gpu, -130327-u34b-cpu.
   Before them (2026-11-04, Phase 6): captures/eval/20261104-101245-p6-after-gpu
   (`--optimise`) and -101700-p6-after-cpu. The marker part's mesh lies 0.08-0.09 mm (median) / 0.33-0.35 mm
   (p90) from Creality's. Hand-held live: 20 fps through `bench --live` on hand2.
@@ -579,20 +613,23 @@ point sets: use `compare.SEEDS = 12`, and the same transform for clouds that sha
 - Hand-held distance readings (about +-1-2 cm) cannot tell `a/z+b` from `a/z^2+b`. A fixed rig is
   needed for the real depth law.
 
-## Open (2026-11-05)
+## Open (2026-11-06)
 
 The GPU plan (approved 2026-11-01) is done through Phase 6 (clean-up), except for what needs the user or
-was left to them. The scan UX plan (approved 2026-11-05, ~/.claude/plans/virtual-watching-kettle.md): U1-U4
-coded and measured on the datasets (docs/history.md); U0 and the live checks need the user.
+was left to them. The scan UX plan (approved 2026-11-05): U1-U4 coded and measured on the datasets
+(docs/history.md); U0 partly recorded. The look-away plan (approved 2026-11-06, ~/.claude/plans/virtual-
+watching-kettle.md: pieces only on the object, a click while scanning, joins both ways, the base from a
+joined piece or a new view) is coded and measured on the datasets; its live checks need the user.
 
 Needs the user and the scanner:
 - **Scan UX, U0 and live:** the dev scene (the dark hand on the board on the white platform, long range,
-  two more hands at the left, the shelf behind) recorded with keep raw frames: D1 platform turn, D2 the
-  same ~45 degrees down, D3 hand-held circle, D4 look away ~2 s twice and come back from another side,
-  D5 60 s still. D1-D4 become evaluate datasets. Live: the aim picks the hand, a click moves it, the
-  countdown, the calm preview, Auto IR on a light and a dark object, 10 range switches without a hang,
-  D4 giving joined pieces. The user offered a CrealityScan screen capture of its Auto IR; and the app on
-  the white-platform scene would tell whether its depth there is any better.
+  two more hands at the left, the shelf behind) recorded with keep raw frames. Done: D1 platform turn
+  (devplatform), D5 still + D4 looking away twice, back from the same side + D2 ~45 degrees down, in one
+  recording (devaway). Open: D3 hand-held circle, D4 coming back from another side. Live: a click on the
+  object while lost and while tracking something else, looking away without new pieces, the countdown,
+  Auto IR on a light and a dark object, 10 range switches without a hang. The user offered a CrealityScan
+  screen capture of its Auto IR; and the app on the white-platform scene would tell whether its depth
+  there is any better.
 - **The live check of Phase 5:**
   - a platform scan with one level pass and one about 45 degrees down, at 30-35 cm;
   - solid.ply opened in Blender;

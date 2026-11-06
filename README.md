@@ -109,7 +109,11 @@ right: Scanner, Capture, Scan, IMU and View.
   more views, **orange** where the scanner sees the object but the scan has nothing yet. A red frame
   means tracking is lost. The depth view then shows the scan so far where it was last seen. Move (or
   turn the object) back until the live view lines up with that grey shape, and the scan goes on. It
-  also finds its place again by itself, by shape, when the scanner sees a part already scanned.
+  also finds its place again by itself, by shape, when the scanner sees a part already scanned; if it
+  cannot, after a second of seeing the object it goes on in a new piece, and the pieces are put
+  together after Stop. Looking away is fine: nothing else is taken for the object meanwhile. Click
+  the object in the depth or colour view to show the scan where it is: before Start (the outline
+  follows it), or while scanning, also when tracking is lost.
   Tick *keep raw frames* to keep the frames the scan used, for replays. *Continue last* goes on
   with the last saved scan.
 - **Scanning on a platform**: the scanner can also stand still while you turn the object on a

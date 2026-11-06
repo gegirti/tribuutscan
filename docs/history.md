@@ -1310,3 +1310,73 @@ cubes on the GPU; the CPU keeps the 6x6 solve, markers, base votes, pose graph, 
   - F4, worker speed (bench stage table on hand2, the code before the scan UX d1b0a88 vs now, alternating three
     times, quiet desktop): feed 51.8-53.8 ms against 51.5-56.1; no stage measurably slower; the unlisted
     bookkeeping (colour learning at keyframes, pieces, aim) +0.8 ms a frame (9.0 -> 10.4 median), under 2%.
+- LOOKING AWAY (2026-11-06, plan approved: ~/.claude/plans/virtual-watching-kettle.md). The user's scan 20261106-100039
+  (the dev scene at long range: 88 s still on the dark hand, looking away twice, then a pass ~45 degrees down): "looking
+  away was kinda mess, click to focus did not help, it tried to get boxes, the 45 degree pass seems not saved".
+  - Replays of its raw copy (now evaluate's "devaway"):
+    - after 1 s lost the scan went on in a new piece on whatever lay nearest the last source: shelf crumbs (35-73
+      points), the wall, then, when the hand came back (frame 1859), the boxes behind it at 66 cm, each piece taken
+      where the last had its object; live 10 pieces, 9 left out;
+    - lost frames ran at 6 fps (322 frames in 51 s; 100 ms median, 400 ms p90, against 33 ms tracked);
+    - clicks on the preview were ignored while scanning;
+    - the 45 degree pass (999 of 999 frames, on the hand, base found) was left out: its only join candidate
+      (shape) was right, but the gate measured the share of it lying on piece 1, 0.306 at 1.06 mm (it saw much
+      more of the hand); piece 1 on it: 0.981 / 0.77 mm;
+    - level at long range the board and the platform give no depth: piece 1 never found a base.
+  - Done (cloud.py, scene.py, optimise.py, viewer.py, livescan.py, frames.py):
+    - `likeness`: a lost frame's piece against the object's look (r90, points x distance^2, distance of the first
+      piece's last 30 tracked sources, or a clicked piece's): "object", "unsure", "other". The hand: 4100-5665
+      points, r90 82-89 mm at 345-380 mm; the junk: 9-786 points, r90 9-65 mm at 454-716 mm, or 11-20k points, r90
+      190-261 mm at 651-678 mm. "other" frames start the 1 s piece clock again and try no recovery.
+    - A click while scanning (`Scanner.pick`, picks.csv in the raw copy, `recording_picks` for replays). Replayed
+      with planted clicks: on the tracked hand nothing changed; on the boxes a piece started there (left out at the
+      join); on the hand in the colour view a piece started and joined piece 1 by ORB (1.0, 0.28 mm).
+    - Joins judged both ways (`join_solve`), two shape seeds, and `join_pick` refusing candidates that pass yet
+      disagree (a box seen from one side passes turned 180 degrees the other way too). The pickled pre-join states:
+      the 45 degree piece joins (0.981 / 0.77 mm, the others onto it); CPU devplatform's wrong join of 11-06 is still
+      refused (0.48 / 1.40, the other way 0.22 / 1.37 mm); handgap's join unchanged. Twelve shape seeds on each real
+      case: all on one pose, none passing for the wrong join.
+    - `Scene.adopt_base`: the base and region of a joined piece when the first piece found none.
+    - Base votes on every frame again for 100 frames after the view turns 25 degrees from every view such a window
+      began at: with the 45 degree pass inside piece 1 (no new piece), voting every 10th frame gave 4-6 votes in
+      1000 frames, the platform and the board by turns, three never agreeing.
+    - relock no longer raises on a piece too new to have a model (Open3D: no normals): HEAD's CPU tracker crashed on
+      devaway there.
+  - Found on the way and fixed (each from a full evaluate run):
+    - With only "object" frames running the piece clock, CPU devplatform never began a piece at the pass from above
+      (the hand there showed a third of its points: "unsure" and "object" by turns) and relock took a wrong pose 20
+      frames later: Optimise moved 9.5 mm. "unsure" frames count now.
+    - Relock after a look-away (CPU devaway, frame 1850): the GPU re-find put the scanner ~103 mm from where it left,
+      relock's limits allow 60 mm / 30 degrees, and it took a pose 14 mm / 16 degrees off: Optimise moved 38 mm. A 1 s
+      time limit on relock instead cost markersgap half its frames on the CPU (frames only missing: relock is right
+      there). Now relock is off once a loss has shown an "other" frame (`relock_due`), which also stopped the CPU
+      tracker's wrong relocks on the synthetic plate turned edge-on (ATE 11.1 -> 1.9 mm, its far face left out as on
+      the GPU).
+    - The CPU tracker's own step from the stale pose took frame 1851 after the look-away (it accepts at 30% / 2 mm):
+      after AWAY_FRAMES 5 "other" frames it is not tried (`step_due`); the GPU's step keeps going.
+    - CPU devplatform with the pass from above joined was not lifted: its base, voted in the new windows, lay 1.6
+      degrees off HEAD's, and the board spread over 19-27 mm above it. The layer's own plane is fitted now
+      (`_layer_plane`): lifted 23.0 mm.
+  - The doubled share rises where more of a scan is kept (devaway GPU 0.4% -> 3.1%): not frames out of place. Every
+    later frame lies within 0.30 mm (median) of the surface the first 88 s built; rebuilt from parts, the first 88 s
+    alone give 0.18% (as live), the 45 degree pass alone 1.0%, all together 3.1%: noise of a dark object at long
+    range piling up from more and steeper views. The mesh (fused) is clean: the hand and its stand.
+  - Evaluate, all 15 datasets, CPU and GPU, `--optimise`: HEAD (with the no-normals guard) g-before-gpu 20261106-110005
+    / g-before-cpu -110839 against g-final3-gpu / -cpu 20261106-153054.
+    - GPU: markers, hand, the synthetic sets, platform2, markersgap and synthturngap as before (points +-6, scatter in
+      the 12th decimal). platform 497 -> 496 tracked (a relock fewer); devplatform the same frames, base lifted
+      23.8 -> 22.9 mm (the board's own plane), correction 0.31 -> 0.44 mm; handgap 381 -> 382.
+    - GPU devaway: 1868 -> 3027 tracked (used 0.60 -> 0.98), 8 pieces (2 joined) -> 1, base found and lifted
+      24.1 mm, 97k -> 199k points, loops 498 -> 898, correction at the object 0.16 -> 0.35 mm.
+    - CPU: markers, hand, synth, synth7, synthhard, synthfp, platform, platform2, synthturn, markersgap and
+      synthturngap as before. synthplate 146 -> 77 tracked, ATE 11.1 -> 1.9 mm (the far face left out, not merged
+      11 mm off). devplatform 607 -> 1369 tracked, the pass from above joined (ORB 0.81 / 0.74 mm), base lifted 24.9
+      -> 23.0 mm, doubled 0.4 -> 1.1%, correction 0.48 -> 0.80 mm. devaway 1789 -> 3004 tracked, 11 pieces (1
+      joined) -> 3 (all joined; the base from the 45 degree piece), correction 0.23 -> 0.88 mm. handgap 366 -> 359
+      (its two "other" frames start the piece clock again).
+  - Speed, quiet desktop, back to back: the look-away stretch of devaway (frames 1790-2112, GPU, the live path) 145 ->
+    41 ms a frame (HEAD: junk pieces and recovery on every frame; now the hand found again); the 45 degree stretch 41 ->
+    54 ms (it tracks against the whole scan now, not a fresh piece). bench stage table on hand2, HEAD and new
+    alternating three times: a frame 52.1-52.6 -> 50.7-51.7 ms, no stage slower, 440 tracked and 131 merged in each.
+  - Tests: 164 pass (new: likeness, the piece clock, clicks, picks.csv, the viewer's click, joins both ways, the base
+    from a joined piece, the vote window, relock and the CPU step after a look-away, a tilted board lifted).

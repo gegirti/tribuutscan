@@ -54,6 +54,8 @@ LAYER_BAND_MM = 2.0  # height bands of the histogram (a layer is a band and its 
 LAYER_MIN_CM2, LAYER_MIN_SHARE = 100.0, 0.10  # a layer covers this much and holds this share of the object's points
 LAYER_FOOTPRINT = 0.25  # what stands on it covers at most this share of the layer's area
 LAYER_THIN = 1 / 3  # its height above the base is at most this share of the height of what stands on it
+LAYER_FIT_MM, LAYER_TILT_DEG = 6.0, 5.0  # its own plane is fitted to the points this near its band (then
+# LAYER_BAND_MM near the fit), and may tilt this far from the base (_layer_plane)
 LAYER_CELL_POINTS = 3  # footprints count FOOTPRINT_CELL_MM cells holding this many points (stray points: none;
 # on the board scan the hand covered 226 cm2 counting every cell, 138 with this, the board 723 / 700)
 BALL_MAX = 2.0
@@ -381,20 +383,43 @@ class Scene:
         for k in np.argsort(-edges[:-1]):  # the highest layer first
             if counts[k] < LAYER_MIN_SHARE * len(h):
                 continue
-            layer = np.abs(h - (edges[k] + LAYER_BAND_MM / 2)) <= LAYER_BAND_MM
+            layer_plane = self._layer_plane(pts, n, c - (edges[k] + LAYER_BAND_MM / 2))
+            if layer_plane is None:
+                continue
+            m, d = layer_plane
+            hl = pts @ m + d  # heights above the layer itself
+            layer = np.abs(hl) <= LAYER_BAND_MM
             height = float(np.median(h[layer]))
-            above = h > height + LAYER_BAND_MM + 3.0
+            above = hl > LAYER_BAND_MM + 3.0
             if above.sum() < 200 or height > LAYER_THIN * (np.percentile(h[above], 99) - height):
                 continue
             layer_cm2 = area(layer)
             if layer_cm2 < LAYER_MIN_CM2 or area(above) > LAYER_FOOTPRINT * layer_cm2:
                 continue
-            self.plane = (n, c - height)
-            self.axis = self.axis + height * n
+            self.plane = (m, d)
+            self.axis = self.axis - (self.axis @ m + d) * m  # (dropped onto it)
             self.top -= height
             self.lifted_mm += height
             return height
         return None
+
+    def _layer_plane(self, pts, n, c):
+        """A layer's own plane, from its band (n, c: parallel to the base), fitted twice to the points within
+        LAYER_FIT_MM then LAYER_BAND_MM of it, or None when it tilts more than LAYER_TILT_DEG from the base. A board
+        on a pad need not lie parallel to the platform, and a voted base can be a degree or two off: on the dev
+        scene's CPU run (base 1.6 degrees off HEAD's) the board spread over 19-27 mm above it and was not lifted."""
+        for band in (LAYER_FIT_MM, LAYER_BAND_MM):
+            near = np.abs(pts @ n + c) <= band
+            if near.sum() < 200:
+                return None
+            q = pts[near][::max(1, int(near.sum()) // FIT_POINTS)]
+            centre = q.mean(0)
+            fit = np.linalg.eigh(np.cov((q - centre).T))[1][:, 0]
+            fit = fit if fit @ self.plane[0] > 0 else -fit
+            if fit @ self.plane[0] < np.cos(np.radians(LAYER_TILT_DEG)):
+                return None
+            n, c = fit, float(-fit @ centre)
+        return n, c
 
     def adopt_base(self, other, transform):
         """Take another scene's base and region while this one has none: a joined piece's (optimise.join_pieces),

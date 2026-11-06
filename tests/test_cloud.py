@@ -810,8 +810,16 @@ def test_the_base_is_lifted_onto_a_board_the_object_stands_on_and_nowhere_else()
 
     s, h = lifted([(-150, 150, -100, 100, 0, 24), (-30, 30, -30, 30, 24, 224)])  # board, and a tall object on it
     assert h is not None and abs(h - 24) < 1.5
-    assert abs(s.plane[1] + h) < 1e-9 and abs(s.axis[2] - h) < 1e-9 and abs(s.top - (260 - h)) < 1e-9
+    assert s.plane[0] @ [0, 0, 1.0] > np.cos(np.radians(0.5)) and abs(s.plane[1] + 24) < 0.5  # the board's top
+    assert abs(s.axis[2] - 24) < 0.5 and abs(s.top - (260 - h)) < 1e-9  # (the axis dropped onto it)
     assert s.lifted_mm == h and sc.Scene("still").lifted_mm == 0.0
+    a = np.radians(1.6)  # the board (and what stands on it) 1.6 degrees off the voted base, as on a CPU run of the
+    tilt = np.array([[1, 0, 0], [0, np.cos(a), -np.sin(a)], [0, np.sin(a), np.cos(a)]])  # dev scene: +-3 mm across
+    s = sc.Scene("still")
+    s.plane = (np.array([0.0, 0.0, 1.0]), 0.0)
+    s.axis, s.radius, s.top = np.zeros(3), 300.0, 260.0
+    h = s.lift_base(_surface_points([(-150, 150, -100, 100, 0, 24), (-30, 30, -30, 30, 24, 224)]) @ tilt.T)
+    assert h is not None and abs(h - 24) < 1.5 and np.degrees(np.arccos(s.plane[0] @ tilt[:, 2])) < 0.5
     assert lifted([(-100, 100, -75, 75, 0, 10), (-75, 75, -50, 50, 10, 25)])[1] is None  # a step: much stands on it
     assert lifted([(-137, 137, -96, 96, 0, 44), (-20, -10, -5, 5, 44, 49), (30, 40, 10, 20, 44, 49)])[1] is None  # thick
     assert lifted([(-50, 50, -50, 50, 0, 40)])[1] is None  # a box: nothing on its lid
@@ -854,22 +862,24 @@ def test_a_lost_frame_is_judged_by_how_much_it_looks_like_the_object():
 
 
 def test_only_frames_like_the_object_start_a_new_piece():
-    """Lost frames of something else (or nothing) never start a piece, however long they go on, and each one starts
-    the clock again; PIECE_AFTER_S of frames like the object do, and the new piece is taken where they saw it."""
+    """Lost frames of something else ("other": crumbs, a wall, a box far behind) or of too little depth never start a
+    piece, however long they go on, and each starts the clock again; PIECE_AFTER_S of frames that may be the object
+    ("object" or "unsure": seen from above, the dev scene's hand showed a third of its points) do, and the new piece
+    is taken where they saw it, not where the last tracked piece was."""
     rng = np.random.default_rng(1)
     s = cl.Scanner("small", log=lambda m: None)
     s.stats["merged"] = 5
     hand, shelf = lump(rng, 3000, 60, 360), lump(rng, 3000, 60, 500) + [200.0, 0, 0]
     s.last_source = shelf.mean(0)  # (where a junk piece once was: not where the new piece is taken)
-    t = 0.0
-    for like in ["other"] * 30 + ["unsure"] * 5 + ["object"] * 5 + ["other"] + ["object"] * 8:  # 0.1 s apart
-        s.lost_long(t, int(t * 10), like, hand)
-        t += 0.1
+    frames = iter(range(1000))
+    for like in ["other"] * 30 + ["unsure"] * 5 + ["object"] * 4 + ["other"] + ["unsure"] * 9:  # 0.1 s apart
+        i = next(frames)
+        s.lost_long(i / 10, i, like, hand)
     assert len(s.pieces) == 1 and s.lost_since is not None
-    for _ in range(4):
-        s.lost_long(t, int(t * 10), "object", hand)
-        t += 0.1
-    assert len(s.pieces) == 2 and s.pieces[1]["first_index"] == int((t - 0.1) * 10) + 1
+    while len(s.pieces) == 1 and i < 60:
+        i = next(frames)
+        s.lost_long(i / 10, i, "unsure", hand)
+    assert len(s.pieces) == 2 and s.pieces[1]["first_index"] == i + 1 and i in (50, 51)  # (1 s after frame 40)
     xyz = np.concatenate([shelf, hand])
     pix = np.c_[np.arange(len(xyz)) % 1280, np.arange(len(xyz)) // 1280].astype(float)
     _, at = s.piece_start_seeds({}, xyz, pix)
@@ -922,3 +932,21 @@ def test_a_new_view_votes_for_the_base_on_every_frame_again():
         assert frames(200, level) == 200 // sc.VOTE_LATE_EVERY  # (seen before)
     finally:
         sc.cl.support_plane = real
+
+
+def test_relock_is_off_once_the_scanner_looked_away():
+    """relock starts from the last good pose; once a loss has shown something else, the scanner may come back
+    anywhere and relock is not tried until tracking resumes or a new piece starts; after AWAY_FRAMES such frames
+    (it looked away) the CPU tracker's own step from the last pose is not tried either. Unsure frames keep both."""
+    s = cl.Scanner("small", log=lambda m: None)
+    s.stats["merged"] = 5
+    xyz = lump(np.random.default_rng(3), 500, 60, 360)
+    s.lost_long(1.0, 10, "unsure", xyz)
+    assert s.relock_due() and s.step_due()
+    s.lost_long(1.1, 11, "other", xyz)
+    assert not s.relock_due() and s.step_due()
+    for i in range(cl.AWAY_FRAMES - 1):
+        s.lost_long(1.2 + i / 10, 12 + i, "other", xyz)
+    assert not s.step_due()
+    s.start_piece(20)
+    assert s.relock_due() and s.step_due()

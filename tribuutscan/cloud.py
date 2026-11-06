@@ -55,6 +55,7 @@ MERGE_MIN_S = 0.25  # ...into the point cloud at most one per this much frame ti
 MAX_STEP_MM, MAX_STEP_DEG = 30.0, 15.0  # larger jumps between tracked frames are tracking failures
 RELOCK_FITNESS = 0.6  # after a loss, a frame must match this share of its points to the cloud so far
 RELOCK_MAX_SCALE = 2.0  # a re-found pose may be at most this many normal steps from the last good one
+AWAY_FRAMES = 5  # a loss with this many frames of something else (likeness "other"): the scanner looked away (step_due)
 GUESS_MAX_S = 0.3  # the motion guess extrapolates the last motion over at most this long (lost frames:
                    # it ran on and on, 7 -> 177 mm at the object over 20 lost frames of the hand scan)
 REFIND_KEYFRAMES, REFIND_TRIES = 16, 3  # refind_anywhere: keyframes compared, best ones tried...
@@ -77,15 +78,16 @@ PIECE_MIN_KEYFRAMES = 5  # a piece with fewer keyframes is dropped as noise
 LOOK_FRAMES = 30  # the object's look (Scanner.look, look_of): its source in the last this many tracked frames...
 LOOK_SIZE, LOOK_POINTS, LOOK_NEAR = (0.5, 2.0), 0.35, (0.3, 100.0)  # ...and a lost frame's piece is "object" with
 # its r90 within these times the look's, its points (scaled by distance^2) at least this share, its distance within
-# max(30%, 100 mm) of the look's (likeness). Only such frames run PIECE_AFTER_S: on 2026-11-06 the dev scan looked
-# away (the shelf, the wall, the floor) and every 1 s went on in a new piece on what was there, each next one taken
-# where the last had its object, until one took the boxes behind the hand (66 cm) when the hand came back. The hand
-# there: 4100-5665 points, r90 82-89 mm at 345-380 mm; what it looked at: 9-786 points, r90 9-65 mm at 454-716 mm,
-# or 11-20k points, r90 190-261 mm at 651-678 mm
-OTHER_SIZE, OTHER_POINTS = (1 / 3, 3.0), 0.1  # "other" (clearly something else): r90 outside these times, points
-# under this share, or the distance off by more than twice LOOK_NEAR. Such lost frames try no recovery (orb_guess,
-# relock, refind_anywhere, refind_shape all need the object in view): the look-away ran at 6 fps, frames of 100 ms
-# median and 400 ms p90 (FPFH on the wall) against 33 ms tracked
+# max(30%, 100 mm) of the look's (likeness)...
+OTHER_SIZE, OTHER_POINTS = (1 / 3, 3.0), 0.1  # ...and "other" (clearly something else) with its r90 outside these
+# times, its points under this share, or its distance off by more than twice LOOK_NEAR; "unsure" in between. An
+# "other" frame starts PIECE_AFTER_S again and tries no recovery (orb_guess, relock, refind_anywhere, refind_shape
+# all need the object in view). On 2026-11-06 the dev scan looked away (the shelf, the wall, the floor) and every
+# 1 s went on in a new piece on what was there, each next one taken where the last had its object, until one took
+# the boxes behind the hand (66 cm) when the hand came back; and the look-away ran at 6 fps, frames of 100 ms
+# median and 400 ms p90 (FPFH on the wall) against 33 ms tracked. The hand there: 4100-5665 points, r90 82-89 mm
+# at 345-380 mm; what it looked at: 9-786 points, r90 9-65 mm at 454-716 mm, or 11-20k points, r90 190-261 mm at
+# 651-678 mm
 GAP_S = 0.5  # the first frame tracked after this long without one (lost frames, or none came) is checked by shape:
     # its solve began at the last good pose, and a turn about a vertical axis hides in horizontal faces (the
     # synthetic block on a platform, 3 s left out: "tracked" 37 degrees off)
@@ -780,6 +782,7 @@ class Scanner:
         self.look = collections.deque(maxlen=LOOK_FRAMES)  # look_of the look piece's last tracked sources (likeness)
         self.look_piece = 0  # the piece whose tracked frames teach the look: the first, or the last one a click started
         self.like_source = None  # centre (camera mm) of the last lost frame's piece that looked like the object
+        self.away_frames = 0  # lost frames of something else (likeness "other") in this loss: relock_due, step_due
         self.stats["lost_away"] = 0  # lost frames of something else (likeness "other": no recovery tried)
         # Clicks on the viewer's preview while scanning ("the object is there", pick): the one the next frame takes,
         # and a replay's, by scanner index, from the raw copy's picks.csv (recording_picks)
@@ -926,8 +929,10 @@ class Scanner:
                         self.view_codes = self.gpu.ghost(self.pose @ step, self.gpu_base(), self.preview_weight())
                     elif self.live_view:
                         self.view_codes = self.gpu.preview(self.gpu_base(), self.preview_weight())
-                else:
+                elif self.step_due():
                     step, ok = self.joint_step(levels, xyz, marker_pts, guess, index)
+                else:  # (the CPU tracker after the scanner looked away: not from the last pose, a new piece)
+                    step, ok = np.eye(4), False
                 like = "object" if ok else self.likeness(seen)  # (a piece of something else: no recovery tried)
                 if ok and status != "tracked":  # (re-found by shape after a gap: no motion to go on from)
                     self.pose, self.motion, self.motion_s = self.pose @ step, np.eye(4), None
@@ -935,7 +940,7 @@ class Scanner:
                     self.motion = step
                     self.motion_s = (t - self.last_t) if (t is not None and self.last_t is not None) else None
                     self.pose = self.pose @ self.motion
-                elif like != "other" and self.relock(*self.relock_source(levels, xyz), marker_pts):
+                elif like != "other" and self.relock_due() and self.relock(*self.relock_source(levels, xyz), marker_pts):
                     stats["relocked"] += 1
                     status = "relocked"
                 elif like != "other" and self.refind_anywhere(frame, pix, xyz, marker_pts, feat):
@@ -960,7 +965,7 @@ class Scanner:
                         self.lost_long(t, index, like, xyz)
                     return False
             self.last_t, self.lost_run, self.lost_since = t, 0, None
-            self.last_source, self.like_source = xyz.mean(0), None
+            self.last_source, self.like_source, self.away_frames = xyz.mean(0), None, 0
             self.cue.pop("away", None)
             if len(self.pieces) - 1 == self.look_piece:  # the object's look, from the first piece (or a clicked one)
                 self.look.append(seen)
@@ -1358,11 +1363,15 @@ class Scanner:
         return "unsure"
 
     def lost_long(self, t, index, like="object", xyz=None):
-        """A lost frame with depth. Frames whose piece looks like the object (likeness "object") run the clock
-        (frame time; 0.1 s a frame without stamps), any other frame starts it again; after PIECE_AFTER_S the scan
-        goes on in a new piece from the next frame (start_piece), taken where that piece was (like_source)."""
-        if like != "object":
+        """A lost frame with depth. Frames whose piece may be the object (likeness "object" or "unsure") run the
+        clock (frame time; 0.1 s a frame without stamps), a frame of something else ("other") starts it again; after
+        PIECE_AFTER_S the scan goes on in a new piece from the next frame (start_piece), taken where that piece was
+        (like_source). ("unsure" counts: devplatform on the CPU tracker lost the hand where the pass from above
+        began, a third of its points and half its size by then, "object" and "unsure" by turns; with only "object"
+        counting no piece began, relock tried on until it took a wrong pose and Optimise had to move 9.5 mm.)"""
+        if like == "other":
             self.lost_since = None
+            self.away_frames += 1
             return
         if xyz is not None and len(xyz):
             self.like_source = xyz.mean(0)
@@ -1430,7 +1439,7 @@ class Scanner:
         self.model, self.model_merged, self.model_levels, self.model_at = None, -1, None, -1
         self.last_merged, self.merge_t, self.since_merge = None, None, 0
         self.room_ref, self.room_t = None, None
-        self.lost_run, self.lost_since = 0, None
+        self.lost_run, self.lost_since, self.away_frames = 0, None, 0
         self.gpu_reset_due = self.gpu is not None
         with self.cloud_lock:
             self.cloud = VoxelCloud(self.cloud.point_mm)
@@ -1772,6 +1781,24 @@ class Scanner:
     def relock_source(self, levels, xyz):
         """Levels to re-find with: the frame's object piece, as tracked (the cloud holds only the object)."""
         return (self.fuse.levels(xyz / 1000) if levels is None else levels), xyz
+
+    def relock_due(self):
+        """Is relock (from the last good pose, within RELOCK_MAX_SCALE steps of it) worth trying: not once the scanner
+        has looked away during this loss (a lost frame of something else, likeness "other"), as then it may come back
+        anywhere. On 2026-11-06 the dev scan came back to the hand 4 s after looking away, ~100 mm from where it left
+        (the GPU re-find), and the CPU tracker's relock took a pose 14 mm / 16 degrees from the old one, within its
+        limits and wrong (Optimise then moved 38 mm). Frames simply missing (markersgap) keep it: a time limit of 1 s
+        cost the CPU tracker half of that dataset. (Off after one such frame: the CPU tracker's relocks on the
+        synthetic plate turned edge-on, its pieces of a few points "other", were the ones 11 mm off.)"""
+        return not self.away_frames
+
+    def step_due(self):
+        """Is the CPU tracker's own step (track.solve from the last pose and the motion guess) worth trying: not once
+        this loss has shown AWAY_FRAMES frames of something else (the scanner looked away). That step accepts at
+        JOINT_MIN_FITNESS 0.3 and 2 mm and the CPU tracker has no re-find anywhere: back at the hand 4 s after looking
+        away, ~100 mm from where it left, it took a frame 14 degrees off (Optimise moved 38 mm). Then a new piece.
+        The GPU's step is held to solve_ok's limits and its re-finds look anywhere: it keeps going."""
+        return self.away_frames < AWAY_FRAMES
 
     def relock(self, levels, xyz, marker_pts=None):
         """Tracking failed: try to place the frame against the cloud so far, from the last known pose.
