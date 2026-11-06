@@ -98,6 +98,10 @@ FLOOR_MAX_DEG = 2.5  # a taken pose tilts the kept base at most this much from t
 FLOOR_OTHER_DEG, FLOOR_MIN_SPAN_MM = 15.0, 150.0  # ...a plane further off, or narrower, says nothing
 OBJECT_ABOVE_MM = 3.0  # (scene.py) the object starts this far above the table
 JOINT_MIN_FITNESS, JOINT_MAX_RMSE_MM = 0.3, 2.0  # accepting a joint-solve pose (markers: see Scanner)
+ODD_MARKERS, PINNED = 2, 4.0  # a solve failed only by this many markers, on a shape that pins the pose this many times
+# over track.DEGENERATE, is solved again without them (2026-11-05, still scans of the dark hand on the calibration
+# board: every lost frame used one marker and fitted the shape at 0.99 / 0.11 mm, degeneracy 0.037 - a spurious
+# "marker" on the board's pattern; 2-3% of the frames that used a marker with 13 fps, 6-16% at 18-19 fps)
 MODEL_EVERY = 5  # the CPU tracker's model: its levels are rebuilt after this many merges
 LABEL_STEP = 8  # per-frame labels (and the viewer's object mask) at 1/8 of the frame size (160 x 100)
 BIAS = 1 << 20  # voxel coordinates are packed into one int64 key, 21 bits each
@@ -849,6 +853,10 @@ class Scanner:
                     self.cue["features"] = False
                     step, info = self.gpu_step(xyz, marker_pts, guess)
                     ok = self.accepted(info, step, xyz)
+                    if not ok and self.odd_markers(info, xyz):  # one or two markers against a shape that pins it
+                        step, info = self.gpu_step(xyz, marker_pts[:0], guess)
+                        ok = self.accepted(info, step, xyz)
+                        stats["odd_markers"] = stats.get("odd_markers", 0) + 1
                     if not ok and self.features is not None:  # an ORB start, then again
                         feat, retry = self.orb_guess(frame, pix, xyz)
                         if retry is not None:
@@ -1339,6 +1347,20 @@ class Scanner:
                 return None, (float(pix[i, 0]), float(pix[i, 1]))
         return None, None
 
+    def settle_base(self):
+        """After Stop: lift the base onto a support stacked on it (scene.Scene.lift_base), judged on the
+        keyframes' object points. Logs and notes it ("base_lifted_mm")."""
+        scene = self.scene
+        if scene.mode != "still" or scene.plane is None or not self.keyframes or scene.lifted_mm:
+            return None
+        pts = np.concatenate([k[2] @ k[1][:3, :3].T + k[1][:3, 3] * 1000 for k in self.keyframes if len(k[2])])
+        lifted = scene.lift_base(pts)
+        if lifted is not None:
+            self.stats["base_lifted_mm"] = round(float(lifted), 1)
+            self.log(f"base: the object stands on a support {lifted:.0f} mm above the base found; "
+                     "the base is now that support (Keep base shows both)")
+        return lifted
+
     def scene_of(self, index):
         """The scene of the piece scanner index `index` belongs to (in that piece's own world until joined)."""
         k = self.piece_of(index)
@@ -1399,6 +1421,14 @@ class Scanner:
     def accepted(self, info, step, xyz):
         """Is a solve's pose taken: its checks (solve_ok), a believable step, the table as flat as it was."""
         return self.solve_ok(info, xyz) and plausible_step(step, xyz) and self.floor_agrees(step)
+
+    def odd_markers(self, info, xyz):
+        """Did only a marker or two fail a solve whose shape fit holds and pins the pose (ODD_MARKERS, PINNED)? A
+        flat face that slides has degeneracy under track.DEGENERATE: there markers disagreeing still refuse it."""
+        from . import track
+        return (info["marker_rmse_mm"] is not None and info["marker_rmse_mm"] > self.marker_accept
+                and 0 < info["markers_used"] <= ODD_MARKERS and (info["degeneracy"] or 0) >= PINNED * track.DEGENERATE
+                and self.solve_ok(dict(info, marker_rmse_mm=None), xyz))
 
     def floor_agrees(self, step):
         """In "still" mode, does the frame's own table (frame_table, when broad enough to tell) lie as flat as
@@ -1691,7 +1721,8 @@ class Scanner:
         if scene.plane is not None and scene.axis is not None:
             n, h = scene.plane[0], scene.height(xyz)
             r = np.linalg.norm(xyz - np.outer((xyz - scene.axis) @ n, n) - scene.axis, axis=1)
-            keep &= (r <= scene.radius) & (h <= scene.top) & (h > (OBJECT_ABOVE_MM if self.remove_base else -PLANE_TOL_MM))
+            floor = OBJECT_ABOVE_MM if self.remove_base else -PLANE_TOL_MM - scene.lifted_mm  # (kept: as voted)
+            keep &= (r <= scene.radius) & (h <= scene.top) & (h > floor)
             core = keep & (h > OBJECT_ABOVE_MM) & (r <= max(scene.radius - scene_margin(), scene.radius / 2))
         elif scene.ball is not None:
             centre, radius, _ = scene.ball
@@ -1780,7 +1811,7 @@ class Scanner:
             return
         c = self.cloud.xyz / self.cloud.n[:, None]
         n = scene.plane[0]
-        h = scene.height(c)
+        h = scene.height(c) + scene.lifted_mm  # (above the base as voted: a lifted one keeps what it stands on)
         flat = c - np.outer((c - scene.axis) @ n, n)
         keep = (h > -PLANE_TOL_MM) & (np.linalg.norm(flat - scene.axis, axis=1) <= scene.radius)
         with self.cloud_lock:
@@ -1813,6 +1844,7 @@ def scan(directory, preset="small", log=print, remove_base=True, track_with="gpu
     if len(scanner.pieces) > 1 and scanner.fuse is not None:  # the scan's pieces into one world, as after Stop
         from . import optimise
         optimise.join_pieces(scanner, log)
+    scanner.settle_base()
     return scanner
 
 

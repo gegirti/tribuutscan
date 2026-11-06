@@ -56,6 +56,10 @@ DATASETS = {  # name: (path or glob under captures/, notes, scan mode)
     "synthturn": ("synth/turntable-rec", "synthetic: the test block on a platform turning ~400 degrees at 3-23 "
                   "deg/s, the scanner standing at ~35 cm in a still room (table, wall, boxes), long range, 10 fps, "
                   "14-bit with the fixed error of synthfp; the platform gives no depth", "still"),
+    "devplatform": ("20261105-190442-scan/*-rec", "the dev scene (2026-11-05): the dark mannequin hand on its stand on "
+                    "the calibration board on a pad on the white platform, turned by hand, the scanner standing; long "
+                    "range ~32 cm, picked by a click (aim); the room behind with two more hands; base: the platform "
+                    "from above, lifted onto the board after Stop", "still"),
 }
 GAPS = {  # name: (dataset, frames left out): a stretch skipped as if tracking had been lost while the scanner moved
     "markersgap": ("markers", range(250, 330)),
@@ -207,6 +211,7 @@ def _run(name, tracker, preset, live_markers, optimise_after, mesh=False):
     if len(scanner.pieces) > 1:  # as after Stop: the scan's pieces into one world (or left out)
         from . import optimise as opt
         pieces = opt.join_pieces(scanner, log=lambda m: None)
+    lifted = scanner.settle_base()
     opt_report = None
     if optimise_after:
         from . import optimise
@@ -230,7 +235,8 @@ def _run(name, tracker, preset, live_markers, optimise_after, mesh=False):
                        metrics.pose_jumps([t for t in tracked if scanner.piece_of(t[0]) == k], centre)],  # scanner moved)
         "used": round(len(tracked) / max(with_depth, 1), 3),  # tracked of the frames that had depth
         "pieces": len(scanner.pieces), "pieces_joined": sum(1 for p in scanner.pieces if p.get("joined", True)),
-        "pieces_report": pieces, "colour_seeded": scanner.stats.get("colour_seeded", 0),
+        "pieces_report": pieces, "colour_seeded": scanner.stats.get("colour_seeded", 0), "base_lifted_mm": lifted,
+        "odd_markers": scanner.stats.get("odd_markers", 0),
         "flat_frames": scanner.stats.get("flat", 0),
         "object_turns": scanner.object_turns, "room_votes": dict(scanner.room_votes),
         "shape_refinds": scanner.stats.get("shape_refinds", 0),

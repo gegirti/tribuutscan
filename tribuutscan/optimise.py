@@ -34,6 +34,10 @@ ROT_SIGMA_DEG, POS_SIGMA_MM = 0.5, 1.0  # per edge, for the information matrices
 JOIN_KEYFRAMES = 12  # a scan piece's keyframes compared by ORB with each joined piece's (spread over both)
 JOIN_ORB_TRIES = 4  # ...the pairs with the most matches tried
 JOIN_GRID_MM = 2.0  # pieces' object points thinned to this grid for the join's checks
+JOIN_MIN_FITNESS, JOIN_MAX_RMSE_MM = 0.6, 1.0  # a join must fit this well (session.accept, 0.3 / 2 mm, is for whole
+# scans). Joins measured right: fitness 0.72-0.99, rmse 0.68-0.83 mm (handgap, the synthetic test); on 2026-11-06 the
+# dev scene's second piece (CPU tracker, the pass from above) joined by shape at 0.43 / 1.44 mm, doubled the hand
+# and stopped its base from being lifted: left out now (piece-2.ply) rather than doubled
 
 
 def relative(a, b):
@@ -196,13 +200,12 @@ def join_candidates(scanner, groups, k, placed, maps):
 def join_pieces(scanner, log=print):
     """After Stop, before Optimise: put a scan's pieces (cloud.Scanner.start_piece) into one world, the first
     piece's (the biggest one's when the first is too small to keep). Each later piece is placed by shared markers, ORB between keyframes or shape (join_candidates),
-    each candidate refined by the joint solve against the pieces placed so far and taken only as Optimise
-    takes a loop: session.accept, and markers or a shape that pins the pose (track.DEGENERATE). A piece that
+    each candidate refined by the joint solve against the pieces placed so far and taken only when it fits
+    well (JOIN_MIN_FITNESS, JOIN_MAX_RMSE_MM) with markers or a shape that pins the pose (track.DEGENERATE). A piece that
     joins moves with all its frames; one that joins nothing (or has fewer than PIECE_MIN_KEYFRAMES) is left
     out of the scan: its points are kept apart (scanner.left_pieces, saved as piece-N.ply). Returns a report,
     or None for a scan of one piece."""
     from . import cloud as cl
-    from . import session
     pieces = scanner.pieces
     if len(pieces) < 2 or all("joined" in p for p in pieces):
         return None
@@ -227,7 +230,9 @@ def join_pieces(scanner, log=print):
                 ls, ld = track.levels(src / 1000), track.levels(dst / 1000)
                 for start, kind in candidates:
                     t, info = track.solve(ls, ld, start)
-                    if session.accept(info) and (info["markers_used"] or (info["degeneracy"] or 0) >= track.DEGENERATE) \
+                    good = info["fitness"] >= JOIN_MIN_FITNESS and info["rmse_mm"] is not None \
+                        and info["rmse_mm"] <= JOIN_MAX_RMSE_MM
+                    if good and (info["markers_used"] or (info["degeneracy"] or 0) >= track.DEGENERATE) \
                             and (best is None or info["fitness"] > best[1]["fitness"]):
                         best = (t, info, kind)
             if best is None:

@@ -396,7 +396,10 @@ One frame (`cloud.Scanner.feed`, GPU tracker):
    Two more checks can change an accepted pose:
    - after a gap of GAP_S 0.5 s, a shape candidate (`shape_candidate`) replaces the solve if it fits
      clearly better elsewhere;
-   - with 3 or more markers in view and none used, `marker_check` places the frame by markers.
+   - with 3 or more markers in view and none used, `marker_check` places the frame by markers;
+   - a solve failed only by one or two markers, on a shape that pins the pose (degeneracy >= 4 x
+     track.DEGENERATE), is solved again without them (`odd_markers`; a spurious marker on a printed
+     pattern, 2026-11-05).
 5. **Lost.** It tries, in this order:
    - `relock`: Open3D ICP from the last pose against the object cloud, gated, then the GPU solve's checks;
    - `refind_anywhere`: ORB against keyframes, with inliers away from the object and the pose reachable
@@ -433,12 +436,18 @@ One frame (`cloud.Scanner.feed`, GPU tracker):
 After Stop:
 - **Join** (`optimise.join_pieces`, before the save, when there are pieces): the first piece's world is
   the scan's (where it was aimed and found its base; the biggest piece's if the first is too small); each other piece is placed by shared markers, ORB between keyframes, or shape (FPFH), each
-  candidate refined by `track.solve` and taken as Optimise takes a loop (fitness >= 0.3, rmse <= 2 mm,
-  markers or a pinned shape). A joined piece moves with all its frames; one that joins nothing, or has
+  candidate refined by `track.solve` and taken only at fitness >= 0.6 and rmse <= 1.0 mm (JOIN_*; a
+  weak shape join at 0.43 / 1.44 mm doubled the dev scene's hand) with markers or a pinned shape. A joined piece moves with all its frames; one that joins nothing, or has
   fewer than PIECE_MIN_KEYFRAMES 5 keyframes, is left out (saved as piece-N.ply; its frames "left out").
   Optimise then adds no odometry edge across a piece boundary, a certain edge per join (the keyframe pair
   nearest each other once placed), and finds loops across pieces as within one; remerge blends nothing
   across a boundary. session.json keeps "piece_list" and "piece_joins".
+- **Base onto a support** (`Scanner.settle_base` -> `Scene.lift_base`, after the join): the base moves up
+  onto a flat layer parallel to it that the object stands on, when the layer is wide (>= 100 cm2, >= 10% of
+  the object's points), what stands on it covers at most a quarter of it (cells of 3+ points), and it is
+  thin compared with that object (<= 1/3 of its height). The dev scene: the platform was voted, the board
+  24.9 mm above it became the base; mesh 1.15M -> 483k triangles, the hand and its stand, flat bottom.
+  `lifted_mm` keeps how far: with Keep base everything above the voted base still shows.
 - **Save**: cloud.ply, session.json, keyframes.npz, merged.npz, frame_poses.txt, labels.npz, track.csv,
   markers.json, cloud_state.npz.
 - **Optimise** (`optimise.py`): loops from shared markers, ORB matches or nearby poses. Loops the shape
@@ -484,7 +493,7 @@ Invariants:
 ## Measuring
 
 - **`evaluate.py`** runs a tracker over these datasets:
-  - real: markers, hand, platform, platform2;
+  - real: markers, hand, platform, platform2, devplatform (the dev scene, 2026-11-05);
   - synthetic: synth, synth7, synthhard, synthfp, synthplate, synthturn;
   - gap variants: markersgap, handgap, synthturngap.
 
@@ -503,8 +512,9 @@ Invariants:
   as the scanner sends them).
 - **`compare.py`** scores a cloud or mesh against Creality's mesh of the marker part. Use 12 seeds, and
   reuse a transform for clouds that share tracking.
-- **Reference runs** (2026-11-05, scan UX, all 13 datasets): captures/eval/20261105-123705-u34-gpu and
-  -122856-u34-cpu, with -130551-u34b-gpu / -130327-u34b-cpu for handgap and synthplate after the last fixes.
+- **Reference runs** (2026-11-05/06, all 14 datasets): captures/eval/20261105-203248-f-gpu and
+  -203250-f-cpu, with 20261106-083850-joingate-cpu for devplatform and handgap after the join gate.
+  Before them (scan UX): 20261105-123705-u34-gpu, -122856-u34-cpu, -130551-u34b-gpu, -130327-u34b-cpu.
   Before them (2026-11-04, Phase 6): captures/eval/20261104-101245-p6-after-gpu
   (`--optimise`) and -101700-p6-after-cpu. The marker part's mesh lies 0.08-0.09 mm (median) / 0.33-0.35 mm
   (p90) from Creality's. Hand-held live: 20 fps through `bench --live` on hand2.

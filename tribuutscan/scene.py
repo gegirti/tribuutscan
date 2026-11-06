@@ -40,6 +40,18 @@ VOTE_LIMIT, VOTE_LATE_EVERY = 300, 10  # frames to look for the base on every fr
 BASE_MIN_SHARE, BASE_MIN_CM2, BASE_TRIES = 0.03, 30.0, 5
 CONTACT_MM = 10.0  # the object at the image centre must come this close to a plane for it to be its base
 FOOTPRINT_CELL_MM, MAX_UNDER = 5.0, 0.5  # ...and at most half the plane may lie inside the object's outline
+# After Stop the base is lifted to a support stacked on it (lift_base): a flat layer parallel to the base, wide,
+# with a much narrower object standing on it and thin compared with that object. 2026-11-05, the dark hand on
+# the calibration board on a pad on the white platform: the platform was voted the base (seen from above), the
+# board top lay 22-26 mm above it holding 486k of the scan's 1.3M object points, and pad and board went into the
+# mesh and the printable STL. A box's lid (nothing above), the test block's steps (low, much above) and the
+# marker part's top (44 mm high, little above) are none.
+LAYER_BAND_MM = 2.0  # height bands of the histogram (a layer is a band and its neighbours: +-2 mm)
+LAYER_MIN_CM2, LAYER_MIN_SHARE = 100.0, 0.10  # a layer covers this much and holds this share of the object's points
+LAYER_FOOTPRINT = 0.25  # what stands on it covers at most this share of the layer's area
+LAYER_THIN = 1 / 3  # its height above the base is at most this share of the height of what stands on it
+LAYER_CELL_POINTS = 3  # footprints count FOOTPRINT_CELL_MM cells holding this many points (stray points: none;
+# on the board scan the hand covered 226 cm2 counting every cell, 138 with this, the board 723 / 700)
 BALL_MAX = 2.0
 SAME_PLANE_DEG, SAME_PLANE_MM = 5.0, 5.0
 OBJECT_ABOVE_MM = 3.0
@@ -113,6 +125,7 @@ class Scene:
         self.votes, self.seen_frames = [], 0
         self.axis, self.radius, self.top = None, None, None  # object cylinder, region frame (mm)
         self.prefer_piece = False  # the viewer's aim chose the object: tracking's piece before the view centre's
+        self.lifted_mm = 0.0  # the base lifted this far onto a stacked support after Stop (lift_base)
         self.ball = None  # (centre, radius, start radius) while no base is known, region frame (mm)
         self.late_plane = False  # the plane was settled after objects had been merged
         self.off_centre = 0  # frames whose view centre missed the object (masks fell back to the core)
@@ -323,7 +336,7 @@ class Scene:
         """The kept plane and region, as plain JSON values."""
         listed = lambda v: None if v is None else np.asarray(v).tolist()
         return {"mode": self.mode, "plane": None if self.plane is None else [listed(self.plane[0]), self.plane[1]],
-                "axis": listed(self.axis), "radius": self.radius, "top": self.top,
+                "axis": listed(self.axis), "radius": self.radius, "top": self.top, "lifted_mm": self.lifted_mm,
                 "ball": None if self.ball is None else [listed(self.ball[0]), self.ball[1], self.ball[2]]}
 
     def load(self, state):
@@ -333,6 +346,46 @@ class Scene:
             self.axis, self.radius, self.top = np.array(state["axis"]), state["radius"], state["top"]
         if state.get("ball") is not None:
             self.ball = (np.array(state["ball"][0]), state["ball"][1], state["ball"][2])
+        self.lifted_mm = float(state.get("lifted_mm", 0.0))
+
+    def lift_base(self, pts):
+        """After Stop: move the base up onto a support stacked on it (LAYER_*), from the object's points (region
+        frame, mm), the highest such layer; returns how far (mm), or None. The plane, the axis on it and the
+        region's top move with it; lifted_mm keeps how far, so a scan kept with its base still shows everything
+        above the base as voted (Scanner.output_mask, trim_table)."""
+        if self.mode != "still" or self.plane is None or self.axis is None or len(pts) < 1000:
+            return None
+        n, c = self.plane
+        h = pts @ n + c
+        up = h > OBJECT_ABOVE_MM
+        pts, h = pts[up], h[up]
+        if len(h) < 1000:
+            return None
+        a = np.cross(n, [1.0, 0, 0] if abs(n[0]) < 0.9 else [0, 1.0, 0])
+        a /= np.linalg.norm(a)
+        flat = np.c_[pts @ a, pts @ np.cross(n, a)]
+        def area(m):
+            _, count = np.unique(np.floor(flat[m] / FOOTPRINT_CELL_MM).astype(np.int64) @ np.array([1, 1_000_003]),
+                                 return_counts=True)
+            return (count >= LAYER_CELL_POINTS).sum() * FOOTPRINT_CELL_MM ** 2 / 100
+        counts, edges = np.histogram(h, np.arange(OBJECT_ABOVE_MM, h.max() + LAYER_BAND_MM, LAYER_BAND_MM))
+        for k in np.argsort(-edges[:-1]):  # the highest layer first
+            if counts[k] < LAYER_MIN_SHARE * len(h):
+                continue
+            layer = np.abs(h - (edges[k] + LAYER_BAND_MM / 2)) <= LAYER_BAND_MM
+            height = float(np.median(h[layer]))
+            above = h > height + LAYER_BAND_MM + 3.0
+            if above.sum() < 200 or height > LAYER_THIN * (np.percentile(h[above], 99) - height):
+                continue
+            layer_cm2 = area(layer)
+            if layer_cm2 < LAYER_MIN_CM2 or area(above) > LAYER_FOOTPRINT * layer_cm2:
+                continue
+            self.plane = (n, c - height)
+            self.axis = self.axis + height * n
+            self.top -= height
+            self.lifted_mm += height
+            return height
+        return None
 
     def cover(self, pts):
         """Grow the region (or the ball) to take in object points (region frame, mm) that other parts of the scan

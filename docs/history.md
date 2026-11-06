@@ -1286,3 +1286,27 @@ cubes on the GPU; the CPU keeps the 6x6 solve, markers, base votes, pose graph, 
     2-3% of marker frames with HEAD, 6-16% at the higher rate.
   - The harness's first runs hung at "saving": it had no __main__ guard, so the spawned worker ran the harness
     again (the known pitfall). And closing the user's viewer by signal reset the scanner into close range.
+  - F5, the base onto a support (Scene.lift_base after Stop). On the dev scene's scan the voted base was the white
+    platform (seen from above); the object's points above it held a flat layer at 22-26 mm, the board on its pad:
+    723 cm2, 26% of the points, the hand on it covering 138 cm2 counting only cells of 3+ points (226 with every
+    cell: stray points). Lifted 24.9 mm: output 625,586 -> 318,624 points with the base removed (625,585 with
+    Keep base), mesh 1.15M -> 483k triangles, the hand and its stand with a flat bottom (195 mm; the closed solid
+    198 mm). Synthetic checks: a board under a tall object lifted; a stepped block, a flat-topped part with
+    bosses and a lone box not.
+  - F7, odd markers: a solve failed only by one or two markers, on a shape that pins the pose (degeneracy >= 4 x
+    DEGENERATE), is solved again without them. The still scans' failure could not be reproduced after dusk (no
+    marker found any more). On the datasets it acts only on GPU platform: 4 re-solves (that recording has no
+    real markers), marker scatter 2.63 -> 2.38 mm, 498 -> 497 tracked, correction 0.27 -> 0.37 mm.
+  - F6: devplatform (20261105-190442) in evaluate. GPU: 1368 of 1372 tracked, one piece, base lifted 23.8 mm,
+    320k points, 361 loops, correction 0.31 mm.
+  - Join gate (2026-11-06): on the CPU tracker devplatform went on in a second piece at frame 610 (the pass
+    from above), joined by shape at fitness 0.433 / 1.44 mm: the hand doubled (its footprint 156 -> 329 cm2) and
+    the base was not lifted. Twelve RANSAC seeds gave no trustworthy join either (best 0.75 / 1.16 mm, the
+    candidates 96-642 mm apart). Pieces now join only at fitness >= 0.6 and rmse <= 1.0 mm (the right joins
+    measured: 0.72-0.99, 0.68-0.83 mm). CPU devplatform: piece 2 left out, 607 of 1372 tracked, base lifted
+    24.9 mm, doubled 0.0096 -> 0.0041. handgap unchanged (joins at 0.72 / 0.83 mm, 366 tracked).
+  - Evaluate, all datasets (f-gpu 20261105-203248, f-cpu -203250, f7check-gpu 20261106-082732, joingate-cpu
+    20261106-083850): everything else identical to the u34 / u34b runs.
+  - F4, worker speed (bench stage table on hand2, the code before the scan UX d1b0a88 vs now, alternating three
+    times, quiet desktop): feed 51.8-53.8 ms against 51.5-56.1; no stage measurably slower; the unlisted
+    bookkeeping (colour learning at keyframes, pieces, aim) +0.8 ms a frame (9.0 -> 10.4 median), under 2%.

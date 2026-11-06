@@ -777,3 +777,56 @@ def test_a_platform_scan_knows_the_axis_it_turned_about():
     sc.object_turns = True
     found = sc.turn_axis()
     assert found is not None and found @ axis > 0.9999
+
+
+def _surface_points(boxes, step=2.0):
+    """Points every `step` mm on the top and the four sides of boxes (x0, x1, y0, y1, z0, z1), z up from the
+    base (z = 0), as a scan's keyframes would hold them, several views deep (each point thrice)."""
+    out = []
+    for x0, x1, y0, y1, z0, z1 in boxes:
+        xs, ys, zs = np.arange(x0, x1 + 1e-9, step), np.arange(y0, y1 + 1e-9, step), np.arange(z0, z1 + 1e-9, step)
+        gx, gy = np.meshgrid(xs, ys)
+        out.append(np.c_[gx.ravel(), gy.ravel(), np.full(gx.size, z1)])
+        for x in (x0, x1):
+            gy, gz = np.meshgrid(ys, zs)
+            out.append(np.c_[np.full(gy.size, x), gy.ravel(), gz.ravel()])
+        for y in (y0, y1):
+            gx, gz = np.meshgrid(xs, zs)
+            out.append(np.c_[gx.ravel(), np.full(gx.size, y), gz.ravel()])
+    return np.tile(np.concatenate(out), (3, 1))
+
+
+def test_the_base_is_lifted_onto_a_board_the_object_stands_on_and_nowhere_else():
+    """lift_base (after Stop): a 300 x 200 mm board 24 mm high under a 200 mm tall object of 60 x 60 mm (the dark
+    hand on the calibration board, 2026-11-05) moves the base onto the board; a stepped block, a flat-topped part
+    with small bosses and a lone box keep their base."""
+    from tribuutscan import scene as sc
+
+    def lifted(boxes):
+        s = sc.Scene("still")
+        s.plane = (np.array([0.0, 0.0, 1.0]), 0.0)  # z up, the base at z = 0
+        s.axis, s.radius, s.top = np.zeros(3), 300.0, 260.0
+        return s, s.lift_base(_surface_points(boxes))
+
+    s, h = lifted([(-150, 150, -100, 100, 0, 24), (-30, 30, -30, 30, 24, 224)])  # board, and a tall object on it
+    assert h is not None and abs(h - 24) < 1.5
+    assert abs(s.plane[1] + h) < 1e-9 and abs(s.axis[2] - h) < 1e-9 and abs(s.top - (260 - h)) < 1e-9
+    assert s.lifted_mm == h and sc.Scene("still").lifted_mm == 0.0
+    assert lifted([(-100, 100, -75, 75, 0, 10), (-75, 75, -50, 50, 10, 25)])[1] is None  # a step: much stands on it
+    assert lifted([(-137, 137, -96, 96, 0, 44), (-20, -10, -5, 5, 44, 49), (30, 40, 10, 20, 44, 49)])[1] is None  # thick
+    assert lifted([(-50, 50, -50, 50, 0, 40)])[1] is None  # a box: nothing on its lid
+
+
+def test_one_odd_marker_does_not_fail_a_pose_the_shape_pins():
+    """A solve failed only by its marker residual, with one or two markers, on a shape that pins the pose
+    (degeneracy 0.037: the still scans of 2026-11-05, a spurious marker on the board's pattern) is solved again
+    without them; a flat face that may slide (degeneracy under track.DEGENERATE) is still refused by its markers,
+    and so is a pose that three markers disagree with."""
+    s = cl.Scanner("small", log=lambda m: None)
+    xyz = np.c_[np.zeros((100, 2)), np.full(100, 330.0)]
+    info = {"fitness": 0.99, "rmse_mm": 0.11, "degeneracy": 0.037, "markers_used": 1, "marker_rmse_mm": 4.5}
+    assert not s.solve_ok(info, xyz) and s.odd_markers(info, xyz)
+    assert not s.odd_markers(dict(info, degeneracy=0.004), xyz)  # a flat face: the markers' word stands
+    assert not s.odd_markers(dict(info, markers_used=3), xyz)
+    assert not s.odd_markers(dict(info, marker_rmse_mm=1.5), xyz)  # (the markers agree: nothing odd)
+    assert not s.odd_markers(dict(info, fitness=0.2), xyz)  # the shape does not hold either

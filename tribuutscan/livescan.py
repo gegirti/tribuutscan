@@ -273,6 +273,7 @@ def run(commands, replies, port=view3d.PORT):
                         optimise.join_pieces(source.scanner, log=lambda m: replies.put(("log", m)))
                     except ImportError:
                         pass
+                source.scanner.settle_base()  # (the base onto a support the object stands on)
                 path, kept = source.scanner.save(out_dir)
                 source.name = out_dir.name
                 source.phase = "optimising"
