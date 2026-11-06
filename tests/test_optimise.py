@@ -99,3 +99,81 @@ def test_scan_pieces_are_joined_into_one_world_and_a_crumb_is_left_out():
     assert s.left_pieces[0]["piece"] == 3 and len(s.left_pieces[0]["xyz"])
     assert [p["joined"] for p in s.pieces] == [True, True, False] and len(s.piece_joins) == 1
     assert optimise.join_pieces(s, log=lambda m: None) is None  # joined once
+
+
+def box_faces(rng, n=2500):
+    """A box's faces (mm): top z 25, sides x +-40, y +-30, and a step on the top."""
+    return [np.c_[rng.uniform(-40, 40, n), rng.uniform(-30, 30, n), np.full(n, 25.0)],
+            np.c_[np.full(n, 40.0), rng.uniform(-30, 30, n), rng.uniform(-25, 25, n)],
+            np.c_[rng.uniform(-40, 40, n), np.full(n, 30.0), rng.uniform(-25, 25, n)],
+            np.c_[np.full(n, -40.0), rng.uniform(-30, 30, n), rng.uniform(-25, 25, n)],
+            np.c_[rng.uniform(-40, 40, n), np.full(n, -30.0), rng.uniform(-25, 25, n)],
+            np.c_[rng.uniform(-15, 5, 800), rng.uniform(-10, 10, 800), np.full(800, 40.0)],
+            np.c_[np.full(800, 5.0), rng.uniform(-10, 10, 800), rng.uniform(25, 40, 800)]]
+
+
+def test_a_join_is_judged_both_ways():
+    """A piece that saw much more of the object than the one it joins (the 2026-11-06 scan's 45 degree pass against
+    the level view) fails the gate onto it, as the share of its points that find a partner is small; the other
+    way the first lies on it whole. join_solve takes that, inverted. The box seen from one side also fits turned
+    180 degrees (the other way passes there too): with both candidates passing, join_pick refuses the join."""
+    if optimise is None:
+        return
+    rng = np.random.default_rng(5)
+    faces = box_faces(rng)
+    seen_first = np.concatenate([faces[0], faces[2], faces[5], faces[6]])  # the top, one side, the step
+    seen_more = np.concatenate(faces + [faces[1] + [120.0, 0, 0]])  # every face, and a second box beside it
+    off = track.exp_se3(np.r_[0.0, np.radians(2), np.radians(3), 0.004, -0.003, 0.002])  # piece 2's world -> 1's
+    src = (seen_more - off[:3, 3] * 1000) @ off[:3, :3]  # (as piece 2 has it)
+    ls, ld = track.levels(src / 1000), track.levels(seen_first / 1000)
+    start = off @ track.exp_se3(np.r_[np.radians(0.5), 0.0, 0.0, 0.001, 0.001, 0.0])  # a candidate, a little off
+    _, one_way = track.solve(ls, ld, start)
+    assert not optimise.join_ok(one_way) and one_way["fitness"] < optimise.JOIN_MIN_FITNESS
+    t, info, back = optimise.join_solve(ls, ld, start)
+    assert back and optimise.join_ok(info)
+    moved = src @ t[:3, :3].T + t[:3, 3] * 1000
+    assert np.abs(moved - seen_more).max() < 1.0  # piece 2's points where they truly are
+    right = (t, info, "shape", back)
+    turned = optimise.join_solve(ls, ld, off @ track.exp_se3(np.r_[0.0, 0.0, np.pi, 0.0, 0.0, 0.0]))
+    assert turned is not None and np.abs(src @ turned[0][:3, :3].T + turned[0][:3, 3] * 1000 - seen_more).max() > 50
+    assert optimise.join_pick([right], src) is right
+    assert optimise.join_pick([right, (*turned[:2], "features", turned[2])], src) is None
+    nudged = (track.exp_se3(np.r_[0.0, 0.0, np.radians(1), 0.002, 0.0, 0.0]) @ t, dict(info, fitness=0.5), "shape", True)
+    assert optimise.join_pick([right, nudged], src) is right  # (within JOIN_AGREE: the best one)
+
+
+def test_the_scan_takes_its_base_from_a_joined_piece():
+    """The scan's own piece never found a base (level at long range: no depth on the board); a piece that joins it
+    did. join_pieces moves that piece's base and region into the scan's world (Scene.adopt_base): the table at the
+    same height, the region round the object, then grown over what the pieces saw."""
+    if optimise is None:
+        return
+    from tribuutscan import cloud as cl
+    from tribuutscan.scene import Scene
+    rng = np.random.default_rng(4)
+    shape = np.concatenate(box_faces(rng)[:3] + box_faces(rng)[5:])
+    to_cam = lambda pose, pts: (pts - pose[:3, 3] * 1000) @ pose[:3, :3]
+    off = track.exp_se3(np.r_[0.0, 0.0, np.radians(12), 0.020, -0.008, 0.004])  # piece 2's world -> piece 1's
+    s = cl.Scanner("small", log=lambda m: None)
+    s.pieces = [{"first_index": 0}, {"first_index": 20}]
+    s.piece_maps = [type(s.marker_map)(add_mm=3.0)]
+    second = Scene("still")  # the table at z = -25 (h = z + 25) in the true world, as piece 2 saw it
+    r, t = off[:3, :3], off[:3, 3] * 1000
+    second.plane = (r.T @ [0, 0, 1.0], 25.0 + np.array([0, 0, 1.0]) @ t)
+    second.axis, second.radius, second.top = r.T @ (np.array([0, 0, -25.0]) - t), 60.0, 70.0
+    s.piece_scenes = [s.scene]
+    s.scene = second
+    for i, a in [(i, np.radians(10 * i)) for i in range(10)] + [(20 + i, np.radians(40 + 10 * i)) for i in range(10)]:
+        true = look_at(np.array([250 * np.cos(a), 250 * np.sin(a), 150.0]))
+        pose = true if i < 20 else np.linalg.inv(off) @ true
+        pts = to_cam(true, shape)
+        s.keyframes.append((i, pose, pts, None, np.zeros((0, 3))))
+        s.poses.append((i, pose))
+        s.merged_data[i] = (pts.astype(np.float32), np.zeros((len(pts), 3), np.uint8), np.zeros((len(pts), 3), np.float32))
+        s.track_log.append((i, "tracked", pose))
+    report = optimise.join_pieces(s, log=lambda m: None)
+    assert report["joined"][2] and report["base_from"] == 2
+    n, c = s.scene.plane
+    assert np.degrees(np.arccos(min(1.0, n @ [0, 0, 1.0]))) < 1.0 and abs(c - 25.0) < 1.5
+    assert np.linalg.norm(s.scene.axis[:2]) < 2.0 and abs(s.scene.axis[2] + 25.0) < 1.5
+    assert s.scene.radius >= 60.0 and s.scene.top >= 65.0  # (grown over the box: its corners lie 50 mm out)

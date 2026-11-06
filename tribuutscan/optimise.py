@@ -31,13 +31,16 @@ SHARED_MARKER_MM = 6.0  # markers within this distance (world, current poses) ar
 LOOP_FITNESS, LOOP_RMSE_MM, LOOP_MARKER_MM = 0.3, 1.5, 2.0
 PREFERENCE = 2.0
 ROT_SIGMA_DEG, POS_SIGMA_MM = 0.5, 1.0  # per edge, for the information matrices
+JOIN_SHAPE_SEEDS = 2  # shape candidates (RANSAC seeds) per join: two independent starts for join_pick to compare
+JOIN_AGREE_MM, JOIN_AGREE_DEG = 10.0, 5.0  # passing join candidates further apart than this: ambiguous (join_pick)
 JOIN_KEYFRAMES = 12  # a scan piece's keyframes compared by ORB with each joined piece's (spread over both)
 JOIN_ORB_TRIES = 4  # ...the pairs with the most matches tried
 JOIN_GRID_MM = 2.0  # pieces' object points thinned to this grid for the join's checks
 JOIN_MIN_FITNESS, JOIN_MAX_RMSE_MM = 0.6, 1.0  # a join must fit this well (session.accept, 0.3 / 2 mm, is for whole
-# scans). Joins measured right: fitness 0.72-0.99, rmse 0.68-0.83 mm (handgap, the synthetic test); on 2026-11-06 the
-# dev scene's second piece (CPU tracker, the pass from above) joined by shape at 0.43 / 1.44 mm, doubled the hand
-# and stopped its base from being lifted: left out now (piece-2.ply) rather than doubled
+# scans), one way or the other (join_solve). Joins measured right: fitness 0.72-0.99, rmse 0.68-0.83 mm (handgap, the
+# synthetic test); on 2026-11-06 the dev scene's second piece (CPU tracker, the pass from above) joined by shape at
+# 0.43 / 1.44 mm, doubled the hand and stopped its base from being lifted: left out now (piece-2.ply) rather than
+# doubled (the other way 0.22 / 1.37 mm)
 
 
 def relative(a, b):
@@ -191,10 +194,52 @@ def join_candidates(scanner, groups, k, placed, maps):
             out.append((tb @ kb[1] @ found @ np.linalg.inv(ka[1]), "features"))
     src = piece_points(groups[k])
     dst = np.concatenate([piece_points(groups[j]) @ placed[j][:3, :3].T + placed[j][:3, 3] * 1000 for j in placed])
-    found = session.shape_pose(src, dst)
-    if found is not None:
-        out.append((found, "shape"))
+    if len(src) >= 200 and len(dst) >= 200:  # (session.shape_pose's minimum)
+        fs, fd = session.shape_features(src), session.shape_features(dst)
+        for seed in range(JOIN_SHAPE_SEEDS):
+            found = session.shape_match(fs, fd, seed)
+            if found is not None:
+                out.append((found, "shape"))
     return out, src, dst
+
+
+def join_pick(passing, pts):
+    """The join to take from the candidates that passed (transform, info, kind, back), the best fitting, or None
+    when two of them disagree by more than JOIN_AGREE_MM at the piece's middle (`pts`, its world mm) or
+    JOIN_AGREE_DEG: a view that fits in two places (a symmetric box seen from one side, turned 180 degrees) is
+    left out rather than perhaps doubled."""
+    if not passing:
+        return None
+    best = max(passing, key=lambda p: p[1]["fitness"])
+    c = pts.mean(0) / 1000
+    for other in passing:
+        apart = np.linalg.inv(best[0]) @ other[0]
+        if np.linalg.norm(apart[:3, :3] @ c + apart[:3, 3] - c) * 1000 > JOIN_AGREE_MM \
+                or np.degrees(np.arccos(np.clip((np.trace(apart[:3, :3]) - 1) / 2, -1, 1))) > JOIN_AGREE_DEG:
+            return None
+    return best
+
+
+def join_ok(info):
+    """Does a join's solve pass the gate: JOIN_MIN_FITNESS, JOIN_MAX_RMSE_MM, and markers or a shape that pins it?"""
+    return info["fitness"] >= JOIN_MIN_FITNESS and info["rmse_mm"] is not None and info["rmse_mm"] <= JOIN_MAX_RMSE_MM \
+        and bool(info["markers_used"] or (info["degeneracy"] or 0) >= track.DEGENERATE)
+
+
+def join_solve(src_levels, dst_levels, start):
+    """A join candidate (start: the piece's world -> the joined world, metres) refined by the joint solve: the piece
+    onto the pieces placed so far, and when that fails the gate (join_ok), they onto the piece, from the inverse.
+    (transform piece -> joined, info, "back" if it passed the other way) or None. The fitness is the share of the
+    moved points that find a partner, so a piece that saw much more of the object than the others fails it one way
+    although they lie on it: the 2026-11-06 scan's 45 degree pass, 0.306 at 1.06 mm one way, 0.981 at 0.77 mm the
+    other."""
+    t, info = track.solve(src_levels, dst_levels, start)
+    if join_ok(info):
+        return t, info, False
+    back, info = track.solve(dst_levels, src_levels, np.linalg.inv(t))
+    if join_ok(info):
+        return np.linalg.inv(back), info, True
+    return None
 
 
 def join_pieces(scanner, log=print):
@@ -228,17 +273,15 @@ def join_pieces(scanner, log=print):
             best = None
             if len(src) >= 200 and len(dst) >= 200:
                 ls, ld = track.levels(src / 1000), track.levels(dst / 1000)
-                for start, kind in candidates:
-                    t, info = track.solve(ls, ld, start)
-                    good = info["fitness"] >= JOIN_MIN_FITNESS and info["rmse_mm"] is not None \
-                        and info["rmse_mm"] <= JOIN_MAX_RMSE_MM
-                    if good and (info["markers_used"] or (info["degeneracy"] or 0) >= track.DEGENERATE) \
-                            and (best is None or info["fitness"] > best[1]["fitness"]):
-                        best = (t, info, kind)
+                passing = [(found[0], found[1], kind, found[2]) for start, kind in candidates
+                           if (found := join_solve(ls, ld, start)) is not None]
+                best = join_pick(passing, src)
+                if best is None and passing:
+                    log(f"piece {k + 1}: its join candidates disagree (it fits in more than one place)")
             if best is None:
                 continue
             placed[k], how[k] = best[0], {"by": best[2], "fitness": round(best[1]["fitness"], 3),
-                                          "rmse_mm": round(best[1]["rmse_mm"], 3)}
+                                          "rmse_mm": round(best[1]["rmse_mm"], 3), "back": best[3]}
             waiting.remove(k)
             progress = True
             mine = np.array([(best[0] @ kf[1])[:3, 3] for kf in groups[k]])  # the join's edge in the pose graph:
@@ -249,8 +292,14 @@ def join_pieces(scanner, log=print):
             joins.append((groups[k][a][0], others[b][0][0]))
     left = [k for k in range(len(pieces)) if k not in placed]
     scene = scanner.scene_of(pieces[anchor]["first_index"])
+    based = [k for k in placed if k != anchor and scanner.scene_of(pieces[k]["first_index"]).plane is not None
+             and scanner.scene_of(pieces[k]["first_index"]).axis is not None]
+    adopted = None
+    if scene.mode == "still" and scene.plane is None and based:  # the scan's own piece never found the base (level
+        adopted = max(based, key=lambda k: len(groups[k]))  # at long range the board gives no depth): a joined one's
+        scene.adopt_base(scanner.scene_of(pieces[adopted]["first_index"]), placed[adopted])
     for k, t in placed.items():  # the scan's region takes in what the joined pieces saw of the object
-        if k != anchor:
+        if k != anchor or adopted is not None:
             scene.cover(piece_points(groups[k]) @ t[:3, :3].T + t[:3, 3] * 1000)
     for k, t in placed.items():  # every joined piece's frames into the scan's world
         if k == anchor:
@@ -267,9 +316,11 @@ def join_pieces(scanner, log=print):
         p["joined"] = k in placed
     scanner.remerge({})
     report = {"pieces": len(pieces), "anchor": anchor + 1, "joined": {k + 1: how[k] for k in how},
-              "left_out": [k + 1 for k in left]}
+              "left_out": [k + 1 for k in left], "base_from": None if adopted is None else adopted + 1}
     log(f"pieces: {len(placed)} of {len(pieces)} in one world" + (f", {len(left)} left out" if left else "")
-        + "".join(f"; piece {k + 1} by {h['by']} (fitness {h['fitness']}, {h['rmse_mm']} mm)" for k, h in how.items()))
+        + "".join(f"; piece {k + 1} by {h['by']} (fitness {h['fitness']}, {h['rmse_mm']} mm"
+                  + (", the others onto it" if h["back"] else "") + ")" for k, h in how.items())
+        + (f"; the base as piece {adopted + 1} found it" if adopted is not None else ""))
     return report
 
 

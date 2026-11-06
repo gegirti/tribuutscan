@@ -387,6 +387,17 @@ class Scene:
             return height
         return None
 
+    def adopt_base(self, other, transform):
+        """Take another scene's base and region while this one has none: a joined piece's (optimise.join_pieces),
+        moved into this scene's world by `transform` (4x4 in metres, the other's world -> this one). Heights stay as
+        they were; `cover` then grows the region over what the other pieces saw. The 2026-11-06 dev scan: level at
+        long range the board and the platform gave no depth, and only its 45 degree pass found the base."""
+        r, t = transform[:3, :3], transform[:3, 3] * 1000
+        n = r @ other.plane[0]
+        self.plane = (n, float(other.plane[1] - n @ t))
+        self.axis = r @ other.axis + t
+        self.radius, self.top = float(other.radius), float(other.top)
+
     def cover(self, pts):
         """Grow the region (or the ball) to take in object points (region frame, mm) that other parts of the scan
         saw: the pieces joined into this scene's world (optimise.join_pieces), whose sides it may never have
