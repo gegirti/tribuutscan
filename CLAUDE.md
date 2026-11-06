@@ -572,8 +572,8 @@ point sets: use `compare.SEEDS = 12`, and the same transform for clouds that sha
     process lifts the flag around its start only (`_config["daemon"]`), and falls back to a thread.
   - An orphaned worker once held port 8765: the worker exits when its viewer dies.
 - uv: plain `uv sync` removes the extras; use `uv sync --all-extras`. `python-preference = only-system`
-  keeps .venv on the system interpreter the viewer runs on. The pip-built venv the user had before sits
-  in ../tribuutscan-venv-pip-backup until a real scan has run on the new one.
+  keeps .venv on the system interpreter the viewer runs on. The old pip-built venv was deleted on
+  2026-11-06, after live scans had run on the uv one.
 - Automatic colour/depth registration by edge correlation did not converge on a flat shelf scene
   of dark boxes; a calibration target or marker is the right way, not more tuning.
 - Hand-held distance readings (about +-1-2 cm) cannot tell `a/z+b` from `a/z^2+b`. A fixed rig is
