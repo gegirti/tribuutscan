@@ -556,8 +556,9 @@ point sets: use `compare.SEEDS = 12`, and the same transform for clouds that sha
 - That 8 GB process ran inside VS Code's systemd scope, so the OOM killer's kill made systemd stop the
   whole scope (OOMPolicy=stop) and VS Code died with it. Start heavy jobs from a session in their own
   capped scope: `systemd-run --user --scope -q -p MemoryMax=6G -p MemorySwapMax=2G <cmd>` (it keeps
-  the working directory and environment). Note too that this machine's shells have `.venv` activated, so
-  plain `python3` is the venv: use `/usr/bin/python3` to test without Open3D.
+  the working directory and environment). Terminals no longer activate `.venv` (VS Code's Python
+  terminal activation turned off, 2026-11-06), so `python3` is the system one: call `.venv/bin/python`
+  for scanning code. A shell started before that may still have it active: check `$VIRTUAL_ENV`.
 - Spawned processes (the live worker, the merge process):
   - A spawned process inherits the parent's `sys.path`. The worker puts its own site-packages first
     (livescan.run), but spawn re-imports the viewer module (numpy at the top) before that. So the worker
