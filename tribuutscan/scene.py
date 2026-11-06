@@ -34,6 +34,10 @@ VOTE_FRAMES, VOTES_NEEDED = 5, 3  # 3 votes must agree; found after VOTE_FRAMES 
 VOTE_LIMIT, VOTE_LATE_EVERY = 300, 10  # frames to look for the base on every frame; after that, while none is
     # known, every 10th (a platform's top shows depth only once the scanner looks down at it, and turning with the
     # object it is a fixed plane in the object's frame: the fourth platform scan looked down after frame 1000)
+VOTE_NEW_VIEW_DEG, VOTE_WINDOW = 25.0, 100  # ...except for VOTE_WINDOW frames after the view turns this far from
+    # every view such a window began at: on 2026-11-06 the dev scan looked level for 2100 frames (the board gives
+    # no depth then) before a pass from 45 degrees; voting every 10th frame there gave 4-6 votes in 1000 frames
+    # (the platform and the board 24 mm above it by turns) and three never agreed: no base
 # The base may be a thin rim around an object that fills the view: on the marker part the table was
 # 7-9% of the points and 55-151 cm2, under the 10% / 80 cm2 that tracking's per-frame plane test uses.
 # Votes must agree in world coordinates, which a slice through a curved surface does not do.
@@ -123,6 +127,7 @@ class Scene:
         self.mode, self.rng = mode, rng or np.random.default_rng(0)
         self.plane = None  # (n, c): n points up out of the table, in the region frame
         self.votes, self.seen_frames = [], 0
+        self.vote_views, self.vote_until = [], 0  # view directions (region frame) vote windows began at; window end
         self.axis, self.radius, self.top = None, None, None  # object cylinder, region frame (mm)
         self.prefer_piece = False  # the viewer's aim chose the object: tracking's piece before the view centre's
         self.lifted_mm = 0.0  # the base lifted this far onto a stacked support after Stop (lift_base)
@@ -137,7 +142,11 @@ class Scene:
         if self.mode == "free" or self.plane is not None:
             return
         self.seen_frames += 1
-        if self.seen_frames > VOTE_LIMIT and self.seen_frames % VOTE_LATE_EVERY:
+        view = cam_to_region[:3, 2]  # (where the camera looks, region frame)
+        if all(view @ v < np.cos(np.radians(VOTE_NEW_VIEW_DEG)) for v in self.vote_views):  # a new direction
+            self.vote_views.append(view.copy())
+            self.vote_until = self.seen_frames + VOTE_WINDOW - 1  # (this frame is the window's first)
+        if self.seen_frames > max(VOTE_LIMIT, self.vote_until) and self.seen_frames % VOTE_LATE_EVERY:
             return
         found = cl.support_plane(xyz_cam, self.rng, pix, shape, tries=BASE_TRIES, min_share=BASE_MIN_SHARE,
                                  min_cm2=BASE_MIN_CM2, accept=lambda n, c: stands_on(xyz_cam, pix, shape, n, c, tracked,

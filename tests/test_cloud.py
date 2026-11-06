@@ -892,3 +892,33 @@ def test_a_click_is_taken_at_the_point_nearest_it():
     s.pick("colour", (cx[42], cy[42]))
     assert s.take_pick(8, xyz, pix) == (pix[42, 0], pix[42, 1]) and s.take_pick(9, xyz, pix) is None
     assert s.stats["picks"] == 2
+
+
+def test_a_new_view_votes_for_the_base_on_every_frame_again():
+    """While no base is known, votes come on every frame for VOTE_LIMIT frames, then on every 10th; a view turned
+    VOTE_NEW_VIEW_DEG from every view a window began at votes on every frame again for VOTE_WINDOW frames (a scan
+    level for minutes before a pass from 45 degrees, which is when the base first shows depth). Turning back to
+    a view seen before opens none."""
+    from tribuutscan import scene as sc
+    calls = []
+    real = sc.cl.support_plane
+    sc.cl.support_plane = lambda *a, **k: calls.append(1)  # (finds nothing: no base)
+    try:
+        s = sc.Scene("still")
+        xyz, pix = np.zeros((10, 3)), np.zeros((10, 2))
+        level, down = np.eye(4), np.eye(4)
+        a = np.radians(sc.VOTE_NEW_VIEW_DEG + 5)
+        down[:3, :3] = [[1, 0, 0], [0, np.cos(a), -np.sin(a)], [0, np.sin(a), np.cos(a)]]
+
+        def frames(n, pose):
+            before = len(calls)
+            for _ in range(n):
+                s.observe(xyz, pix, (800, 1280), pose)
+            return len(calls) - before
+        assert frames(sc.VOTE_LIMIT, level) == sc.VOTE_LIMIT
+        assert frames(200, level) == 200 // sc.VOTE_LATE_EVERY
+        assert frames(sc.VOTE_WINDOW, down) == sc.VOTE_WINDOW  # a new direction: every frame again
+        assert frames(200, down) == 200 // sc.VOTE_LATE_EVERY
+        assert frames(200, level) == 200 // sc.VOTE_LATE_EVERY  # (seen before)
+    finally:
+        sc.cl.support_plane = real
