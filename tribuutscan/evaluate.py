@@ -60,6 +60,10 @@ DATASETS = {  # name: (path or glob under captures/, notes, scan mode)
                     "the calibration board on a pad on the white platform, turned by hand, the scanner standing; long "
                     "range ~32 cm, picked by a click (aim); the room behind with two more hands; base: the platform "
                     "from above, lifted onto the board after Stop", "still"),
+    "devaway": ("20261106-100039-scan/*-rec", "the dev scene again (2026-11-06), long range, picked by a click: the "
+                "dark hand held still 88 s, then looking away twice (the shelf, the wall, the floor) and back, then a "
+                "pass ~45 degrees down that finds the base; live it went on in 10 pieces (boxes among them) and the "
+                "45 degree pass was left out", "still"),
 }
 GAPS = {  # name: (dataset, frames left out): a stretch skipped as if tracking had been lost while the scanner moved
     "markersgap": ("markers", range(250, 330)),
@@ -108,11 +112,11 @@ TRACKERS = {  # name: Scanner options (the scan mode comes from the dataset)
 }  # (the earlier variants, baseline to gpu-noverify, went in Phase 6: docs/history.md has their numbers)
 
 
-def make_scanner(tracker, preset, mode, aim=None):
+def make_scanner(tracker, preset, mode, aim=None, picks=None):
     options = dict(mode=mode, **TRACKERS[tracker]) if tracker in TRACKERS else None
     if options is None:
         raise ValueError(f"unknown tracker {tracker}; one of {list(TRACKERS)}")
-    return cl.Scanner(preset, log=lambda m: None, aim=aim, **options)
+    return cl.Scanner(preset, log=lambda m: None, aim=aim, picks=picks, **options)
 
 
 def run(name, tracker="current", preset="small", live_markers=False, optimise_after=False, mesh=False):
@@ -189,7 +193,7 @@ def _run(name, tracker, preset, live_markers, optimise_after, mesh=False):
     directory = dataset_path(name)
     base, gap = GAPS.get(name, (name, range(0)))
     found = cached_markers(base, directory)
-    scanner = make_scanner(tracker, preset, DATASETS[name][2], cl.recording_aim(directory))
+    scanner = make_scanner(tracker, preset, DATASETS[name][2], cl.recording_aim(directory), cl.recording_picks(directory))
     sightings, elapsed, n = [], 0.0, 0
     for i, frame in enumerate(fr.read_recording(directory)):
         if i in gap:
@@ -236,7 +240,8 @@ def _run(name, tracker, preset, live_markers, optimise_after, mesh=False):
         "used": round(len(tracked) / max(with_depth, 1), 3),  # tracked of the frames that had depth
         "pieces": len(scanner.pieces), "pieces_joined": sum(1 for p in scanner.pieces if p.get("joined", True)),
         "pieces_report": pieces, "colour_seeded": scanner.stats.get("colour_seeded", 0), "base_lifted_mm": lifted,
-        "odd_markers": scanner.stats.get("odd_markers", 0),
+        "odd_markers": scanner.stats.get("odd_markers", 0), "lost_away": scanner.stats.get("lost_away", 0),
+        "picks": scanner.stats.get("picks", 0), "base_found": scanner.scene.plane is not None,
         "flat_frames": scanner.stats.get("flat", 0),
         "object_turns": scanner.object_turns, "room_votes": dict(scanner.room_votes),
         "shape_refinds": scanner.stats.get("shape_refinds", 0),

@@ -359,3 +359,29 @@ def test_the_feeder_keeps_the_worker_fed_off_the_tk_loop():
     assert all(kind == "frame_done" and raw is not None and raw.startswith(b"d") for kind, _, raw in done)
     assert feeder.stats["sent"] == len(done) and "a second" in feeder.report()
     assert float(np.median(feeder.stats["lag"])) < 0.02  # sent within ~a camera frame of arriving
+
+
+def test_a_click_while_scanning_tells_the_worker_where_the_object_is():
+    """While scanning, a click on the depth or colour preview goes to the worker as a pick in that image's full-size
+    pixels (cloud.Scanner.pick); while optimising it does nothing."""
+    import queue
+
+    class Proc:
+        def is_alive(self):
+            return True
+
+    app = viewer.App.__new__(viewer.App)
+    logged = []
+    app.log = logged.append
+    app.live = {"proc": Proc(), "commands": queue.Queue()}
+    app.scan_state = "scanning"
+    app.aim_click("Depth", viewer.DEPTH_W / 2, 100)
+    app.aim_click("Colour", viewer.SIDE_W / 4, 50)
+    kind, how, uv = app.live["commands"].get_nowait()
+    assert (kind, how) == ("pick", "depth") and np.allclose(uv, (640, 100 * 1280 / viewer.DEPTH_W))
+    kind, how, uv = app.live["commands"].get_nowait()
+    assert (kind, how) == ("pick", "colour") and np.allclose(uv, (320, 50 * 1280 / viewer.SIDE_W))
+    assert logged and logged[0].startswith("picked")
+    app.scan_state = "optimising"
+    app.aim_click("Depth", 10, 10)
+    assert app.live["commands"].empty()

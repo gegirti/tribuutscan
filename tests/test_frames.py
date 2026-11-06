@@ -158,3 +158,23 @@ def test_depth_mode_survives_a_failing_factory_read():
         assert "factory calibration not readable" in logs[-1]
     finally:
         vendor.Channel, calib.note_factory = real_channel, real_note
+
+
+def test_a_scan_recording_keeps_its_clicks_for_replays():
+    """A click while a live scan ran is noted with the index of the next set written (frames.Recorder.note_pick, in
+    order with the sets: livescan.RawCopy); cloud.recording_picks gives them back for Scanner(picks=...)."""
+    from tribuutscan import cloud as cl
+    from tribuutscan.livescan import RawCopy
+    depth = np.zeros((fr.H, fr.W), np.uint16)
+    with tempfile.TemporaryDirectory() as tmp:
+        assert cl.recording_picks(tmp) == {}
+        copy = RawCopy(fr.Recorder(fr.W * 10 // 8, root=tmp))
+        bufs = {"color": bytes(fr.FRAME_BYTES["color"]), "ir": None, "depth": encode_y10(depth)}
+        for t in range(2):
+            copy.put(bufs, {"color": float(t), "depth": float(t)})
+        copy.pick("colour", (640.25, 412.0))
+        copy.put(bufs, {"color": 2.0, "depth": 2.0})
+        copy.pick("depth", (100.0, 50.0))
+        copy.close()
+        assert cl.recording_picks(copy.recorder.dir) == {2: ("colour", (640.2, 412.0)), 3: ("depth", (100.0, 50.0))}
+        assert len(list(fr.read_recording(copy.recorder.dir))) == 3

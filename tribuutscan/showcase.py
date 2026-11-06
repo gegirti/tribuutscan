@@ -30,7 +30,8 @@ def scan_frames(rec, out, every=SCAN_EVERY):
     from . import depth as dp
     from . import frames as fr
     from . import viewer
-    s = cl.Scanner("small", log=lambda m: None, track_with="gpu", live_view=True, aim=cl.recording_aim(rec))
+    s = cl.Scanner("small", log=lambda m: None, track_with="gpu", live_view=True, aim=cl.recording_aim(rec),
+                   picks=cl.recording_picks(rec))
     viewer.found_markers["on"] = False
 
     class Cap:

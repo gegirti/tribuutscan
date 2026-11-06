@@ -830,3 +830,65 @@ def test_one_odd_marker_does_not_fail_a_pose_the_shape_pins():
     assert not s.odd_markers(dict(info, markers_used=3), xyz)
     assert not s.odd_markers(dict(info, marker_rmse_mm=1.5), xyz)  # (the markers agree: nothing odd)
     assert not s.odd_markers(dict(info, fitness=0.2), xyz)  # the shape does not hold either
+
+
+def lump(rng, n, half_mm, z_mm):
+    """n points filling a cube of half side half_mm around (0, 0, z_mm): a piece of a frame, camera mm."""
+    return rng.uniform(-half_mm, half_mm, (n, 3)) + [0.0, 0.0, z_mm]
+
+
+def test_a_lost_frame_is_judged_by_how_much_it_looks_like_the_object():
+    """While lost, a frame's piece is "object" (about the size, points and distance the object had while tracked),
+    "other" (clearly something else: crumbs, a wall, a box far behind) or "unsure" in between; with no look yet,
+    "object" as before. The proportions are the 2026-11-06 dev scan's (the hand at ~36 cm, the shelf, the wall)."""
+    rng = np.random.default_rng(0)
+    s = cl.Scanner("small", log=lambda m: None)
+    assert s.likeness(cl.look_of(lump(rng, 50, 10, 460))) == "object"  # (no look yet)
+    for _ in range(10):
+        s.look.append(cl.look_of(lump(rng, 5000, 70, 360)))
+    assert s.likeness(cl.look_of(lump(rng, 4500, 65, 380))) == "object"
+    assert s.likeness(cl.look_of(lump(rng, 60, 12, 460))) == "other"  # crumbs on the shelf
+    assert s.likeness(cl.look_of(np.c_[rng.uniform(-250, 250, (20000, 2)), np.full(20000, 650.0)])) == "other"  # wall
+    assert s.likeness(cl.look_of(lump(rng, 800, 70, 680))) == "other"  # a box as big, 32 cm further away
+    assert s.likeness(cl.look_of(lump(rng, 1500, 70, 360))) == "unsure"  # the object half out of view
+
+
+def test_only_frames_like_the_object_start_a_new_piece():
+    """Lost frames of something else (or nothing) never start a piece, however long they go on, and each one starts
+    the clock again; PIECE_AFTER_S of frames like the object do, and the new piece is taken where they saw it."""
+    rng = np.random.default_rng(1)
+    s = cl.Scanner("small", log=lambda m: None)
+    s.stats["merged"] = 5
+    hand, shelf = lump(rng, 3000, 60, 360), lump(rng, 3000, 60, 500) + [200.0, 0, 0]
+    s.last_source = shelf.mean(0)  # (where a junk piece once was: not where the new piece is taken)
+    t = 0.0
+    for like in ["other"] * 30 + ["unsure"] * 5 + ["object"] * 5 + ["other"] + ["object"] * 8:  # 0.1 s apart
+        s.lost_long(t, int(t * 10), like, hand)
+        t += 0.1
+    assert len(s.pieces) == 1 and s.lost_since is not None
+    for _ in range(4):
+        s.lost_long(t, int(t * 10), "object", hand)
+        t += 0.1
+    assert len(s.pieces) == 2 and s.pieces[1]["first_index"] == int((t - 0.1) * 10) + 1
+    xyz = np.concatenate([shelf, hand])
+    pix = np.c_[np.arange(len(xyz)) % 1280, np.arange(len(xyz)) // 1280].astype(float)
+    _, at = s.piece_start_seeds({}, xyz, pix)
+    i = int(np.argmin(np.hypot(pix[:, 0] - at[0], pix[:, 1] - at[1])))
+    assert i >= len(shelf)  # on the hand
+
+
+def test_a_click_is_taken_at_the_point_nearest_it():
+    """A click (Scanner.pick, or a replay's planned one at its frame) becomes the depth pixel of the frame's point
+    nearest it: on the depth image directly, on the colour image where the colour camera sees each point."""
+    from tribuutscan.calib import CAMERA
+    rng = np.random.default_rng(2)
+    pix = np.c_[rng.integers(0, 1280, 3000), rng.integers(0, 800, 3000)].astype(float)
+    xyz = np.c_[rng.uniform(-100, 100, (3000, 2)), rng.uniform(300, 400, 3000)]
+    s = cl.Scanner("small", log=lambda m: None, picks={7: ("depth", (500.0, 300.0))})
+    assert s.take_pick(6, xyz, pix) is None
+    u, v = s.take_pick(7, xyz, pix)
+    assert np.hypot(u - 500, v - 300) == np.hypot(pix[:, 0] - 500, pix[:, 1] - 300).min()
+    cx, cy = CAMERA.colour_px(pix[:, 0], pix[:, 1], xyz[:, 2])
+    s.pick("colour", (cx[42], cy[42]))
+    assert s.take_pick(8, xyz, pix) == (pix[42, 0], pix[42, 1]) and s.take_pick(9, xyz, pix) is None
+    assert s.stats["picks"] == 2

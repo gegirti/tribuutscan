@@ -10,12 +10,15 @@ Commands:  ("start", preset, out_dir, keep_raw, continue_from or None, depth mod
            info.json and the scan's session.json
            (tracker: "gpu", the default, which falls back to the CPU solve without a GPU; or "joint")
            | ("frame", yuyv, grey or None, depth_buf, bytesperline, (t_colour, t_ir, t_depth))
+           | ("pick", "depth" | "colour", (u, v))   (a click on that preview, full-size pixel: the object is
+           there, cloud.Scanner.pick; noted in the raw copy's picks.csv)
            | ("stop"[, mesh]) | ("quit",)   (times: camera capture times, seconds; mesh: make the mesh after
            Optimise, fusion on the GPU, so Stop ends with a finished model)
 Replies:   ("ready", url) | ("log", text) | ("optimised", message, a mesh follows) | ("meshed", message)
            | ("frame_done", merged, frames, points, tracking, cue, view, model, t_depth) | ("saved", path, points)
            cue: {"markers": used, "features": ORB start, "flat": shape alone slides, "base": base found,
-                 "turning": the object turns and the scanner stands (Scanner.check_room)}
+                 "turning": the object turns and the scanner stands (Scanner.check_room), "piece": its number,
+                 "away": lost on something else (Scanner.likeness "other", or too little depth)}
            view: what the frame was, at 1/VIEW_STEP of its size (uint8: 0 other, 1 base, 2 object), or None
            model: the live model view of that frame (gpu.preview_codes at 1/gputrack.PREVIEW_STEP: its piece
            against the model built so far), or None without the GPU tracker; t_depth: the frame's depth time
@@ -65,12 +68,19 @@ class RawCopy:
         while (item := self.queue.get()) is not None:
             if self.error is None:
                 try:
-                    self.recorder.write(*item)
+                    if item[0] == "pick":
+                        self.recorder.note_pick(*item[1:])
+                    else:
+                        self.recorder.write(*item[1:])
                 except fr.DiskFull as e:
                     self.error = e
 
     def put(self, bufs, stamps):
-        self.queue.put((bufs, stamps))
+        self.queue.put(("set", bufs, stamps))
+
+    def pick(self, kind, uv):
+        """A click while scanning, noted in order with the frames (frames.Recorder.note_pick)."""
+        self.queue.put(("pick", kind, uv))
 
     def close(self):
         self.queue.put(None)
@@ -261,6 +271,12 @@ def run(commands, replies, port=view3d.PORT):
                          s.view_codes, t_d))
         elif kind == "frame":
             replies.put(("frame_done", 0, 0, 0))
+        elif kind == "pick" and source.scanner is not None:  # a click on the preview: the object is there
+            _, how, uv = cmd
+            with source.lock:
+                source.scanner.pick(how, uv)
+            if recorder is not None:
+                recorder.pick(how, uv)  # (a replay of the raw copy takes it at the same frame)
         elif kind == "stop" and source.scanner is not None:
             if recorder is not None:
                 recorder.close()

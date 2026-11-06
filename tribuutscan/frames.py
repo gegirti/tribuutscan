@@ -219,6 +219,16 @@ class Recorder:
             np.savetxt(self.imu, np.asarray(rows)[:, :9], fmt=IMU_FORMAT, delimiter=",")
             self.imu_rows += len(rows)
 
+    def note_pick(self, kind, uv):
+        """A click on the viewer's preview while a live scan ran (cloud.Scanner.pick): appended to picks.csv as the
+        index of the next set written, kind ("depth" or "colour") and pixel, so a replay takes it at the same frame
+        (cloud.recording_picks). Called from the writing thread, in order with the sets."""
+        path = self.dir / "picks.csv"
+        with open(path, "a") as f:
+            if f.tell() == 0:
+                f.write("index,kind,u,v\n")
+            f.write(f"{self.count},{kind},{uv[0]:.1f},{uv[1]:.1f}\n")
+
     def close(self):
         with self.lock:
             if self.imu is not None:

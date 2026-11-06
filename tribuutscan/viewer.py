@@ -1330,7 +1330,16 @@ class App:
                  + (f", on the picked object (depth pixel {aim[0]:.0f}, {aim[1]:.0f})" if aim else ""))
 
     def aim_click(self, name, x, y):
-        """A click on the depth or colour preview picks the piece there for the aim (idle or counting only)."""
+        """A click on the depth or colour preview picks the piece there: for the aim while idle or counting down, and
+        while scanning for the scan itself, "the object is there" (the worker's cloud.Scanner.pick: found again
+        there, or a new piece from there)."""
+        if self.scan_state == "scanning":
+            if self.live["proc"] is not None:
+                side = DEPTH_W if name == "Depth" else SIDE_W
+                uv = (x * fr.W / side, y * fr.H / (side * fr.H // fr.W))  # (full size: that preview's own pixels)
+                self.live["commands"].put(("pick", "depth" if name == "Depth" else "colour", uv))
+                self.log("picked: the scan takes the object there")
+            return
         if self.scan_state not in ("idle", "counting"):
             return
         if name == "Depth":
@@ -1415,8 +1424,10 @@ class App:
                     held = ", ".join(([f"{cue['markers']} markers"] if cue.get("markers") else [])
                                      + (["features"] if cue.get("features") else [])) or "shape"
                     turning = cue.get("turning")
-                    hint = ("   TRACKING LOST: turn " + ("" if turning else "(or move) ") + "back until the live view "
-                            "lines up with the grey shape" if not tracking else
+                    hint = ("   TRACKING LOST: the object is out of view: point back at it, or click it" if not tracking
+                            and cue.get("away") else
+                            "   TRACKING LOST: turn " + ("" if turning else "(or move) ") + "back until the live view "
+                            "lines up with the grey shape, or click the object" if not tracking else
                             "   THIN VIEW: turn slowly here" if cue.get("flat") and turning else
                             "   FLAT AREA: aim at an edge, a corner or markers" if cue.get("flat") else "")
                     base = ("object turning, scanner standing | " if turning else "") + \
