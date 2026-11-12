@@ -1407,3 +1407,30 @@ cubes on the GPU; the CPU keeps the 6x6 solve, markers, base votes, pose graph, 
       and from then on each lost frame's piece was the platform and what lies around it, ~650 mm away, r90 ~300 mm
       (3.4-4x the look: "other" by size alone), so nothing was tried for 540 frames, also while the hand was in view
       (940-1020).
+- TAKE-BACK, BEYOND, CONTACT (2026-11-12). The two weaknesses above, and the shelf piece, dealt with differently:
+  - A minimum-points guard on refind_shape was not the cause to fix: the 179 degree pose at devaway 1842 was lost
+    again on the next frame, and every later recovery was measured from it, so the right re-find 11 frames on was
+    out of reach. Now a frame with depth lost within REFIND_HOLD of a pose found anywhere takes that pose back
+    (`take_back`, GPU tracker only): pose, motion, look, the scene's votes and region (`Scene.snapshot/restore`),
+    the marker map and the ORB reference as before the re-find, its frames "taken back" (evaluate: taken_back).
+    Without restoring the scene, devclicks voted the wall as its base on the frames between.
+  - BEYOND: a lost "unsure" frame whose piece lies further from the object's distance than LOOK_NEAR starts the
+    piece clock again; its recoveries are still tried (as "other", with no recovery, the GPU tracker lost devaway and
+    devclicks, as with the dropped rule). Every piece begun on lost frames in the other datasets was within 0.61
+    of near; the shelf was 1.66, the two hands at the left 1.4-1.5. Also requiring 3x the points kept their pieces.
+  - `stands_on`: a plane that tracking's piece floats above, further than a stacked support could be (LAYER_THIN
+    of the piece's height over the gap), is not its base. devclicks' piece at frame 640 had voted the wall behind
+    (normal toward the camera, 743 mm). A strict "contact within 10 mm" broke the board under devaway's hand.
+  - `lift_base` counts a band's points with its neighbours': devaway's board at 23.9 mm held 11.6% of the points
+    in one band in one run, and split under 10% over two in the next, so it was not lifted.
+  - The all-"other" loss is not fixed: it needs a way to choose the piece while lost, not a threshold.
+  - Evaluate, all 16, `--optimise` (tb2-gpu 20261112-093430, tb2-current -095619, against base / ransac):
+    every dataset not named here identical in tracking. GPU: devclicks 871 -> 912 tracked (used 0.72 -> 0.75),
+    9 -> 7 pieces (the shelf's gone), base lifted, region 207 -> 286 mm, Optimise's correction at the object 0.93
+    -> 0.71 mm; devaway 3025 -> 3019, 5 taken back, its two wrong stretches gone from the jumps (1789, 2074-2076),
+    lifted 24.2; devplatform and platform one taken back each, platform 496 -> 498. CPU: devclicks 867 -> 669
+    tracked, 11 -> 10 pieces, jumps 3 -> 1, base lifted (none before), Optimise's correction at the object 70 ->
+    4.2 mm; the tracked frames fell because piece 7 (frames 262-640, the same in both) fits by all six candidates
+    at fitness 0.90 but rmse 1.09 mm, over JOIN_MAX_RMSE_MM 1.0: without the contact rule the piece at 640 took
+    the wall, the anchor began at 672 instead of 681, and piece 7 joined at 0.81 mm. GPU ms a frame: devclicks
+    53.8 -> 56.6 (lost frames now try recoveries), the rest the RANSAC's gain.

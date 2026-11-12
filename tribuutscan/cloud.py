@@ -65,7 +65,9 @@ REFIND_MIN_AWAY = 25  # ...this many of them on the still scene around the objec
 REFIND_MM_S, REFIND_DEG_S, REFIND_SLACK = 300.0, 60.0, (50.0, 15.0)  # ...and must be reachable in the time lost:
     # a full circle round the object in 6 s is a fast walk; a faster turn only delays the re-find. The plate's
     # mirrored re-find turned 136 degrees in 1.35 s (truly ~45); the real ones 18-31 degrees after 19-27 s
-REFIND_HOLD = 2  # frames tracked after a pose found anywhere before merging resumes
+REFIND_HOLD = 2  # frames tracked after a pose found anywhere before merging resumes; a frame with depth lost before
+# then takes that pose back (take_back): devaway, frame 1842, a re-find by shape on a third of the hand 179 degrees off,
+# lost again at once, and every later recovery measured from it; the right one 11 frames on was out of reach
 SHAPE_EVERY_S = 0.25  # refind_shape: at most one try per this much frame time while lost (~50-150 ms each)
 MARKER_CHECK_MM, MARKER_CHECK_DEG, MARKER_CHECK_MIN = 5.0, 2.0, 3  # marker_check: a solve this far from the markers' own
     # placement is redone from it, and must then hold this many of them
@@ -88,6 +90,13 @@ OTHER_SIZE, OTHER_POINTS = (1 / 3, 3.0), 0.1  # ...and "other" (clearly somethin
 # median and 400 ms p90 (FPFH on the wall) against 33 ms tracked. The hand there: 4100-5665 points, r90 82-89 mm
 # at 345-380 mm; what it looked at: 9-786 points, r90 9-65 mm at 454-716 mm, or 11-20k points, r90 190-261 mm at
 # 651-678 mm
+BEYOND = True  # a lost "unsure" frame whose piece lies further than LOOK_NEAR from the object's distance starts the
+# piece clock again, its recoveries tried as before. The 11-06 18:39 scan (devclicks) swung from the hand to the shelf
+# (5.9x the points, r90 2.7x, 188 mm further; near 113) and later to the two hands at the left (their size, 1.4-1.5x
+# near further): "unsure" for 1 s each, and pieces began there (the shelf's 1.4M points, 700 mm across). Every piece
+# begun on lost frames in the other datasets was within 0.61 near. Evaluate (2026-11-12): devclicks GPU 9 -> 8 pieces,
+# CPU 11 -> 9, only the clicked ones left out; devaway, devplatform, handgap unchanged. Requiring 3x the points as well
+# kept the far hands' pieces; as "other" (no recovery, relock off for the loss) the GPU tracker lost devaway, devclicks
 GAP_S = 0.5  # the first frame tracked after this long without one (lost frames, or none came) is checked by shape:
     # its solve began at the last good pose, and a turn about a vertical axis hides in horizontal faces (the
     # synthetic block on a platform, 3 s left out: "tracked" 37 degrees off)
@@ -752,6 +761,7 @@ class Scanner:
         self.last_t, self.motion_s, self.lost_run = None, None, 0  # time of the last tracked frame, of `motion`
         self.frame_table = None  # this frame's own table: (normal, narrower extent mm), for floor_agrees
         self.hold, self.refind_feat = 0, None  # refind_anywhere's state
+        self.unconfirmed = None  # a pose found anywhere, until REFIND_HOLD frames hold it: how to take it back
         self.shape_model, self.shape_t = None, None  # refind_shape's: (merged count, the model's shape features), last try
         self.object_turns = False  # the room stands still while the object turns (check_room): its features left out
         self.room_ref, self.room_votes, self.room_t = None, {"still": 0, "moved": 0}, None  # check_room's reference,
@@ -937,6 +947,7 @@ class Scanner:
                 else:  # (the CPU tracker after the scanner looked away: not from the last pose, a new piece)
                     step, ok = np.eye(4), False
                 like = "object" if ok else self.likeness(seen)  # (a piece of something else: no recovery tried)
+                undo = None if ok or self.unconfirmed is not None else self.undo_point(index)
                 if ok and status != "tracked":  # (re-found by shape after a gap: no motion to go on from)
                     self.pose, self.motion, self.motion_s = self.pose @ step, np.eye(4), None
                 elif ok:
@@ -954,6 +965,8 @@ class Scanner:
                     stats["relocked"] += 1
                     status = "re-found by shape"
                 else:
+                    if self.unconfirmed is not None:  # lost again before the pose found anywhere held: not taken
+                        self.take_back()
                     stats["lost"] += 1
                     stats["lost_away"] += like == "other"
                     stats["tracking"] = False
@@ -967,6 +980,8 @@ class Scanner:
                     else:
                         self.lost_long(t, index, like, xyz)
                     return False
+            if status.startswith("re-found") and self.track_with == "gpu" and undo is not None:
+                self.unconfirmed = undo
             self.last_t, self.lost_run, self.lost_since = t, 0, None
             self.last_source, self.like_source, self.away_frames = xyz.mean(0), None, 0
             self.cue.pop("away", None)
@@ -993,6 +1008,8 @@ class Scanner:
             self.hold = REFIND_HOLD + 1
         if self.hold:  # a pose found anywhere is merged only once the frames after it have tracked from it
             self.hold -= 1
+            if not self.hold:
+                self.unconfirmed = None
             return False
         self.since_merge = getattr(self, "since_merge", 0) + 1
         if self.last_merged is not None:
@@ -1365,6 +1382,43 @@ class Scanner:
             return "object"
         return "unsure"
 
+    def undo_point(self, index):
+        """What take_back restores: the state of a loss before a pose found anywhere (refind_anywhere,
+        refind_shape) at frame `index`."""
+        return dict(index=index, pose=self.pose.copy(), motion=self.motion, motion_s=self.motion_s,
+                    last_t=self.last_t, lost_run=self.lost_run, lost_since=self.lost_since,
+                    away_frames=self.away_frames, last_source=self.last_source, like_source=self.like_source,
+                    look=list(self.look), scene=self.scene.snapshot(), scene_of=self.scene,
+                    markers=(self.marker_map.pos.copy(), self.marker_map.count.copy()), marker_map=self.marker_map,
+                    feat=(self.prev_feat, self.feat_pose))
+
+    def take_back(self):
+        """A pose found anywhere and lost again before REFIND_HOLD frames held it (nothing merged meanwhile): the
+        loss goes on as if it had not been found, and what its frames taught the scene (base votes, the ball or
+        region, a base found) and the marker map at that pose is forgotten: on devclicks such frames voted the wall
+        behind the hand as the base. Its frames are logged "taken back", without a pose."""
+        u, self.unconfirmed, self.hold = self.unconfirmed, None, 0
+        self.pose, self.motion, self.motion_s, self.last_t = u["pose"], u["motion"], u["motion_s"], u["last_t"]
+        self.lost_run, self.lost_since, self.away_frames = u["lost_run"], u["lost_since"], u["away_frames"]
+        self.last_source, self.like_source = u["last_source"], u["like_source"]
+        self.look.clear()
+        self.look.extend(u["look"])
+        if self.scene is u["scene_of"]:  # (the same piece: a new one starts afresh anyway)
+            self.scene.restore(u["scene"])
+        if self.marker_map is u["marker_map"]:
+            self.marker_map.pos, self.marker_map.count = u["markers"]
+        self.prev_feat, self.feat_pose = u["feat"]
+        self.track_log = [(i, "taken back", None) if i >= u["index"] and p is not None else (i, st, p)
+                          for i, st, p in self.track_log]
+        self.stats["taken_back"] = self.stats.get("taken_back", 0) + 1
+
+    def beyond(self, seen):
+        """Does a lost frame's piece (look_of) lie further from the object's distance than LOOK_NEAR (BEYOND)?"""
+        if not BEYOND or not self.look:
+            return False
+        z0 = float(np.median(np.array(self.look)[:, 2]))
+        return abs(seen[2] - z0) > max(LOOK_NEAR[0] * z0, LOOK_NEAR[1])
+
     def lost_long(self, t, index, like="object", xyz=None):
         """A lost frame with depth. Frames whose piece may be the object (likeness "object" or "unsure") run the
         clock (frame time; 0.1 s a frame without stamps), a frame of something else ("other") starts it again; after
@@ -1375,6 +1429,9 @@ class Scanner:
         if like == "other":
             self.lost_since = None
             self.away_frames += 1
+            return
+        if like == "unsure" and xyz is not None and self.beyond(look_of(xyz)):
+            self.lost_since = None  # (something at another distance: no new piece there)
             return
         if xyz is not None and len(xyz):
             self.like_source = xyz.mean(0)
@@ -1437,7 +1494,7 @@ class Scanner:
         self.marker_map = MarkerMap(add_mm=self.marker_map.add_mm)
         self.prev, self.motion, self.motion_s, self.last_t = None, np.eye(4), None, None
         self.prev_feat = self.feat_pose = self.refind_feat = None
-        self.hold, self.cue = 0, {}
+        self.hold, self.cue, self.unconfirmed = 0, {}, None
         self.shape_model, self.shape_t = None, None
         self.model, self.model_merged, self.model_levels, self.model_at = None, -1, None, -1
         self.last_merged, self.merge_t, self.since_merge = None, None, 0

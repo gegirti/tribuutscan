@@ -887,6 +887,47 @@ def test_only_frames_like_the_object_start_a_new_piece():
     assert i >= len(shelf)  # on the hand
 
 
+def test_unsure_frames_at_another_distance_start_no_piece():
+    """An "unsure" lost frame whose piece lies further from the object's distance than LOOK_NEAR (the 11-06 18:39
+    scan's swings to the shelf, ~6x the points 18 cm further, and to a hand as big ~17 cm further) starts the piece
+    clock again, like "other"; it stays "unsure", so recoveries are still tried. The hand with the board under it
+    (4x the points at its own distance) runs the clock."""
+    rng = np.random.default_rng(3)
+    s = cl.Scanner("small", log=lambda m: None)
+    s.stats["merged"] = 5
+    for _ in range(10):
+        s.look.append(cl.look_of(lump(rng, 5000, 70, 360)))
+    shelf, far_hand, board = lump(rng, 13000, 185, 540), lump(rng, 9000, 63, 530), lump(rng, 20000, 130, 370)
+    for piece in (shelf, far_hand):
+        assert s.likeness(cl.look_of(piece)) == "unsure" and s.beyond(cl.look_of(piece))
+        for i in range(30):  # 3 s
+            s.lost_long(i / 10, i, "unsure", piece)
+        assert len(s.pieces) == 1 and s.lost_since is None and s.away_frames == 0
+    assert not s.beyond(cl.look_of(board))
+    for i in range(30, 45):
+        s.lost_long(i / 10, i, "unsure", board)
+    assert len(s.pieces) == 2
+
+
+def test_a_pose_found_anywhere_and_lost_at_once_is_taken_back():
+    """A pose re-found anywhere and lost again before REFIND_HOLD frames held it is taken back (take_back): the
+    loss goes on from where it was, its frames are logged without a pose (devaway, 1842: 179 degrees off)."""
+    rng = np.random.default_rng(4)
+    s = cl.Scanner("small", log=lambda m: None)
+    s.look.append(cl.look_of(lump(rng, 5000, 70, 360)))
+    s.pose, s.last_t, s.lost_run, s.lost_since, s.away_frames = np.eye(4), 1.0, 12, 1.2, 3
+    s.track_log = [(9, "tracked", np.eye(4)), (10, "lost", None)]
+    s.unconfirmed = s.undo_point(11)
+    flipped = np.diag([-1.0, -1.0, 1.0, 1.0])
+    s.pose, s.last_t, s.lost_run, s.lost_since, s.away_frames, s.hold = flipped, 2.0, 0, None, 0, 2
+    s.look.append(cl.look_of(lump(rng, 900, 30, 480)))
+    s.track_log += [(11, "re-found by shape", flipped), (12, "tracked", flipped)]
+    s.take_back()
+    assert np.array_equal(s.pose, np.eye(4)) and s.last_t == 1.0 and (s.lost_run, s.lost_since, s.away_frames) == (12, 1.2, 3)
+    assert len(s.look) == 1 and s.hold == 0 and s.unconfirmed is None and s.stats["taken_back"] == 1
+    assert [st for _, st, _ in s.track_log] == ["tracked", "lost", "taken back", "taken back"]
+
+
 def test_a_click_is_taken_at_the_point_nearest_it():
     """A click (Scanner.pick, or a replay's planned one at its frame) becomes the depth pixel of the frame's point
     nearest it: on the depth image directly, on the colour image where the colour camera sees each point."""

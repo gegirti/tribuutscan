@@ -101,11 +101,19 @@ def stands_on(xyz, pix, shape, n, c, tracked=None, prefer=False):
     object a table is hidden, while one of the object's own flat sides lies within its outline. When the
     centre piece does not touch the plane, tracking's piece (`tracked`, a mask of the points) may: looking
     down on a platform the middle of the view can miss the object. With `prefer` (the viewer's aim chose the
-    object), tracking's piece is asked first."""
+    object), tracking's piece is asked first. A plane that tracking's piece lies wholly above, out of contact and
+    further than a stacked support could be (LAYER_THIN of the piece's own height over the gap, as lift_base), is not
+    its support, whatever the centre piece touches: devclicks (2026-11-12), the hand at ~35 cm tracked again, its
+    base voted on the wall 72 cm away, which the view's centre piece reached. (Without the stacked allowance the dev
+    scene's platform, under the board under the hand, was refused and the board voted less exactly: not lifted.)"""
     h = xyz @ n + c
     idx = np.nonzero(h > OBJECT_ABOVE_MM)[0]
     if len(idx) < 50:
         return False
+    if tracked is not None and tracked.any():
+        gap = h[tracked].min()
+        if gap >= CONTACT_MM and gap > LAYER_THIN * (np.percentile(h[tracked], 99) - gap):
+            return False
     piece = tracked[idx] if prefer and tracked is not None else cl.centre_piece(xyz[idx], pix[idx], shape)
     if (not piece.any() or h[idx][piece].min() >= CONTACT_MM) and tracked is not None:
         piece = tracked[idx] if not prefer else cl.centre_piece(xyz[idx], pix[idx], shape)
@@ -343,6 +351,18 @@ class Scene:
         keep[idx[~inside]] = False
         return keep
 
+    def snapshot(self):
+        """What frames change (observe, masks): votes, the plane, the region, the ball; for restore (a pose found
+        anywhere and taken back: cloud.Scanner.take_back). The values are replaced, never changed in place."""
+        return dict(plane=self.plane, votes=list(self.votes), seen_frames=self.seen_frames,
+                    vote_views=list(self.vote_views), vote_until=self.vote_until, axis=self.axis, radius=self.radius,
+                    top=self.top, ball=self.ball, late_plane=self.late_plane, off_centre=self.off_centre)
+
+    def restore(self, snap):
+        for k, v in snap.items():
+            setattr(self, k, v)
+        self.axial_cache = None
+
     def state(self):
         """The kept plane and region, as plain JSON values."""
         listed = lambda v: None if v is None else np.asarray(v).tolist()
@@ -380,8 +400,11 @@ class Scene:
                                  return_counts=True)
             return (count >= LAYER_CELL_POINTS).sum() * FOOTPRINT_CELL_MM ** 2 / 100
         counts, edges = np.histogram(h, np.arange(OBJECT_ABOVE_MM, h.max() + LAYER_BAND_MM, LAYER_BAND_MM))
+        near = counts + np.r_[0, counts[:-1]] + np.r_[counts[1:], 0]  # each band with its neighbours: a layer on a
+        # band's edge splits between two (devaway, 2026-11-12: the board at 23.9 mm, 11.6% of the points in one band
+        # in one run, under 10% in each of two in the next, and not lifted)
         for k in np.argsort(-edges[:-1]):  # the highest layer first
-            if counts[k] < LAYER_MIN_SHARE * len(h):
+            if near[k] < LAYER_MIN_SHARE * len(h):
                 continue
             layer_plane = self._layer_plane(pts, n, c - (edges[k] + LAYER_BAND_MM / 2))
             if layer_plane is None:

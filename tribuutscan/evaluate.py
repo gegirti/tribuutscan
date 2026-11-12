@@ -249,6 +249,7 @@ def _run(name, tracker, preset, live_markers, optimise_after, mesh=False):
         "flat_frames": scanner.stats.get("flat", 0),
         "object_turns": scanner.object_turns, "room_votes": dict(scanner.room_votes),
         "shape_refinds": scanner.stats.get("shape_refinds", 0),
+        "taken_back": scanner.stats.get("taken_back", 0),
         "feature_starts": scanner.feature_starts,
         "double_surface_ratio": round(metrics.double_surface_ratio(xyz, normals), 4),
         "marker_scatter": metrics.marker_scatter(sightings),

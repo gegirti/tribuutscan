@@ -417,13 +417,17 @@ One frame (`cloud.Scanner.feed`, GPU tracker):
    - `refind_shape`: FPFH + RANSAC against the object so far, at most every 0.25 s, refusing edge-on
      views.
 
-   After a pose found anywhere, REFIND_HOLD frames must track before merging resumes. While lost, the
+   After a pose found anywhere, REFIND_HOLD frames must track before merging resumes; on the GPU tracker a frame
+   lost before then takes that pose back (`take_back`: pose, motion, look, scene votes, marker map and ORB
+   reference as they were before the re-find, its frames "taken back"), so later recoveries are not measured from
+   a wrong pose (devaway 1842: a shape re-find on a third of the hand, 179 degrees off). While lost, the
    viewer shows the model from the last pose (the "ghost"). While lost, the source piece is seeded by the
    object's colours instead of the region's core when the colour model can tell them (`colour.py`:
    U/V histograms of object vs the rest of the view, learned at keyframes; silent when they overlap,
    Bhattacharyya > 0.6, so depth alone decides as before).
    **Pieces.** After PIECE_AFTER_S 1 s of lost frames whose piece may be the object ("object" or "unsure"; an
-   "other" frame, or one with too little depth, starts the clock again), with every recovery failing, the scan
+   "other" frame, one with too little depth, or an "unsure" one whose piece lies further than LOOK_NEAR from the
+   object's distance (BEYOND: the shelf, the hands behind) starts the clock again), with every recovery failing, the scan
    goes on in a new piece (`start_piece`): pose chain, scene, marker map, live cloud and tracking volume start
    afresh (the volume emptied in place, `Engine.reset`: no second ~560 MB engine), at the last good pose; its
    first frame takes the object by colour, else at the point nearest where the lost frames saw it
@@ -438,7 +442,9 @@ One frame (`cloud.Scanner.feed`, GPU tracker):
    new piece starts there (no 1 s wait). A piece a click started becomes the look piece.
 6. **Scene** (`scene.py`, mode "still"):
    - The base is found by votes: 3 must agree in world coordinates. `stands_on` requires contact within
-     10 mm, and at most half the plane may lie inside the object's outline. After VOTE_LIMIT, while no
+     10 mm, and at most half the plane may lie inside the object's outline; when tracking's piece floats above
+     the plane further than a stacked support could be (LAYER_THIN of its height), the plane is not its base,
+     whatever the centre piece touches (devclicks: the wall behind). After VOTE_LIMIT, while no
      base is known, a vote is taken on every 10th frame, except for VOTE_WINDOW 100 frames after the view
      turns VOTE_NEW_VIEW_DEG 25 degrees from every view such a window began at (a scan level for minutes,
      then a pass from 45 degrees: the dev scan of 2026-11-06 got 4-6 votes in 1000 frames before this).
@@ -472,7 +478,7 @@ After Stop:
   across a boundary. session.json keeps "piece_list" and "piece_joins".
 - **Base onto a support** (`Scanner.settle_base` -> `Scene.lift_base`, after the join): the base moves up
   onto a flat layer parallel to it that the object stands on, when the layer is wide (>= 100 cm2, >= 10% of
-  the object's points), what stands on it covers at most a quarter of it (cells of 3+ points), and it is
+  the object's points, a band counted with its neighbours), what stands on it covers at most a quarter of it (cells of 3+ points), and it is
   thin compared with that object (<= 1/3 of its height). The layer's own plane is fitted (`_layer_plane`,
   within 5 degrees of the base): a board need not lie parallel to the platform, and a base voted 1.6 degrees
   off spread the board over 19-27 mm. The dev scene: the platform was voted, the board 24.9 mm above it
@@ -545,9 +551,11 @@ Invariants:
   as the scanner sends them).
 - **`compare.py`** scores a cloud or mesh against Creality's mesh of the marker part. Use 12 seeds, and
   reuse a transform for clouds that share tracking.
-- **Reference runs** (2026-11-12, `--optimise`): captures/eval/20261112-001833-base-gpu and -003952-base-current
-  (HEAD a179d2e, all 15 datasets before devclicks; the vectorised RANSAC after it gives the same numbers, faster),
-  with 20261112-023315-ransac-gpu and -024156-ransac-current for devaway and devclicks on the new code.
+- **Reference runs** (2026-11-12, `--optimise`, all 16): captures/eval/20261112-093430-tb2-gpu and
+  -095619-tb2-current (take-back, BEYOND, the contact rule, layer bands). The code before them:
+  20261112-001833-base-gpu and -003952-base-current (HEAD a179d2e, all 15 before devclicks; the vectorised RANSAC
+  after it gives the same numbers, faster), with 20261112-023315-ransac-gpu and -024156-ransac-current for devaway
+  and devclicks on 18174ed.
   Before them (2026-11-06, all 15): captures/eval/20261106-153054-g-final3-gpu
   and -153054-g-final3-cpu (the look-away plan). The code before it: 20261106-110005-g-before-gpu and
   -110839-g-before-cpu (HEAD ab893a8 with relock's no-normals guard, which HEAD's CPU tracker needed on devaway).
@@ -656,9 +664,13 @@ Needs the user and the scanner:
   identical).
 
 Known weaknesses (each measured, in docs/history.md):
-- refind_shape can take a pose from a piece of ~170 points (devaway frame 1842 under a stricter "other" rule:
-  178.7 degrees off), and a loss whose every frame is "other" never tries a recovery (devclicks under that rule:
-  540 frames, the hand in view for 80 of them). Both found 2026-11-12 (THE SLOW SCAN); the rule was dropped.
+- refind_shape can take a pose from a piece of ~170 points (devaway frame 1842, 178.7 degrees off). The GPU
+  tracker takes it back when the next frame is lost (take_back); one that holds 2 frames stays.
+- A loss whose every frame is "other" never tries a recovery (devclicks under a stricter "other" rule: 540
+  frames, the hand in view for 80 of them). Needs a way to choose the piece while lost, not a threshold.
+- A join gate on the edge: CPU devclicks' piece 7 (378 frames) fits in one place by all six candidates at fitness
+  0.90 but rmse 1.09 mm (gate 1.0) and is left out; before the contact rule it joined at 0.81 mm against a
+  slightly different anchor piece.
 - With no base known (each new piece starts without one) a frame runs two plane searches: 26-35 ms before the
   2026-11-12 RANSAC speed-up, an estimated 16-22 ms after it; the 11-06 18:39 scan had no base for ~650 frames.
 - The thin plate's edge-on turn: neither tracker holds it; markers on both faces are the way.
