@@ -1380,3 +1380,30 @@ cubes on the GPU; the CPU keeps the 6x6 solve, markers, base votes, pose graph, 
     alternating three times: a frame 52.1-52.6 -> 50.7-51.7 ms, no stage slower, 440 tracked and 131 merged in each.
   - Tests: 164 pass (new: likeness, the piece clock, clicks, picks.csv, the viewer's click, joins both ways, the base
     from a joined piece, the vote window, relock and the CPU step after a look-away, a tilted board lifted).
+- THE SLOW SCAN (2026-11-12). The user's first live scan with the look-away plan, 20261106-183959 (the dev scene,
+  long range, the platform turned by hand, 7 clicks, a look at the shelf and the wall), ran 10.8 fps in 9 pieces
+  (worker 91 ms a frame; devaway live: 61). Now the dataset "devclicks".
+  - Replays (aim and picks, GPU, back to back) keep the ratio, 64 against 44 ms a frame: the scan, not the machine.
+  - The cost: with no base known (~650 of its 1208 frames: every new piece starts a fresh Scene and its 300 frames of
+    voting) a frame runs two plane searches (`isolate_mask` and `Scene.observe`), 26-35 ms; 76% of that was
+    `_ransac_plane`'s loop of 60 planes. Keeping the vote budget across pieces saved only 2.4 ms a frame and changed
+    tracking: not taken. Smaller: a bigger ray cast at that distance (+3.8 ms), lost and recovery frames.
+  - `_ransac_plane` now tests its planes together: the same draws in the same order, the same result, bit for bit on
+    6940 recorded calls (devaway, devclicks, platform, synth, synth7 among them), 2.1 -> 0.9-1.4 ms a call. Evaluate,
+    GPU, back to back, trees alternating: devclicks 61.4-65.3 -> 52.8-54.5 ms a frame, devaway 37.6-39.4 -> 32.1-32.2.
+    Without Optimise synth and synth7 (GPU) and synth (CPU) give identical numbers; with it the points move by a few
+    between runs of the same code (synth CPU 146680 / 146682), and GPU replays of the same code differ by a frame or
+    more (devaway 3026 / 3024, devclicks 871 / 895). Full evaluate, both trackers: base-gpu 20261112-001833,
+    base-current -003952; the RANSAC tree on devaway and devclicks: ransac-gpu -023315, ransac-current -024156.
+  - Piece 8 (frames 460-670) began on the shelf: frames 453-459 showed 5.9x the look's points, r90 2.7x, 188 mm
+    further, each within the "other" bounds, so "unsure", and the piece clock ran. Tried and dropped: "other" also
+    with more than 3x the points AND the distance off by more than LOOK_NEAR. Offline it flipped only look-away
+    frames, but evaluate (twice, the same numbers) made the GPU tracker much worse: devaway 3025 -> 1791 tracked
+    (2 pieces, one left out), devclicks 871 -> 327 (used 0.72 -> 0.27); the CPU tracker no worse (devclicks 867 ->
+    887, 4 joined). Two weaknesses it walked into, both there before it:
+    - refind_shape takes a pose from a piece of 167 points (r90 59 mm, a third of the look's points): devaway frame
+      1842, 178.7 degrees off. The rule only moved which frames tried a re-find (refind_shape's 0.25 s spacing).
+    - A loss whose every frame is "other" never ends: devclicks under the rule, piece 10 lost the hand at frame 670,
+      and from then on each lost frame's piece was the platform and what lies around it, ~650 mm away, r90 ~300 mm
+      (3.4-4x the look: "other" by size alone), so nothing was tried for 540 frames, also while the hand was in view
+      (940-1020).

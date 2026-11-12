@@ -525,7 +525,8 @@ Invariants:
 
 - **`evaluate.py`** runs a tracker over these datasets:
   - real: markers, hand, platform, platform2, devplatform (the dev scene, 2026-11-05), devaway (the dev
-    scene, 2026-11-06: still 88 s, two look-aways, a 45 degree pass);
+    scene, 2026-11-06: still 88 s, two look-aways, a 45 degree pass), devclicks (the dev scene, 2026-11-06
+    18:39: platform turned by hand, 7 clicks, a look-away; live 10.8 fps in 9 pieces, one on the shelf);
   - synthetic: synth, synth7, synthhard, synthfp, synthplate, synthturn;
   - gap variants: markersgap, handgap, synthturngap.
 
@@ -544,7 +545,10 @@ Invariants:
   as the scanner sends them).
 - **`compare.py`** scores a cloud or mesh against Creality's mesh of the marker part. Use 12 seeds, and
   reuse a transform for clouds that share tracking.
-- **Reference runs** (2026-11-06, all 15 datasets, `--optimise`): captures/eval/20261106-153054-g-final3-gpu
+- **Reference runs** (2026-11-12, `--optimise`): captures/eval/20261112-001833-base-gpu and -003952-base-current
+  (HEAD a179d2e, all 15 datasets before devclicks; the vectorised RANSAC after it gives the same numbers, faster),
+  with 20261112-023315-ransac-gpu and -024156-ransac-current for devaway and devclicks on the new code.
+  Before them (2026-11-06, all 15): captures/eval/20261106-153054-g-final3-gpu
   and -153054-g-final3-cpu (the look-away plan). The code before it: 20261106-110005-g-before-gpu and
   -110839-g-before-cpu (HEAD ab893a8 with relock's no-normals guard, which HEAD's CPU tracker needed on devaway).
   Before them: captures/eval/20261105-203248-f-gpu and -203250-f-cpu, with 20261106-083850-joingate-cpu for
@@ -652,6 +656,11 @@ Needs the user and the scanner:
   identical).
 
 Known weaknesses (each measured, in docs/history.md):
+- refind_shape can take a pose from a piece of ~170 points (devaway frame 1842 under a stricter "other" rule:
+  178.7 degrees off), and a loss whose every frame is "other" never tries a recovery (devclicks under that rule:
+  540 frames, the hand in view for 80 of them). Both found 2026-11-12 (THE SLOW SCAN); the rule was dropped.
+- With no base known (each new piece starts without one) a frame runs two plane searches: 26-35 ms before the
+  2026-11-12 RANSAC speed-up, an estimated 16-22 ms after it; the 11-06 18:39 scan had no base for ~650 frames.
 - The thin plate's edge-on turn: neither tracker holds it; markers on both faces are the way.
 - Marker-map entries 2.9 mm off can make the marker check refuse a correct pose.
 - Something touching the object (a stand, a cable) stays in the scan unless cropped.

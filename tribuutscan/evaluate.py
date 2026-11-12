@@ -64,6 +64,10 @@ DATASETS = {  # name: (path or glob under captures/, notes, scan mode)
                 "dark hand held still 88 s, then looking away twice (the shelf, the wall, the floor) and back, then a "
                 "pass ~45 degrees down that finds the base; live it went on in 10 pieces (boxes among them) and the "
                 "45 degree pass was left out", "still"),
+    "devclicks": ("20261106-183959-scan/*-rec", "the dev scene again (2026-11-06 18:39), long range, the platform turned "
+                  "by hand: 7 clicks in the first 25 s, on the dark hand and on things beside it, then a look "
+                  "away at the shelf and the wall (frames ~450-620) and back; live it ran at 10.8 fps in 9 pieces, one "
+                  "of them on the shelf", "still"),
 }
 GAPS = {  # name: (dataset, frames left out): a stretch skipped as if tracking had been lost while the scanner moved
     "markersgap": ("markers", range(250, 330)),
