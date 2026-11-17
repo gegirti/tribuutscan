@@ -626,16 +626,26 @@ class App:
                 image.bind("<Button-1>", lambda e, name=name: self.aim_click(name, e.x, e.y))
                 image.bind("<Button-3>", lambda _e: self.aim_clear())
             if name == "Depth":
-                bar = tk.Frame(parent)
+                guide_font = tkinter.font.nametofont("TkDefaultFont").copy()
+                guide_font.configure(size=12, weight="bold")
+                bar = tk.Frame(parent, width=width, height=2 * guide_font.metrics("linespace") + 8)
                 bar.pack(fill="x", pady=(4, 0))
-                self.guide = tk.Label(bar, anchor="center", font=("TkDefaultFont", 12, "bold"))
-                self.guide.pack(side="left", fill="x", expand=True)
+                bar.pack_propagate(False)  # status text must not resize the preview column
+                self.guide = tk.Label(bar, anchor="center", font=guide_font, height=2,
+                                      wraplength=width - 140)
+                self.guide.pack(side="left", fill="both", expand=True)
                 self.retry = tk.Button(bar, text="Retry now", font=panels.BOLD, command=self.retry_now)  # shown while lost
             stats = tk.Label(parent, anchor="w", font=("TkFixedFont", 9))
             stats.pack(fill="x", pady=(0, 6))
             self.views[name] = (title, image, stats)
-        self.note = tk.Label(root, anchor="w", font=("TkDefaultFont", 11))
-        self.note.grid(row=1, column=0, columnspan=3, sticky="we", padx=8, pady=(0, 8))
+        note_font = tkinter.font.nametofont("TkDefaultFont").copy()
+        note_font.configure(size=11)
+        note_bar = tk.Frame(root, width=SIDE_W + DEPTH_W, height=2 * note_font.metrics("linespace") + 8)
+        note_bar.grid(row=1, column=0, columnspan=3, sticky="w", padx=8, pady=(0, 8))
+        note_bar.grid_propagate(False)  # messages must not change the window's width or height
+        self.note = tk.Label(note_bar, anchor="w", justify="left", font=note_font, height=2,
+                             wraplength=SIDE_W + DEPTH_W - 16)
+        self.note.pack(fill="both", expand=True)
         for cls in PANELS:
             panel = cls(right, self)
             panel.pack(fill="x", pady=(0, 6))
