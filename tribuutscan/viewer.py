@@ -47,6 +47,7 @@ from .depth import decode_depth, decode_strided, garbled
 from .image import depth_to_rgb, ppm, yuyv_pixels
 
 SIDE_W, DEPTH_W = 400, 800  # preview widths: colour and IR on the left, depth in the middle
+GUIDE_WRAP = {False: DEPTH_W - 8, True: DEPTH_W - 140}  # the guide's wrap width (px), with Retry shown or not
 PREVIEW_FPS = 15  # previews redraw at most this often; every frame is still captured and paired
 SCAN_SIDE_FPS = 5  # the colour and IR previews while scanning (the depth preview, the live model, stays at 15)
 
@@ -632,7 +633,7 @@ class App:
                 bar.pack(fill="x", pady=(4, 0))
                 bar.pack_propagate(False)  # status text must not resize the preview column
                 self.guide = tk.Label(bar, anchor="center", font=guide_font, height=2,
-                                      wraplength=width - 140)
+                                      wraplength=GUIDE_WRAP[False])
                 self.guide.pack(side="left", fill="both", expand=True)
                 self.retry = tk.Button(bar, text="Retry now", font=panels.BOLD, command=self.retry_now)  # shown while lost
             stats = tk.Label(parent, anchor="w", font=("TkFixedFont", 9))
@@ -642,8 +643,8 @@ class App:
         note_font.configure(size=11)
         note_bar = tk.Frame(root, width=SIDE_W + DEPTH_W, height=2 * note_font.metrics("linespace") + 8)
         note_bar.grid(row=1, column=0, columnspan=3, sticky="w", padx=8, pady=(0, 8))
-        note_bar.grid_propagate(False)  # messages must not change the window's width or height
-        self.note = tk.Label(note_bar, anchor="w", justify="left", font=note_font, height=2,
+        note_bar.pack_propagate(False)  # messages must not change the window's width or height
+        self.note = tk.Label(note_bar, anchor="nw", justify="left", font=note_font, height=2,
                              wraplength=SIDE_W + DEPTH_W - 16)
         self.note.pack(fill="both", expand=True)
         for cls in PANELS:
@@ -733,8 +734,10 @@ class App:
         retry_shown = self.retry.winfo_ismapped()
         if self.lost and not self.switching["busy"] and not retry_shown:
             self.retry.pack(side="right", padx=(6, 0))
+            self.guide.configure(wraplength=GUIDE_WRAP[True])
         elif retry_shown and (not self.lost or self.switching["busy"]):
             self.retry.pack_forget()
+            self.guide.configure(wraplength=GUIDE_WRAP[False])
         self.check_mesh()
         self.check_scan()
         recorder = self.rec["recorder"]

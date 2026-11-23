@@ -1434,3 +1434,10 @@ cubes on the GPU; the CPU keeps the 6x6 solve, markers, base votes, pose graph, 
     at fitness 0.90 but rmse 1.09 mm, over JOIN_MAX_RMSE_MM 1.0: without the contact rule the piece at 640 took
     the wall, the anchor began at 672 instead of 681, and piece 7 joined at 0.81 mm. GPU ms a frame: devclicks
     53.8 -> 56.6 (lost frames now try recoveries), the rest the RANSAC's gain.
+- FIXED-SIZE TEXT BARS (2026-11-23, PR #3 by glsys, issue #2). A long guide or message line widened the window
+  (measured with fake captures at Tk scaling 1.33: 1571 px wide -> 1773 with a long hint and message, 1875 with
+  Retry, 2642 with a very long message). The PR made both two-line bars of fixed size that wrap; the window
+  width no longer changes, ~25 px taller. Follow-up: the message bar's size took effect only with
+  pack_propagate (it had grid_propagate, so the bar shrank to its text), the message sits at the top-left, and
+  the guide wraps at the full 792 px except while Retry shows (660 px): the longest aim hint (all its parts at
+  once, 1494 px) needed 3 lines at 660, clipped half a line top and bottom; 2 at 792.

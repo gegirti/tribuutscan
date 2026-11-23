@@ -360,8 +360,10 @@ Processes:
     at start.
   - `--force-cpu` (gpu.force_cpu) sets TRIBUUTSCAN_GPU=0 before anything starts, so the worker and
     meshing jobs inherit it.
-  - Window 1491 x 971 with every panel open (fits 1920 x 1080 at Tk scaling 1.33). ("TkFixedFont", 9)
-    is not monospace here; the boxes use a sized copy of the named font.
+  - Window 1491 x 971 with every panel open (fits 1920 x 1080 at Tk scaling 1.33), measured before PR #3
+    (2026-11-23) made the guide under the depth preview and the message line two-line bars of fixed size:
+    long text wraps instead of widening the window, ~25 px taller. ("TkFixedFont", 9) is not monospace
+    here; the boxes use a sized copy of the named font.
 - **Live worker** (`livescan.py`): spawned with .venv's Python. It serves the 3D page on :8765 and exits
   when its viewer dies.
   - Frames arrive as raw depth bytes (`depth.LazyFrame`). The CPU decodes only every 4th pixel
